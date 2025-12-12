@@ -40,7 +40,7 @@ class TrainConfig:
     seed: int = 42
     stage: int = 1
     n_steps: int = 2000
-    batch_size: int = 32
+    batch_size: int = 1024
     lr: float = 1e-3
     grad_clip: float = 1.0
     n_layers: int = 4
