@@ -32,10 +32,11 @@ try:
     from gabv_net_model import GABVNet, GABVConfig
     # Try importing baselines
     try:
-        from baselines_receivers import detector_lmmse_bussgang, detector_gamp_1bit
+        # Import GPU versions
+        from baselines_receivers import detector_lmmse_bussgang_torch, detector_gamp_1bit_torch
+
         HAS_BASELINES = True
     except ImportError:
-        print("Warning: 'baselines_receivers.py' not found. Baselines will be skipped.")
         HAS_BASELINES = False
 except ImportError as e:
     print(f"Error importing modules: {e}")
@@ -149,50 +150,53 @@ def load_gabv_model(ckpt_path: str, device: str) -> GABVNet:
     model.eval()
     return model
 
-def run_baselines_on_batch(batch_data: dict, sim_cfg: SimConfig) -> dict:
+
+def run_baselines_on_batch(batch_data: dict, sim_cfg: SimConfig, device: str) -> dict:
+    """Runs LMMSE and GAMP baselines on GPU."""
     if not HAS_BASELINES: return {}
 
-    y_q = batch_data['y_q']
-    x_true = batch_data['x_true']
-    meta = batch_data['meta']
+    # Move data to GPU
+    y_q = batch_data['y_q'].to(device)
+    x_true = batch_data['x_true'].to(device)
+    meta = batch_data['meta']  # CPU tensor usually, need values
 
     B_batch = y_q.shape[0]
-    ber_lmmse_list, ber_gamp_list = [], []
 
-    B_gain = meta['B_gain']
-    H_diag_all = meta['h_diag']
+    # Extract channel params (Assuming these are numpy in meta, convert to torch)
+    # Note: simulate_batch returns numpy dict. We need to convert relevant parts.
+    # But wait, run_single_scenario converts y_q to gpu for the Model.
+    # Let's assume we receive raw_data (numpy) and manually convert here for efficiency.
 
-    # Broadcast Fix
-    if H_diag_all.ndim == 1:
-        H_diag_all = np.tile(H_diag_all, (B_batch, 1))
+    # To handle the 'meta' dict which might be numpy arrays from thz_isac_world:
+    h_diag_np = meta['h_diag']
+    if h_diag_np.ndim == 1:
+        h_diag_np = np.tile(h_diag_np, (B_batch, 1))
+    H_diag = torch.from_numpy(h_diag_np).cfloat().to(device)
 
-    snr_lin = meta['snr_linear']
-    sigma_eta = meta['sigma_eta']
+    B_gain = float(meta['B_gain'])
+    snr_lin = float(meta['snr_linear'])
+    sigma_eta = float(meta['sigma_eta'])
 
+    # Effective Channel and Noise
+    H_eff = H_diag * B_gain
     n0 = 1.0 / snr_lin
     noise_lmmse = sigma_eta + n0 + 0.5
     noise_gamp = sigma_eta + n0
 
-    for i in range(B_batch):
-        y = y_q[i]
-        h_diag = H_diag_all[i] * B_gain
-        H_eff = np.diag(h_diag)
-        x_t = x_true[i]
+    # --- 1. GPU LMMSE ---
+    x_lmmse = detector_lmmse_bussgang_torch(y_q, H_eff, noise_lmmse)
+    ber_lmmse = compute_ber_qpsk(x_lmmse.cpu().numpy(), x_true.cpu().numpy())
 
-        # 1. LMMSE
-        x_lmmse = detector_lmmse_bussgang(y, H_eff, noise_lmmse, P_signal=1.0)
-        ber_lmmse_list.append(compute_ber_qpsk(x_lmmse, x_t))
-
-        # 2. GAMP
-        try:
-            x_gamp = detector_gamp_1bit(y, H_eff, noise_gamp)
-            ber_gamp_list.append(compute_ber_qpsk(x_gamp, x_t))
-        except:
-            ber_gamp_list.append(0.5)
+    # --- 2. GPU GAMP ---
+    try:
+        x_gamp = detector_gamp_1bit_torch(y_q, H_eff, noise_gamp)
+        ber_gamp = compute_ber_qpsk(x_gamp.cpu().numpy(), x_true.cpu().numpy())
+    except:
+        ber_gamp = 0.5
 
     return {
-        "BER_LMMSE": np.mean(ber_lmmse_list),
-        "BER_GAMP": np.mean(ber_gamp_list)
+        "BER_LMMSE": ber_lmmse,
+        "BER_GAMP": ber_gamp
     }
 
 # --- 4. Core Evaluation Loop ---
@@ -283,7 +287,7 @@ def run_single_scenario(cfg: ExperimentConfig, model: Optional[GABVNet],
 
             # C. Baselines
             if cfg.use_baselines and HAS_BASELINES:
-                bl_res = run_baselines_on_batch(raw_data, sim_cfg)
+                bl_res = run_baselines_on_batch(raw_data, sim_cfg, device)
                 metrics_accum["BER_LMMSE"].append(bl_res.get("BER_LMMSE", 1.0))
                 metrics_accum["BER_GAMP"].append(bl_res.get("BER_GAMP", 1.0))
 
