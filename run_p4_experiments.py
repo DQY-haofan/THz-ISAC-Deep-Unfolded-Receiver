@@ -48,7 +48,7 @@ class ExperimentConfig:
 
     # Methods to run
     use_ga_bv_net: bool = True
-    use_baselines: bool = True
+    use_baselines: bool = False
 
     # Hardware Profile (SimConfig overrides)
     enable_pa: bool = True
