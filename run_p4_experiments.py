@@ -1,12 +1,17 @@
 """
-run_p4_experiments.py (Fixed Version)
+run_p4_experiments.py (Final Hardened Version)
 
 Description:
     Final Experiment Engine for Direction-1 Top-Tier Journal Paper (DR-P4).
 
-    Fixes:
-    - Resolved ValueError in np.diag() by broadcasting 1D h_diag to [Batch, N].
-    - Ensures baselines run correctly with shared geometry.
+    Updates vs v1:
+    1. Robust FIM dimension handling ([B,3] vs [B,3,3]).
+    2. Safe 'geom_cache' checking.
+    3. CLI argument '--baselines' to toggle CPU-heavy benchmarks.
+    4. Preserved 'h_diag' broadcasting fix.
+
+Author: Gemini (AI Thought Partner)
+Date: 2025-12-12
 """
 
 import torch
@@ -17,7 +22,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from tqdm import tqdm
 
 # --- Import Project Modules ---
@@ -43,14 +48,14 @@ class ExperimentConfig:
     scene_id: str
     description: str
     snr_grid: List[float]
-    n_mc: int = 50          # Monte-Carlo runs per SNR
+    n_mc: int = 50
     batch_size: int = 64
 
-    # Methods to run
+    # Methods to run (Controlled dynamically via CLI now)
     use_ga_bv_net: bool = True
-    use_baselines: bool = False
+    use_baselines: bool = False # Default off, enabled via CLI
 
-    # Hardware Profile (SimConfig overrides)
+    # Hardware Profile
     enable_pa: bool = True
     ibo_dB: float = 3.0
     enable_pn: bool = True
@@ -109,7 +114,6 @@ def get_default_experiments() -> Dict[str, ExperimentConfig]:
 # --- 2. Metrics Calculation ---
 
 def compute_ber_qpsk(x_hat: np.ndarray, x_true: np.ndarray) -> float:
-    """Computes Symbol Error Rate for QPSK."""
     x_hat_sign = np.sign(x_hat.real) + 1j * np.sign(x_hat.imag)
     x_true_sign = np.sign(x_true.real) + 1j * np.sign(x_true.imag)
     x_hat_sign.real[x_hat_sign.real == 0] = 1
@@ -132,7 +136,7 @@ def compute_rmse(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[float, 
 
 def load_gabv_model(ckpt_path: str, device: str) -> GABVNet:
     print(f"[Model] Loading GA-BV-Net from {ckpt_path}...")
-    cfg = GABVConfig(n_layers=6, hidden_dim_pn=64) # Ensure this matches training!
+    cfg = GABVConfig(n_layers=6, hidden_dim_pn=64)
     model = GABVNet(cfg)
     try:
         checkpoint = torch.load(ckpt_path, map_location=device)
@@ -146,27 +150,21 @@ def load_gabv_model(ckpt_path: str, device: str) -> GABVNet:
     return model
 
 def run_baselines_on_batch(batch_data: dict, sim_cfg: SimConfig) -> dict:
-    """Runs LMMSE and GAMP baselines."""
-    if not HAS_BASELINES:
-        return {}
+    if not HAS_BASELINES: return {}
 
     y_q = batch_data['y_q']
     x_true = batch_data['x_true']
     meta = batch_data['meta']
 
     B_batch = y_q.shape[0]
-
     ber_lmmse_list, ber_gamp_list = [], []
-    nmse_lmmse_list, nmse_gamp_list = [], []
 
     B_gain = meta['B_gain']
-    H_diag_all = meta['h_diag'] # Might be [N] or [B, N]
+    H_diag_all = meta['h_diag']
 
-    # --- FIX: Handle Broadcasting for 1D h_diag ---
+    # Broadcast Fix
     if H_diag_all.ndim == 1:
-        # If h_diag is [N] (shared geometry), tile it to [B, N]
         H_diag_all = np.tile(H_diag_all, (B_batch, 1))
-    # ----------------------------------------------
 
     snr_lin = meta['snr_linear']
     sigma_eta = meta['sigma_eta']
@@ -178,28 +176,23 @@ def run_baselines_on_batch(batch_data: dict, sim_cfg: SimConfig) -> dict:
     for i in range(B_batch):
         y = y_q[i]
         h_diag = H_diag_all[i] * B_gain
-        H_eff = np.diag(h_diag) # Now safe: h_diag is 1D vector
+        H_eff = np.diag(h_diag)
         x_t = x_true[i]
 
         # 1. LMMSE
         x_lmmse = detector_lmmse_bussgang(y, H_eff, noise_lmmse, P_signal=1.0)
         ber_lmmse_list.append(compute_ber_qpsk(x_lmmse, x_t))
-        nmse_lmmse_list.append(compute_nmse(x_lmmse, x_t))
 
         # 2. GAMP
         try:
             x_gamp = detector_gamp_1bit(y, H_eff, noise_gamp)
             ber_gamp_list.append(compute_ber_qpsk(x_gamp, x_t))
-            nmse_gamp_list.append(compute_nmse(x_gamp, x_t))
         except:
             ber_gamp_list.append(0.5)
-            nmse_gamp_list.append(0.0)
 
     return {
         "BER_LMMSE": np.mean(ber_lmmse_list),
-        "NMSE_LMMSE": np.mean(nmse_lmmse_list),
-        "BER_GAMP": np.mean(ber_gamp_list),
-        "NMSE_GAMP": np.mean(nmse_gamp_list)
+        "BER_GAMP": np.mean(ber_gamp_list)
     }
 
 # --- 4. Core Evaluation Loop ---
@@ -207,6 +200,7 @@ def run_baselines_on_batch(batch_data: dict, sim_cfg: SimConfig) -> dict:
 def run_single_scenario(cfg: ExperimentConfig, model: Optional[GABVNet],
                         device: str, ckpt_tag: str, out_dir: str):
     print(f"\n>>> Running Scenario: {cfg.scene_id} [{cfg.description}]")
+    print(f"    Baselines: {'ON' if cfg.use_baselines else 'OFF'}")
 
     sim_cfg = SimConfig()
     sim_cfg.enable_pa = cfg.enable_pa
@@ -267,12 +261,25 @@ def run_single_scenario(cfg: ExperimentConfig, model: Optional[GABVNet],
                 metrics_accum["RMSE_v"].append(r_v)
                 metrics_accum["RMSE_a"].append(r_a)
 
-                if outputs['geom_cache']['fim_invs']:
-                    fim_inv = outputs['geom_cache']['fim_invs'][-1].cpu().numpy()
-                    crlb_r = np.mean(fim_inv[:, 0])
-                    metrics_accum["BCRLB_R"].append(crlb_r)
-                    mse_r = r_r**2 + 1e-12
-                    metrics_accum["Eff_R"].append(crlb_r / mse_r)
+                # --- FIX 1 & 2: Robust FIM / Geom Cache Handling ---
+                geom_cache = outputs.get('geom_cache', {})
+                fim_invs = geom_cache.get('fim_invs', [])
+
+                if isinstance(fim_invs, list) and len(fim_invs) > 0:
+                    fim_inv = fim_invs[-1].cpu().numpy()
+
+                    # Robust Dimension Check
+                    crlb_r = np.nan
+                    if fim_inv.ndim == 3: # [B, 3, 3] -> [0,0]
+                        crlb_r = np.mean(fim_inv[:, 0, 0])
+                    elif fim_inv.ndim == 2: # [B, 3] -> [0]
+                        crlb_r = np.mean(fim_inv[:, 0])
+
+                    if not np.isnan(crlb_r):
+                        metrics_accum["BCRLB_R"].append(crlb_r)
+                        mse_r = r_r**2 + 1e-12
+                        metrics_accum["Eff_R"].append(crlb_r / mse_r)
+                # ----------------------------------------------------
 
             # C. Baselines
             if cfg.use_baselines and HAS_BASELINES:
@@ -339,12 +346,16 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--scenes", type=str, default="all")
     parser.add_argument("--n_mc", type=int, default=20)
+
+    # --- FIX 3: CLI Control for Baselines ---
+    parser.add_argument("--baselines", type=int, default=0, help="Run Baselines? 0=No, 1=Yes")
+    # ----------------------------------------
+
     parser.add_argument("--out_dir", type=str, default="results/p4")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Extract tag
     ckpt_tag = os.path.basename(os.path.dirname(args.ckpt))
     if not ckpt_tag: ckpt_tag = "custom"
 
@@ -358,8 +369,11 @@ def main():
         target_scenes = [all_scenarios[k] for k in keys if k in all_scenarios]
 
     print(f"--- Launching P4 Experiments (Tag: {ckpt_tag}) ---")
+    print(f"    Mode: {'WITH Baselines' if args.baselines else 'Net ONLY (Fast)'}")
+
     for sc in target_scenes:
         sc.n_mc = args.n_mc
+        sc.use_baselines = bool(args.baselines) # Override config
         run_single_scenario(sc, model, args.device, ckpt_tag, args.out_dir)
 
     print(f"\n[Done] All results saved to {args.out_dir}")
