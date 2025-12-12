@@ -40,8 +40,8 @@ class TrainConfig:
     seed: int = 42
     stage: int = 1
     n_steps: int = 2000
-    batch_size: int = 1024
-    lr: float = 1e-3
+    batch_size: int = 512
+    lr: float = 2e-3
     grad_clip: float = 1.0
     n_layers: int = 4
     hidden_dim_pn: int = 64
@@ -69,7 +69,7 @@ def set_stage_params(cfg: TrainConfig, sim_cfg: SimConfig):
         sim_cfg.enable_quantization = True
         cfg.w_geom = 0.01; cfg.w_bound = 0.0
     elif cfg.stage == 2:
-        sim_cfg.ibo_dB = 3.0; sim_cfg.pn_linewidth = 100e3
+        sim_cfg.ibo_dB = 3.0; sim_cfg.pn_linewidth = 300e3
         cfg.w_geom = 0.1; cfg.w_bound = 0.1
     elif cfg.stage == 3:
         sim_cfg.ibo_dB = 0.0; sim_cfg.pn_linewidth = 500e3

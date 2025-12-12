@@ -50,7 +50,7 @@ class ExperimentConfig:
     description: str
     snr_grid: List[float]
     n_mc: int = 50
-    batch_size: int = 1024
+    batch_size: int = 2048
 
     # Methods to run (Controlled dynamically via CLI now)
     use_ga_bv_net: bool = True
