@@ -690,13 +690,22 @@ def main():
                         help='Output directory')
     parser.add_argument('--scene', type=str, default='all',
                         help='Scene ID to run (or "all")')
+    parser.add_argument('--n_mc', type=int, default=10,
+                        help='Number of Monte Carlo trials (default: 10)')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='Batch size per trial (default: 64)')
     parser.add_argument('--no_baselines', action='store_true',
                         help='Disable baselines')
     parser.add_argument('--no_model', action='store_true',
                         help='Disable GA-BV-Net (baselines only)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda/cpu, default: auto-detect)')
     args = parser.parse_args()
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if args.device:
+        device = args.device
+    else:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[Device] Using: {device}")
 
     print("\n" + "=" * 60)
@@ -727,11 +736,18 @@ def main():
             print(f"[Error] Scene '{args.scene}' not found")
             sys.exit(1)
 
+    # Apply command line overrides
     for exp in experiments:
         if args.no_baselines:
             exp.use_baselines = False
         if args.no_model:
             exp.use_ga_bv_net = False
+        # Override n_mc and batch_size from command line
+        exp.n_mc = args.n_mc
+        exp.batch_size = args.batch_size
+
+    print(f"[Config] n_mc={args.n_mc}, batch_size={args.batch_size}")
+    print(f"[Config] Scenes: {[e.scene_id for e in experiments]}")
 
     for exp in experiments:
         run_single_scenario(exp, model, device, ckpt_tag, args.out)
