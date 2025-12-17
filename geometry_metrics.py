@@ -144,17 +144,19 @@ def estimate_gamma_eff(sim_stats: Dict[str, float]) -> float:
     First-principles Γ_eff estimation from power decomposition.
 
     Formula (per DR-P2-2.5):
-        Γ_eff = P_signal / (P_pa + P_pn + P_quant)
+        Γ_eff = P_signal / (P_pa + P_pn)
 
-    This is the ONLY correct way to compute Γ_eff.
-    DO NOT use magic values like 0.5 or 100.
+    IMPORTANT: P_quantization_loss is NOT included!
+    - Γ_eff captures TX-side distortions (PA nonlinearity + phase noise)
+    - χ captures RX-side quantization loss separately
+    - Including P_quant would double-count the quantization effect
 
     Args:
         sim_stats: Dict with keys:
             - P_signal: Main signal power
             - P_pa_distortion: PA Bussgang residual power
             - P_phase_noise: Phase noise equivalent power
-            - P_quantization_loss: Quantization Bussgang residual
+            - P_quantization_loss: (NOT USED for Γ_eff - captured by χ)
 
     Returns:
         gamma_eff: Hardware distortion ratio (linear scale)
@@ -162,10 +164,10 @@ def estimate_gamma_eff(sim_stats: Dict[str, float]) -> float:
     P_sig = sim_stats.get('P_signal', 1.0)
     P_pa = sim_stats.get('P_pa_distortion', 0.0)
     P_pn = sim_stats.get('P_phase_noise', 0.0)
-    P_quant = sim_stats.get('P_quantization_loss', 0.0)
+    # NOTE: P_quantization_loss NOT included - it's captured by chi factor
 
-    # Total distortion power
-    P_dist = P_pa + P_pn + P_quant
+    # Total TX-side distortion power
+    P_dist = P_pa + P_pn
 
     # Compute Gamma_eff
     if P_dist < 1e-12:

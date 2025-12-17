@@ -382,8 +382,11 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
             ibo_db = batch.get('_ibo_dB', 0)
             pn_lw = batch.get('_pn_linewidth', 0)
 
+            # Convert gamma_eff to dB for better display
+            raw_gamma_db = 10 * np.log10(raw_gamma + 1e-12)
+
             print(f"Step {step} | Loss: {loss.item():.4f} | Comm: {metrics['L_comm']:.4f} | "
-                  f"g_PN: {g_pn_val:.2f} | χ: {raw_chi:.3f} | Γ_eff: {raw_gamma:.2f} | "
+                  f"g_PN: {g_pn_val:.2f} | χ: {raw_chi:.3f} | Γ_eff: {raw_gamma_db:.1f} dB | "
                   f"seed: {seed_used}")
 
             writer.add_scalar("Loss/Total", loss.item(), step)
