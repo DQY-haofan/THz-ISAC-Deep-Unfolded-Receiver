@@ -390,7 +390,7 @@ if __name__ == "__main__":
     mc_results = verify_mc_randomness()
     print(f"  No seed unique: {mc_results['no_seed_unique']} {'✓' if mc_results['no_seed_unique'] else '✗'}")
     print(f"  Same seed identical: {mc_results['same_seed_identical']} {'✓' if mc_results['same_seed_identical'] else '✗'}")
-    print(f"  Different seeds unique: {mc_results['diff_seeds_unique']} {'✓' if mc_results['diff_seeds_unique'] else '✗'}")
+    print(f"  Different seeds unique: {mc_results['diff_seed_unique']} {'✓' if mc_results['diff_seed_unique'] else '✗'}")
     print(f"  OVERALL: {'PASS ✓' if mc_results['all_pass'] else 'FAIL ✗'}")
 
     print("\n--- Gamma_eff Monotonicity Check ---")
