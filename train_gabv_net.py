@@ -247,8 +247,8 @@ class THzISACDataset:
             'x_true': torch.from_numpy(raw_data['x_true']).cfloat(),
             'theta_true': theta_true,
             'theta_init': theta_init,
-            'meta': meta,
-            # Raw values for monitoring
+            'meta': torch.from_numpy(meta).float(),  # FIX: Convert to tensor
+            # Raw values for monitoring (not tensors, won't go to GPU)
             '_raw_gamma_eff': raw_gamma_eff,
             '_raw_chi': raw_chi,
             '_raw_sinr_eff': raw_sinr_eff,
