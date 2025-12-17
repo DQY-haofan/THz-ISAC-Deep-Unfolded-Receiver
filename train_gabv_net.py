@@ -1,25 +1,14 @@
 """
-train_gabv_net.py (Definition Freeze v3 - MC Randomness Fixed)
+train_gabv_net.py (MC Randomness Fixed - v3.1)
 
-Description:
-    Training Pipeline for GA-BV-Net.
+CRITICAL FIXES:
+1. Global RNG with unique seeds per batch (not per stage)
+2. Hardware parameter randomization for gamma_eff diversity
+3. Seed tracking in output for verification
 
-    **CRITICAL FIX** per Expert Review (Blocker 3):
-    - Dataset uses master RNG with step counter
-    - Each batch gets unique seed: batch_seed = master_rng.integers(0, 2³¹) + step
-    - Calls simulate_batch(config, batch_size, seed=batch_seed)
-    - REMOVED gamma_proxy entirely
-
-    **Meta Feature Definition** (Frozen v3):
-        [0] snr_db_norm      - Normalized SNR in dB
-        [1] gamma_eff_db_norm - Normalized Gamma_eff in dB
-        [2] chi              - Information retention factor (raw)
-        [3] sigma_eta_norm   - Normalized PA distortion power
-        [4] pn_linewidth_norm - Normalized PN linewidth
-        [5] ibo_db_norm      - Normalized IBO
-
-Author: Definition Freeze v3
-Date: 2025-12-17
+Usage:
+    python train_gabv_net.py --stage 1 --steps 2000
+    python train_gabv_net.py --curriculum  # Run stages 1→2→3 with continuous RNG
 """
 
 import torch
@@ -45,9 +34,7 @@ except ImportError as e:
     exit(1)
 
 
-# =============================================================================
-# 1. Configuration
-# =============================================================================
+# --- 1. Configuration ---
 
 @dataclass
 class TrainConfig:
@@ -62,7 +49,7 @@ class TrainConfig:
     hidden_dim_pn: int = 64
     cg_steps: int = 5
 
-    # Loss Weights
+    # Loss Weights (Defaults)
     w_comm: float = 1.0
     w_sens: float = 1.0
     w_geom: float = 0.0
@@ -73,7 +60,7 @@ class TrainConfig:
     ckpt_dir: str = "results/checkpoints"
     eval_dir: str = "results/eval_results"
 
-    # Meta Feature Normalization Constants (Definition Freeze)
+    # --- Meta Feature Normalization Constants (Definition Freeze) ---
     snr_db_center: float = 15.0
     snr_db_scale: float = 15.0
     gamma_eff_db_center: float = 10.0
@@ -83,9 +70,37 @@ class TrainConfig:
     ibo_db_center: float = 3.0
     ibo_db_scale: float = 3.0
 
+    # --- NEW: Hardware Randomization for Gamma_eff Diversity ---
+    randomize_hardware: bool = True
+    ibo_range: tuple = (1.0, 8.0)        # IBO range in dB
+    pn_linewidth_range: tuple = (1e3, 1e6)  # PN linewidth range in Hz
+
+
+# Global step counter for unique seeds across all stages
+_global_step_counter = 0
+
+
+def get_global_step():
+    """Get current global step (unique across all stages)."""
+    global _global_step_counter
+    return _global_step_counter
+
+
+def increment_global_step():
+    """Increment and return global step."""
+    global _global_step_counter
+    _global_step_counter += 1
+    return _global_step_counter
+
+
+def reset_global_step():
+    """Reset global step (only for fresh training runs)."""
+    global _global_step_counter
+    _global_step_counter = 0
+
 
 def set_stage_params(cfg: TrainConfig, sim_cfg: SimConfig):
-    """Configures Physics based on Stage."""
+    """Configures Physics based on Stage (BASE values - will be randomized)."""
     print(f"[Curriculum] Configuring Stage {cfg.stage}...")
     if cfg.stage == 0:
         sim_cfg.enable_pa = False
@@ -95,70 +110,66 @@ def set_stage_params(cfg: TrainConfig, sim_cfg: SimConfig):
         cfg.w_bound = 0.0
     elif cfg.stage == 1:
         sim_cfg.enable_pa = True
-        sim_cfg.ibo_dB = 6.0
+        sim_cfg.ibo_dB = 6.0  # Base value
         sim_cfg.enable_pn = True
-        sim_cfg.pn_linewidth = 1e3
+        sim_cfg.pn_linewidth = 1e3  # Base value
         sim_cfg.enable_quantization = True
         cfg.w_geom = 0.01
         cfg.w_bound = 0.0
     elif cfg.stage == 2:
-        sim_cfg.ibo_dB = 3.0
-        sim_cfg.pn_linewidth = 500e3
+        sim_cfg.enable_pa = True
+        sim_cfg.ibo_dB = 3.0  # Base value
+        sim_cfg.enable_pn = True
+        sim_cfg.pn_linewidth = 500e3  # Base value
+        sim_cfg.enable_quantization = True
+        cfg.w_geom = 0.05
+        cfg.w_bound = 0.01
+    elif cfg.stage == 3:
+        sim_cfg.enable_pa = True
+        sim_cfg.ibo_dB = 0.0  # Base value
+        sim_cfg.enable_pn = True
+        sim_cfg.pn_linewidth = 1e6  # Base value
+        sim_cfg.enable_quantization = True
         cfg.w_geom = 0.1
         cfg.w_bound = 0.1
-    elif cfg.stage == 3:
-        sim_cfg.ibo_dB = 0.0
-        sim_cfg.pn_linewidth = 100e4
-        cfg.w_geom = 0.2
-        cfg.w_bound = 1.0
 
 
-# =============================================================================
-# 2. Meta Feature Construction (Definition Freeze v3)
-# =============================================================================
+# --- 2. Meta Features ---
 
-def construct_meta_features(raw_meta: dict, train_cfg: TrainConfig, batch_size: int) -> torch.Tensor:
+def construct_meta_features(raw_meta: dict, train_cfg: TrainConfig, batch_size: int) -> np.ndarray:
     """
-    Constructs normalized meta feature tensor from simulation metadata.
+    Construct meta feature vector from simulation metadata.
 
-    **DEFINITION FREEZE v3** - 6 features:
-        [0] snr_db_norm       - (snr_db - center) / scale
-        [1] gamma_eff_db_norm - (gamma_eff_dB - center) / scale
-        [2] chi               - Raw chi value (already in [0, 2/π])
-        [3] sigma_eta_norm    - sigma_eta / scale
-        [4] pn_linewidth_norm - log10(pn_linewidth + 1) / 6
-        [5] ibo_db_norm       - (ibo_dB - center) / scale
-
-    Args:
-        raw_meta: Meta dict from simulate_batch()
-        train_cfg: Training config with normalization constants
-        batch_size: Number of samples
-
-    Returns:
-        meta_tensor: [B, 6] float tensor
+    Definition Freeze v3 (6-dim):
+        [0] snr_db_norm       - Normalized SNR in dB
+        [1] gamma_eff_db_norm - Normalized Gamma_eff in dB
+        [2] chi               - Information retention factor (raw)
+        [3] sigma_eta_norm    - Normalized PA distortion power
+        [4] pn_linewidth_norm - Normalized PN linewidth (log scale)
+        [5] ibo_db_norm       - Normalized IBO
     """
-    meta = torch.zeros(batch_size, 6)
+    meta = np.zeros((batch_size, 6), dtype=np.float32)
 
     # [0] SNR normalized
-    snr_db = raw_meta['snr_db']
+    snr_db = raw_meta.get('snr_db', 20.0)
     meta[:, 0] = (snr_db - train_cfg.snr_db_center) / train_cfg.snr_db_scale
 
-    # [1] Gamma_eff normalized (in dB) - REAL from simulation
-    gamma_eff = raw_meta['gamma_eff']
-    gamma_eff_db = 10 * np.log10(max(gamma_eff, 1e-12))
+    # [1] Gamma_eff normalized (in dB)
+    gamma_eff = raw_meta.get('gamma_eff', 1.0)
+    gamma_eff_db = 10 * np.log10(gamma_eff + 1e-12)
     meta[:, 1] = (gamma_eff_db - train_cfg.gamma_eff_db_center) / train_cfg.gamma_eff_db_scale
 
-    # [2] Chi (raw value, already normalized to [0, 2/π]) - REAL from simulation
-    chi = raw_meta['chi']
+    # [2] Chi (raw value, already in [0, 1])
+    chi = raw_meta.get('chi', 0.6)
     meta[:, 2] = chi
 
     # [3] Sigma_eta normalized
-    sigma_eta = raw_meta['sigma_eta']
+    sigma_eta = raw_meta.get('sigma_eta', 0.0)
     meta[:, 3] = sigma_eta / train_cfg.sigma_eta_scale
 
     # [4] PN Linewidth normalized (log-scale)
     pn_linewidth = raw_meta.get('pn_linewidth', 100e3)
-    meta[:, 4] = np.log10(pn_linewidth + 1) / 6.0
+    meta[:, 4] = np.log10(pn_linewidth + 1) / np.log10(train_cfg.pn_linewidth_scale)
 
     # [5] IBO normalized
     ibo_db = raw_meta.get('ibo_dB', 3.0)
@@ -167,52 +178,53 @@ def construct_meta_features(raw_meta: dict, train_cfg: TrainConfig, batch_size: 
     return meta
 
 
-# =============================================================================
-# 3. Dataset (MC Randomness Fixed)
-# =============================================================================
+# --- 3. Dataset ---
 
 class THzISACDataset:
     """
-    Dataset with PROPER Monte Carlo randomness.
-
-    **CRITICAL FIX** (Blocker 3):
-    - Uses master RNG to generate unique seeds per step
-    - Each batch gets different random data
-    - Reproducible if master seed is fixed
+    Dataset with proper MC randomness:
+    - Uses global master RNG for consistent seed generation
+    - Unique seed for each batch
+    - Optional hardware parameter randomization
     """
-    def __init__(self, train_cfg: TrainConfig):
+
+    def __init__(self, train_cfg: TrainConfig, master_rng: np.random.Generator):
         self.train_cfg = train_cfg
         self.sim_cfg = SimConfig()
         set_stage_params(train_cfg, self.sim_cfg)
-
-        # Master RNG for seed generation
-        self.master_rng = np.random.default_rng(train_cfg.seed)
+        self.master_rng = master_rng  # Shared across stages
         self.step_counter = 0
 
-        # RNG for SNR sampling (separate from data generation)
-        self.snr_rng = np.random.default_rng(train_cfg.seed + 1000)
+        # Track gamma_eff diversity
+        self.gamma_eff_history = []
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        # Generate unique seed for this batch
-        batch_seed = int(self.master_rng.integers(0, 2**31)) + self.step_counter
-        self.step_counter += 1
-
-        # Random SNR for curriculum
-        current_snr = self.snr_rng.uniform(0, 30)
+        # Randomize SNR
+        current_snr = self.master_rng.uniform(0, 30)
         self.sim_cfg.snr_db = current_snr
 
-        # Generate data with unique seed
-        raw_data = simulate_batch(self.sim_cfg, batch_size=self.train_cfg.batch_size,
-                                  seed=batch_seed)
+        # NEW: Randomize hardware parameters for diversity
+        if self.train_cfg.randomize_hardware:
+            self.sim_cfg.ibo_dB = self.master_rng.uniform(*self.train_cfg.ibo_range)
+            self.sim_cfg.pn_linewidth = 10 ** self.master_rng.uniform(
+                np.log10(self.train_cfg.pn_linewidth_range[0]),
+                np.log10(self.train_cfg.pn_linewidth_range[1])
+            )
+
+        # Generate unique seed for this batch
+        batch_seed = self.master_rng.integers(0, 2**31)
+
+        # Simulate with unique seed
+        raw_data = simulate_batch(self.sim_cfg, batch_size=self.train_cfg.batch_size, seed=batch_seed)
 
         theta_true = torch.tensor(raw_data['theta_true'], dtype=torch.float32)
         tle_noise = torch.randn_like(theta_true) * torch.tensor([100.0, 10.0, 0.5])
         theta_init = theta_true + tle_noise
 
-        # Construct meta features from REAL gamma_eff/chi (NOT gamma_proxy!)
+        # Construct meta features
         meta = construct_meta_features(
             raw_meta=raw_data['meta'],
             train_cfg=self.train_cfg,
@@ -223,6 +235,12 @@ class THzISACDataset:
         raw_gamma_eff = raw_data['meta']['gamma_eff']
         raw_chi = raw_data['meta']['chi']
         raw_sinr_eff = raw_data['meta']['sinr_eff']
+        seed_used = raw_data['meta'].get('seed_used', batch_seed)
+
+        # Track diversity
+        self.gamma_eff_history.append(raw_gamma_eff)
+        self.step_counter += 1
+        increment_global_step()
 
         return {
             'y_q': torch.from_numpy(raw_data['y_q']).cfloat(),
@@ -230,18 +248,34 @@ class THzISACDataset:
             'theta_true': theta_true,
             'theta_init': theta_init,
             'meta': meta,
-            # Raw values for monitoring (not used in network)
+            # Raw values for monitoring
             '_raw_gamma_eff': raw_gamma_eff,
             '_raw_chi': raw_chi,
             '_raw_sinr_eff': raw_sinr_eff,
             '_raw_snr_db': current_snr,
-            '_batch_seed': batch_seed,  # Track seed for reproducibility
+            '_seed_used': seed_used,
+            '_ibo_dB': self.sim_cfg.ibo_dB,
+            '_pn_linewidth': self.sim_cfg.pn_linewidth,
+        }
+
+    def get_diversity_stats(self) -> dict:
+        """Return diversity statistics for gamma_eff."""
+        if not self.gamma_eff_history:
+            return {'unique_ratio': 0, 'total': 0, 'unique': 0}
+
+        # Round to 2 decimal places for comparison
+        rounded = [round(g, 2) for g in self.gamma_eff_history]
+        unique = len(set(rounded))
+        total = len(rounded)
+
+        return {
+            'unique_ratio': unique / total,
+            'total': total,
+            'unique': unique
         }
 
 
-# =============================================================================
-# 4. Loss Engine
-# =============================================================================
+# --- 4. Loss Engine ---
 
 class GABVLoss(nn.Module):
     def __init__(self, cfg: TrainConfig):
@@ -277,11 +311,24 @@ class GABVLoss(nn.Module):
         }
 
 
-# =============================================================================
-# 5. Training Loop
-# =============================================================================
+# --- 5. Training Loop ---
 
-def train_one_stage(cfg: TrainConfig):
+def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
+    """
+    Train one stage with proper MC randomness.
+
+    Args:
+        cfg: TrainConfig instance
+        master_rng: Optional shared RNG (for curriculum training)
+
+    Returns:
+        master_rng: Updated RNG for next stage
+    """
+    # Create or use shared master RNG
+    if master_rng is None:
+        master_rng = np.random.default_rng(cfg.seed)
+        reset_global_step()
+
     # Unique Run ID
     run_id = f"Stage{cfg.stage}_{int(time.time())}"
     log_path = os.path.join(cfg.log_dir, run_id)
@@ -295,17 +342,18 @@ def train_one_stage(cfg: TrainConfig):
     model_cfg = GABVConfig(n_layers=cfg.n_layers)
     model = create_gabv_model(model_cfg).to(cfg.device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
-    dataset = THzISACDataset(cfg)
+    dataset = THzISACDataset(cfg, master_rng)
     criterion = GABVLoss(cfg)
 
     print(f"--- Starting Training: {run_id} ---")
     print(f"    Using REAL gamma_eff/chi (gamma_proxy REMOVED)")
     print(f"    MC Randomness: FIXED (unique seed per batch)")
+    print(f"    Hardware Randomization: {'ON' if cfg.randomize_hardware else 'OFF'}")
+
     model.train()
     data_iter = iter(dataset)
 
     loss_history = []
-    gamma_eff_history = []  # Track for diversity check
 
     for step in range(1, cfg.n_steps + 1):
         batch = next(data_iter)
@@ -320,28 +368,34 @@ def train_one_stage(cfg: TrainConfig):
         nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
-        # Track gamma_eff for diversity verification
-        raw_gamma = batch.get('_raw_gamma_eff', 0)
-        gamma_eff_history.append(raw_gamma)
-
         if step % 50 == 0:
+            # Extract Gate Values
             last_layer_gates = outputs['layers'][-1]['gates']
             g_pn_val = last_layer_gates['g_PN'].mean().item()
             g_nl_val = last_layer_gates['g_NL'].mean().item()
 
+            # Extract raw metrics
+            raw_gamma = batch.get('_raw_gamma_eff', 0)
             raw_chi = batch.get('_raw_chi', 0)
             raw_snr = batch.get('_raw_snr_db', 0)
-            batch_seed = batch.get('_batch_seed', 0)
+            seed_used = batch.get('_seed_used', 0)
+            ibo_db = batch.get('_ibo_dB', 0)
+            pn_lw = batch.get('_pn_linewidth', 0)
 
             print(f"Step {step} | Loss: {loss.item():.4f} | Comm: {metrics['L_comm']:.4f} | "
-                  f"g_PN: {g_pn_val:.2f} | χ: {raw_chi:.3f} | Γ_eff: {raw_gamma:.2f} | seed: {batch_seed}")
+                  f"g_PN: {g_pn_val:.2f} | χ: {raw_chi:.3f} | Γ_eff: {raw_gamma:.2f} | "
+                  f"seed: {seed_used}")
 
             writer.add_scalar("Loss/Total", loss.item(), step)
             writer.add_scalar("Gates/g_PN", g_pn_val, step)
             writer.add_scalar("Physics/chi", raw_chi, step)
             writer.add_scalar("Physics/gamma_eff", raw_gamma, step)
             writer.add_scalar("Physics/snr_db", raw_snr, step)
+            writer.add_scalar("Physics/ibo_dB", ibo_db, step)
+            writer.add_scalar("Physics/pn_linewidth", pn_lw, step)
+            writer.add_scalar("MC/seed", seed_used, step)
 
+            # Record detailed metrics
             record = {
                 "Step": step,
                 "Loss": loss.item(),
@@ -351,128 +405,138 @@ def train_one_stage(cfg: TrainConfig):
                 "gamma_eff": raw_gamma,
                 "chi": raw_chi,
                 "snr_db": raw_snr,
-                "batch_seed": batch_seed,
+                "ibo_dB": ibo_db,
+                "pn_linewidth": pn_lw,
+                "seed": seed_used,
             }
             loss_history.append(record)
 
-    # Verify MC diversity
-    gamma_eff_unique = len(set([f"{g:.4f}" for g in gamma_eff_history]))
-    gamma_eff_total = len(gamma_eff_history)
-    diversity_ratio = gamma_eff_unique / gamma_eff_total
-    print(f"\n[MC Diversity Check] Unique gamma_eff values: {gamma_eff_unique}/{gamma_eff_total} ({diversity_ratio:.1%})")
+    # Diversity check
+    diversity = dataset.get_diversity_stats()
+    print(f"\n [MC Diversity Check] Unique gamma_eff values: {diversity['unique']}/{diversity['total']} "
+          f"({diversity['unique_ratio']*100:.1f}%)")
 
-    if diversity_ratio < 0.5:
-        print("⚠️  WARNING: Low diversity in gamma_eff - MC randomness may not be working correctly!")
+    if diversity['unique_ratio'] < 0.5:
+        print("⚠️  WARNING: Low diversity in gamma_eff - check hardware randomization!")
+    else:
+        print("✓  Good diversity in gamma_eff")
 
     # Save checkpoint with meta
     checkpoint = {
         'model_state': model.state_dict(),
         'config': {
             'stage': cfg.stage,
-            'n_layers': cfg.n_layers,
             'n_steps': cfg.n_steps,
+            'n_layers': cfg.n_layers,
+            'lr': cfg.lr,
         },
-        'meta_feature_definition': {
-            'version': 'v3_definition_freeze',
-            'dims': ['snr_db_norm', 'gamma_eff_db_norm', 'chi',
-                     'sigma_eta_norm', 'pn_linewidth_norm', 'ibo_db_norm'],
-            'note': 'gamma_proxy REMOVED, MC randomness FIXED'
-        },
+        'version': 'v3.1_mc_fixed',
         'mc_randomness_info': {
-            'status': 'FIXED',
-            'diversity_ratio': diversity_ratio,
-            'unique_values': gamma_eff_unique,
-            'total_steps': gamma_eff_total,
+            'fixed': True,
+            'diversity_ratio': diversity['unique_ratio'],
+            'hardware_randomization': cfg.randomize_hardware,
+            'global_step_end': get_global_step(),
         }
     }
     torch.save(checkpoint, os.path.join(ckpt_path, "final.pth"))
 
-    save_training_curves(loss_history, cfg.eval_dir, run_id)
+    # Save training history
+    df = pd.DataFrame(loss_history)
+    csv_path = os.path.join(cfg.eval_dir, f"train_curve_{run_id}.csv")
+    df.to_csv(csv_path, index=False)
+
+    # Plot training curves
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    axes[0, 0].plot(df['Step'], df['Loss'])
+    axes[0, 0].set_xlabel('Step')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training Loss')
+
+    axes[0, 1].plot(df['Step'], df['gamma_eff'], label='Γ_eff', alpha=0.7)
+    axes[0, 1].set_xlabel('Step')
+    axes[0, 1].set_ylabel('Γ_eff')
+    axes[0, 1].set_title('Gamma_eff Over Training')
+
+    axes[1, 0].plot(df['Step'], df['chi'], label='χ', alpha=0.7)
+    axes[1, 0].set_xlabel('Step')
+    axes[1, 0].set_ylabel('χ')
+    axes[1, 0].set_title('Chi Over Training')
+
+    axes[1, 1].scatter(df['gamma_eff'], df['chi'], alpha=0.3, s=10)
+    axes[1, 1].set_xlabel('Γ_eff')
+    axes[1, 1].set_ylabel('χ')
+    axes[1, 1].set_title('Γ_eff vs χ (should show variation)')
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(cfg.eval_dir, f"train_curve_{run_id}.png"), dpi=150)
+    fig.savefig(os.path.join(cfg.eval_dir, f"train_curve_{run_id}.pdf"))
+    plt.close(fig)
+
+    print(f"[Result] Saved training curves to {cfg.eval_dir}/train_curve_{run_id}.*")
+    print("Training Complete.\n")
 
     writer.close()
-    print("Training Complete.")
-    return model
+
+    return master_rng  # Return for curriculum training
 
 
-# =============================================================================
-# 6. Utils
-# =============================================================================
+def run_curriculum(cfg: TrainConfig, stages=[1, 2, 3]):
+    """
+    Run curriculum training with shared RNG across stages.
 
-def save_training_curves(history, save_dir, run_id):
-    """Saves training loss & gate curves with gamma_eff/chi info."""
-    df = pd.DataFrame(history)
-    base_name = os.path.join(save_dir, f"train_curve_{run_id}")
+    This ensures:
+    - Each stage uses different seeds (not the same sequence)
+    - Global step counter increases continuously
+    """
+    print("=" * 60)
+    print("CURRICULUM TRAINING (MC Randomness Fixed)")
+    print("=" * 60)
+    print(f"Stages: {stages}")
+    print(f"Base seed: {cfg.seed}")
+    print(f"Hardware randomization: {cfg.randomize_hardware}")
+    print("=" * 60)
 
-    df.to_csv(f"{base_name}.csv", index=False)
+    # Create master RNG once
+    master_rng = np.random.default_rng(cfg.seed)
+    reset_global_step()
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for stage in stages:
+        cfg.stage = stage
+        print(f"\n{'='*60}")
+        print(f"STAGE {stage}")
+        print(f"{'='*60}")
 
-    # Top-Left: Loss
-    axes[0, 0].plot(df["Step"], df["Loss"], label="Total Loss", color='blue')
-    axes[0, 0].plot(df["Step"], df["L_comm"], label="Comm MSE", linestyle="--", color='cyan')
-    axes[0, 0].set_xlabel("Steps")
-    axes[0, 0].set_ylabel("Loss")
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
+        # Pass and update master RNG
+        master_rng = train_one_stage(cfg, master_rng)
 
-    # Top-Right: Gates
-    axes[0, 1].plot(df["Step"], df["g_PN"], label="g_PN", color='red')
-    axes[0, 1].plot(df["Step"], df["g_NL"], label="g_NL", color='orange')
-    axes[0, 1].set_xlabel("Steps")
-    axes[0, 1].set_ylabel("Gate Value")
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
+        print(f"Stage {stage} complete. Global step: {get_global_step()}")
 
-    # Bottom-Left: Gamma_eff and Chi (should show VARIATION now!)
-    ax3 = axes[1, 0]
-    ax3.plot(df["Step"], df["gamma_eff"], label=r"$\Gamma_{eff}$", color='green')
-    ax3.set_xlabel("Steps")
-    ax3.set_ylabel(r"$\Gamma_{eff}$ (linear)")
-    ax3.legend(loc='upper left')
-    ax3.grid(True)
-
-    ax3_twin = ax3.twinx()
-    ax3_twin.plot(df["Step"], df["chi"], label=r"$\chi$", color='purple', linestyle='--')
-    ax3_twin.set_ylabel(r"$\chi$")
-    ax3_twin.legend(loc='upper right')
-
-    # Bottom-Right: SNR variation
-    axes[1, 1].plot(df["Step"], df["snr_db"], label="SNR (dB)", color='brown', alpha=0.7)
-    axes[1, 1].set_xlabel("Steps")
-    axes[1, 1].set_ylabel("SNR (dB)")
-    axes[1, 1].legend()
-    axes[1, 1].grid(True)
-
-    plt.suptitle(f"Training Dynamics: {run_id}\n(Definition Freeze v3 - MC Randomness FIXED)")
-    fig.tight_layout()
-
-    fig.savefig(f"{base_name}.png", dpi=300)
-    fig.savefig(f"{base_name}.pdf")
-    plt.close(fig)
-    print(f"[Result] Saved training curves to {base_name}.*")
+    print("\n" + "=" * 60)
+    print("CURRICULUM TRAINING COMPLETE")
+    print(f"Total steps across all stages: {get_global_step()}")
+    print("=" * 60)
 
 
-# =============================================================================
-# Main
-# =============================================================================
+# --- Main ---
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", type=int, default=1, help="Curriculum Stage")
-    parser.add_argument("--steps", type=int, default=2000, help="Training Steps")
+    parser.add_argument("--stage", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--curriculum", action="store_true", help="Run stages 1→2→3")
+    parser.add_argument("--no-hw-random", action="store_true", help="Disable hardware randomization")
     args = parser.parse_args()
 
-    for d in ["results/train_logs", "results/checkpoints", "results/eval_results"]:
-        os.makedirs(d, exist_ok=True)
+    cfg = TrainConfig(
+        stage=args.stage,
+        n_steps=args.steps,
+        seed=args.seed,
+        randomize_hardware=not args.no_hw_random
+    )
 
-    cfg = TrainConfig(stage=args.stage, n_steps=args.steps)
-
-    print("=" * 60)
-    print("GA-BV-Net Training (Definition Freeze v3)")
-    print("=" * 60)
-    print("FIXES APPLIED:")
-    print("  [✓] gamma_proxy REMOVED - using REAL gamma_eff/chi")
-    print("  [✓] MC Randomness FIXED - unique seed per batch")
-    print("=" * 60)
-
-    train_one_stage(cfg)
+    if args.curriculum:
+        run_curriculum(cfg, stages=[1, 2, 3])
+    else:
+        train_one_stage(cfg)
