@@ -297,7 +297,7 @@ def simulate_batch(config: SimConfig, batch_size: int = 64, seed: Optional[int] 
 
 # --- Verification Functions ---
 
-def verify_mc_randomness() -> Dict:
+def verify_mc_randomness(n_trials: int = 5) -> Dict:
     """
     Verify Monte Carlo randomness is working correctly.
 
@@ -305,38 +305,44 @@ def verify_mc_randomness() -> Dict:
     1. No seed → unique data each call
     2. Same seed → identical data
     3. Different seeds → unique data
+
+    Args:
+        n_trials: Number of trials for each test (default: 5)
     """
     cfg = SimConfig()
     results = {}
 
     # Test 1: No seed - should be unique each call
     checksums_no_seed = []
-    for _ in range(5):
+    for _ in range(n_trials):
         data = simulate_batch(cfg, batch_size=16, seed=None)
         cs = hashlib.md5(data['y_q'].tobytes()).hexdigest()[:8]
         checksums_no_seed.append(cs)
-    results['no_seed_unique'] = len(set(checksums_no_seed)) == 5
+    results['no_seed_unique'] = len(set(checksums_no_seed)) == n_trials
+    results['no_seed_checksums'] = checksums_no_seed
 
     # Test 2: Same seed - should be identical
     checksums_same_seed = []
-    for _ in range(5):
+    for _ in range(n_trials):
         data = simulate_batch(cfg, batch_size=16, seed=12345)
         cs = hashlib.md5(data['y_q'].tobytes()).hexdigest()[:8]
         checksums_same_seed.append(cs)
     results['same_seed_identical'] = len(set(checksums_same_seed)) == 1
+    results['same_seed_checksums'] = checksums_same_seed
 
     # Test 3: Different seeds - should be unique
     checksums_diff_seed = []
-    for i in range(5):
+    for i in range(n_trials):
         data = simulate_batch(cfg, batch_size=16, seed=12345 + i)
         cs = hashlib.md5(data['y_q'].tobytes()).hexdigest()[:8]
         checksums_diff_seed.append(cs)
-    results['diff_seeds_unique'] = len(set(checksums_diff_seed)) == 5
+    results['diff_seed_unique'] = len(set(checksums_diff_seed)) == n_trials
+    results['diff_seed_checksums'] = checksums_diff_seed
 
     results['all_pass'] = all([
         results['no_seed_unique'],
         results['same_seed_identical'],
-        results['diff_seeds_unique']
+        results['diff_seed_unique']
     ])
 
     return results
