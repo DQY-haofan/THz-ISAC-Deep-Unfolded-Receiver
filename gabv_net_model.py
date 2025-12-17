@@ -247,7 +247,14 @@ class GABVNet(nn.Module):
         meta = batch['meta']
         theta = batch['theta_init']
 
-        snr = meta[:, 0:1]
+        # FIX: Convert normalized SNR back to linear scale
+        # meta[:, 0] is snr_db_norm = (snr_db - 15) / 15
+        # Need to denormalize: snr_db = snr_db_norm * 15 + 15
+        # Then convert to linear: snr_linear = 10^(snr_db/10)
+        snr_db_norm = meta[:, 0:1]
+        snr_db = snr_db_norm * 15.0 + 15.0  # Denormalize
+        snr = 10 ** (snr_db / 10.0)  # Convert to linear
+
         gamma_eff = meta[:, 1:2]
 
         if 'x_init' in batch:
