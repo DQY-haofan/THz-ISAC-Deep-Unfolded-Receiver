@@ -60,7 +60,7 @@ class GABVConfig:
     block_size_fim: int = 32
 
     # [FIX 4] Enable theta update
-    enable_theta_update: bool = False
+    enable_theta_update: bool = True
     theta_update_start_layer: int = 1  # Start updating from layer 1
 
 
@@ -349,10 +349,12 @@ class UnrolledCGSolver(nn.Module):
 
 class ThetaUpdater(nn.Module):
     """
-    [FIX 4] Theta Update Module - ACTUALLY UPDATES THETA!
+    [FIX 4 & 9] Theta Update Module with Physical Constraints
 
-    Previous bug: theta_next = theta (no update)
-    Now: Uses residual-based gradient estimation
+    [FIX 9] Added:
+    - Physical clipping: Limits per-layer update to physically plausible range
+    - Confidence gating: Only update when symbol estimate is reliable
+    - Prevents drift that caused BER ≈ 0.5
     """
 
     def __init__(self, cfg: GABVConfig):
@@ -373,28 +375,32 @@ class ThetaUpdater(nn.Module):
         self.register_buffer('theta_min', torch.tensor([1e3, -1e4, -100.0]))
         self.register_buffer('theta_max', torch.tensor([1e7, 1e4, 100.0]))
 
+        # [FIX 9] Physical limits for per-layer update
+        # Max velocity ~8km/s, block duration ~0.1ms → max displacement ~0.8m per block
+        # We allow 20m per layer to be safe (accounts for estimation error)
+        self.register_buffer('max_delta_R', torch.tensor(20.0))  # meters
+        self.register_buffer('max_delta_v', torch.tensor(5.0))  # m/s
+        self.register_buffer('max_delta_a', torch.tensor(1.0))  # m/s²
+
+        # [FIX 9] Confidence threshold for gating
+        self.register_buffer('confidence_threshold', torch.tensor(0.3))
+
     def forward(self, theta: torch.Tensor, resid: torch.Tensor,
                 x_est: torch.Tensor, g_theta: torch.Tensor,
                 fim_inv: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Update theta based on residual.
+        Update theta based on residual with physical constraints.
 
-        Args:
-            theta: Current estimate [B, 3]
-            resid: Residual y - Hx [B, N]
-            x_est: Current symbol estimate [B, N]
-            g_theta: Update gate [B, 1]
-            fim_inv: Optional FIM inverse for natural gradient
-
-        Returns:
-            theta_new: Updated estimate [B, 3]
+        [FIX 9] Key additions:
+        1. Physical clipping: |ΔR| < 20m, |Δv| < 5m/s, |Δa| < 1m/s²
+        2. Confidence gating: Only update when |x_est| > threshold
         """
         B = theta.shape[0]
 
         # Compute residual statistics
         resid_power = torch.mean(resid.abs() ** 2, dim=1, keepdim=True)  # [B, 1]
-        resid_phase_mean = torch.mean(torch.angle(resid + 1e-8), dim=1, keepdim=True)  # [B, 1]
-        resid_phase_var = torch.var(torch.angle(resid + 1e-8), dim=1, keepdim=True)  # [B, 1]
+        resid_phase_mean = torch.mean(torch.angle(resid + 1e-8), dim=1, keepdim=True)
+        resid_phase_var = torch.var(torch.angle(resid + 1e-8), dim=1, keepdim=True)
 
         # Cross-correlation with x_est
         cross_corr_real = torch.mean((resid * torch.conj(x_est)).real, dim=1, keepdim=True)
@@ -419,13 +425,40 @@ class ThetaUpdater(nn.Module):
 
         # Apply gate and step size
         lr = torch.abs(self.lr_param)  # Ensure positive
-        theta_new = theta + g_theta * lr * delta_theta
+        delta_theta_scaled = lr * delta_theta  # [B, 3]
 
-        # Clamp to reasonable range
+        # ============================================================
+        # [FIX 9] Physical Clipping - Prevent unrealistic updates
+        # ============================================================
+        # Clamp each parameter independently
+        delta_R = torch.clamp(delta_theta_scaled[:, 0:1], -self.max_delta_R, self.max_delta_R)
+        delta_v = torch.clamp(delta_theta_scaled[:, 1:2], -self.max_delta_v, self.max_delta_v)
+        delta_a = torch.clamp(delta_theta_scaled[:, 2:3], -self.max_delta_a, self.max_delta_a)
+        delta_theta_clipped = torch.cat([delta_R, delta_v, delta_a], dim=1)
+
+        # ============================================================
+        # [FIX 9] Confidence Gating - Only update when x_est is reliable
+        # ============================================================
+        # Use average symbol magnitude as confidence proxy
+        # QPSK symbols have magnitude ~1, noisy estimates are smaller
+        confidence = torch.mean(x_est.abs(), dim=1, keepdim=True)  # [B, 1]
+
+        # Soft gate: sigmoid centered at threshold
+        confidence_gate = torch.sigmoid((confidence - self.confidence_threshold) * 10)
+
+        # ============================================================
+        # Final Update with both gates
+        # ============================================================
+        # g_theta: learned gate from network
+        # confidence_gate: physics-based confidence gate
+        effective_gate = g_theta * confidence_gate
+
+        theta_new = theta + effective_gate * delta_theta_clipped
+
+        # Final clamping to reasonable range
         theta_new = torch.clamp(theta_new, self.theta_min, self.theta_max)
 
         return theta_new
-
 
 class FisherUpdater(nn.Module):
     """Legacy updater - kept for compatibility."""
