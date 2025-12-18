@@ -1,14 +1,16 @@
 """
-gabv_net_model.py (Fixed Version v2)
+gabv_net_model.py (Fixed Version v3 - Expert Review Applied)
 
 Description:
     PyTorch Implementation of Geometry-Aware Bussgang-VAMP Network (GA-BV-Net).
 
-    Fixes Applied:
-    - [v1] Removed incorrect 'unsqueeze' calls that caused dimensionality explosion (4D tensors).
-    - [v1] Ensures correct broadcasting for [B, 1] * [B, N] operations.
-    - [v2] CRITICAL FIX: SNR denormalization in forward() - converts normalized meta features
-           back to physical values before use in CG solver regularization.
+    **CRITICAL FIXES APPLIED (Expert Review):**
+    - [FIX 1] fs = 10e9 (matches SimConfig, was 25e9)
+    - [FIX 2] PhysicsEncoder uses SINGLE-TRIP model: tau = R/c (was 2R/c)
+    - [FIX 3] PhysicsEncoder matches thz_isac_world.apply_channel_squint exactly
+    - [FIX 4] Theta UPDATE implemented (was theta_next = theta)
+    - [FIX 5] Improved PN tracker with explicit (cos, sin) output
+    - [FIX 6] Added learnable Bussgang gain compensation
 
     Meta Feature Schema (FROZEN - must match train_gabv_net.py):
         meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
@@ -17,6 +19,9 @@ Description:
         meta[:, 3] = sigma_eta_norm   = sigma_eta / 0.1
         meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
         meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
+
+Author: Expert Review Fixed v3
+Date: 2025-12-18
 """
 
 import torch
@@ -37,17 +42,21 @@ class GABVConfig:
     cg_steps: int = 5
     use_bidirectional_pn: bool = True
 
+    # [FIX 1] fs MUST match SimConfig.fs = 10e9
     N_sym: int = 1024
-    fs: float = 25e9
+    fs: float = 10e9   # FIXED: was 25e9, now matches SimConfig
     fc: float = 300e9
 
     share_weights: bool = True
     enable_geom_loss: bool = True
     block_size_fim: int = 32
 
+    # [FIX 4] Enable theta update
+    enable_theta_update: bool = True
+    theta_update_start_layer: int = 1  # Start updating from layer 1
+
 
 # --- Meta Feature Normalization Constants (FROZEN) ---
-# These MUST match the constants in train_gabv_net.py exactly!
 
 META_CONSTANTS = {
     'snr_db_center': 15.0,
@@ -74,17 +83,17 @@ class PilotNavigator(nn.Module):
             nn.ReLU(),
             nn.Linear(h_dim, h_dim // 2),
             nn.ReLU(),
-            nn.Linear(h_dim // 2, 3)
+            nn.Linear(h_dim // 2, 4)  # Added g_theta output
         )
         self.register_buffer('brake_threshold', torch.tensor(-15.0))
 
     def forward(self, meta_features: torch.Tensor, log_vol: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         logits = self.net(meta_features)
 
-        # All outputs are [B, 1]
         g_PN = torch.sigmoid(logits[:, 0:1])
         g_NL = F.softplus(logits[:, 1:2]) + 0.5
         learned_brake = torch.sigmoid(logits[:, 2:3])
+        g_theta = torch.sigmoid(logits[:, 3:4])  # [FIX 4] Gate for theta update
 
         if log_vol is not None:
             physics_brake = torch.sigmoid((log_vol - self.brake_threshold) * 5.0)
@@ -92,59 +101,94 @@ class PilotNavigator(nn.Module):
         else:
             g_grad = learned_brake
 
-        return {"g_PN": g_PN, "g_NL": g_NL, "g_grad": g_grad}
+        return {"g_PN": g_PN, "g_NL": g_NL, "g_grad": g_grad, "g_theta": g_theta}
 
 
 class PhysicsEncoder(nn.Module):
+    """
+    [FIX 2 & 3] Physics Encoder - NOW MATCHES thz_isac_world.apply_channel_squint EXACTLY
+
+    Channel model (SINGLE-TRIP, matches simulator):
+        tau = R / c  (NOT 2R/c!)
+        tau_dot = v / c
+        tau_ddot = a / c
+        phase = 2π * fc * (tau + tau_dot * t + 0.5 * tau_ddot * t²)
+        h[n] = exp(-j * phase[n])
+    """
+
     def __init__(self, cfg: GABVConfig):
         super().__init__()
-        self.N, self.fs, self.fc = cfg.N_sym, cfg.fs, cfg.fc
+        self.N = cfg.N_sym
+        self.fs = cfg.fs  # Now 10e9, matches SimConfig
+        self.fc = cfg.fc
+        self.c = 3e8
 
-        self.register_buffer('f_grid', torch.fft.fftfreq(self.N, d=1/self.fs))
-        self.register_buffer('t_grid', torch.arange(self.N, dtype=torch.float32) / self.fs)
+        # Time grid - matches simulator's t = np.arange(N) * Ts
+        t_grid = torch.arange(self.N, dtype=torch.float32) / self.fs
+        self.register_buffer('t_grid', t_grid)
 
+        # Frequency grid (for potential wideband extensions)
+        f_grid = torch.fft.fftfreq(self.N, d=1/self.fs)
+        self.register_buffer('f_grid', f_grid)
+
+        # Regularization network for FIM
         self.reg_net = nn.Sequential(
             nn.Linear(1, 16), nn.ReLU(),
             nn.Linear(16, 1), nn.Softplus()
         )
 
+        # [FIX 6] Learnable Bussgang gain compensation
+        self.bussgang_gain = nn.Parameter(torch.tensor(1.0))
+
+    def compute_channel_diag(self, theta: torch.Tensor) -> torch.Tensor:
+        """
+        Compute diagonal channel response h_diag.
+
+        EXACTLY matches thz_isac_world.apply_channel_squint:
+            tau = R / c  (SINGLE-TRIP!)
+            phase = 2π * fc * (tau + (v/c)*t + 0.5*(a/c)*t²)
+            h = exp(-j * phase)
+
+        Args:
+            theta: [B, 3] parameters (R, v, a)
+
+        Returns:
+            h_diag: [B, N] diagonal channel
+        """
+        R = theta[:, 0:1]  # [B, 1]
+        v = theta[:, 1:2]  # [B, 1]
+        a = theta[:, 2:3]  # [B, 1]
+
+        t = self.t_grid.unsqueeze(0)  # [1, N]
+
+        # [FIX 2] SINGLE-TRIP delay parameters (matches simulator!)
+        tau = R / self.c           # τ = R/c (NOT 2R/c!)
+        tau_dot = v / self.c       # τ̇ = v/c
+        tau_ddot = a / self.c      # τ̈ = a/c
+
+        # Phase calculation - EXACTLY matches simulator
+        phase = 2 * math.pi * self.fc * (
+            tau + tau_dot * t + 0.5 * tau_ddot * (t ** 2)
+        )  # [B, N]
+
+        h_diag = torch.exp(-1j * phase)
+        return h_diag
+
     def forward_operator(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        R, v, a = theta[:, 0], theta[:, 1], theta[:, 2]
-
-        tau = 2 * R / 3e8
-        # [1, N] * [B, 1] -> [B, N]
-        phase_shift = torch.exp(-1j * 2 * math.pi * self.f_grid.unsqueeze(0) * tau.unsqueeze(1))
-
-        x_freq = torch.fft.fft(x, dim=1)
-        x_delayed = torch.fft.ifft(x_freq * phase_shift, dim=1)
-
-        k_fact = 4 * math.pi * self.fc / 3e8
-        t = self.t_grid.unsqueeze(0)
-        v = v.unsqueeze(1); a = a.unsqueeze(1)
-
-        doppler_phase = 1j * k_fact * (v * t + 0.5 * a * (t**2))
-
-        return x_delayed * torch.exp(doppler_phase)
+        """Forward operator: y = H @ x (diagonal channel = element-wise multiply)"""
+        h_diag = self.compute_channel_diag(theta)
+        # Apply Bussgang gain compensation
+        h_eff = h_diag * self.bussgang_gain
+        return x * h_eff
 
     def adjoint_operator(self, y: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        R, v, a = theta[:, 0], theta[:, 1], theta[:, 2]
-
-        k_fact = 4 * math.pi * self.fc / 3e8
-        t = self.t_grid.unsqueeze(0)
-        v = v.unsqueeze(1); a = a.unsqueeze(1)
-        doppler_phase = 1j * k_fact * (v * t + 0.5 * a * (t**2))
-
-        y_derot = y * torch.exp(-doppler_phase)
-
-        tau = 2 * R / 3e8
-        phase_shift = torch.exp(-1j * 2 * math.pi * self.f_grid.unsqueeze(0) * tau.unsqueeze(1))
-
-        y_freq = torch.fft.fft(y_derot, dim=1)
-        y_out = torch.fft.ifft(y_freq * torch.conj(phase_shift), dim=1)
-
-        return y_out
+        """Adjoint operator: x = H^H @ y"""
+        h_diag = self.compute_channel_diag(theta)
+        h_eff = h_diag * self.bussgang_gain
+        return y * torch.conj(h_eff)
 
     def get_approx_fim_info(self, theta: torch.Tensor, gamma_eff: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Approximate FIM information for natural gradient."""
         reg = self.reg_net(gamma_eff) + 1e-6
         log_vol = -torch.log(reg) * 3
         fim_inv_diag = torch.ones_like(theta) * reg
@@ -152,6 +196,15 @@ class PhysicsEncoder(nn.Module):
 
 
 class RiemannianPNTracker(nn.Module):
+    """
+    [FIX 5] Improved Phase Noise Tracker with explicit (cos, sin) output
+
+    Changes:
+    - Output explicit (cos, sin) instead of angle for stability
+    - Can work without x_est in early layers
+    - Proper normalization to unit circle
+    """
+
     def __init__(self, cfg: GABVConfig):
         super().__init__()
         self.rnn = nn.GRU(
@@ -161,23 +214,56 @@ class RiemannianPNTracker(nn.Module):
             batch_first=True
         )
         out_dim = cfg.hidden_dim_pn * 2 if cfg.use_bidirectional_pn else cfg.hidden_dim_pn
-        self.head = nn.Linear(out_dim, 1)
 
-    def forward(self, resid_complex: torch.Tensor, g_PN: torch.Tensor) -> torch.Tensor:
-        # resid_complex: [B, N]
-        # feats: [B, N, 2]
-        feats = torch.stack([resid_complex.real, resid_complex.imag], dim=-1)
+        # Output (cos, sin) for stability
+        self.head = nn.Sequential(
+            nn.Linear(out_dim, cfg.hidden_dim_pn // 2),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden_dim_pn // 2, 2)  # (cos, sin)
+        )
 
-        rnn_out, _ = self.rnn(feats)
-        delta_phi = self.head(rnn_out).squeeze(-1) # [B, N]
+    def forward(self, y_q: torch.Tensor, g_PN: torch.Tensor,
+                x_est: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Estimate phase noise and return de-rotation factor.
 
-        phi_cum = torch.cumsum(delta_phi, dim=1)
-        rotator = torch.exp(-1j * phi_cum)
+        Args:
+            y_q: Quantized observation [B, N]
+            g_PN: PN gate [B, 1]
+            x_est: Optional symbol estimate (used if reliable)
 
-        # g_PN is [B, 1], rotator is [B, N]. Broadcasts correctly.
-        eff_rotator = (1 - g_PN) + g_PN * rotator
+        Returns:
+            derotator: exp(-jφ) de-rotation factor [B, N]
+        """
+        # Use residual if x_est is reliable, else use y_q directly
+        if x_est is not None and x_est.abs().mean() > 0.1:
+            # Normalize x_est to unit magnitude for phase extraction
+            x_norm = x_est / (x_est.abs() + 1e-6)
+            resid = y_q * torch.conj(x_norm)
+            feats = torch.stack([resid.real, resid.imag], dim=-1)
+        else:
+            # Early layers: use y_q directly
+            feats = torch.stack([y_q.real, y_q.imag], dim=-1)  # [B, N, 2]
 
-        return eff_rotator
+        rnn_out, _ = self.rnn(feats)  # [B, N, hidden*2]
+
+        # Output (cos, sin)
+        cos_sin = self.head(rnn_out)  # [B, N, 2]
+        cos_phi = cos_sin[..., 0]
+        sin_phi = cos_sin[..., 1]
+
+        # Normalize to unit circle
+        mag = torch.sqrt(cos_phi**2 + sin_phi**2 + 1e-8)
+        cos_phi = cos_phi / mag
+        sin_phi = sin_phi / mag
+
+        # De-rotation factor: exp(-jφ) = cos(φ) - j*sin(φ)
+        derotator = torch.complex(cos_phi, -sin_phi)  # [B, N]
+
+        # Apply gate: g_PN=0 means no de-rotation
+        eff_derotator = (1 - g_PN) * torch.ones_like(derotator) + g_PN * derotator
+
+        return eff_derotator
 
 
 class BussgangRefiner(nn.Module):
@@ -186,8 +272,6 @@ class BussgangRefiner(nn.Module):
         self.scale_slope = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, z_in: torch.Tensor, g_NL: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # FIX: g_NL is already [B, 1]. Do NOT unsqueeze.
-        # [B, 1] * [B, N] -> [B, N]
         beta = self.scale_slope * g_NL
 
         z_out_real = torch.tanh(beta * z_in.real)
@@ -203,63 +287,121 @@ class BussgangRefiner(nn.Module):
 
 
 class UnrolledCGSolver(nn.Module):
+    """CG Solver for diagonal channel (optimized)."""
+
     def __init__(self, cfg: GABVConfig):
         super().__init__()
         self.steps = cfg.cg_steps
         self.step_scale = nn.Parameter(torch.tensor(1.0))
 
-    def matvec(self, x, phys_enc, theta, lambda_reg):
-        Hx = phys_enc.forward_operator(x, theta)
-        HnHx = phys_enc.adjoint_operator(Hx, theta)
-        # FIX: lambda_reg is [B, 1]. Do NOT unsqueeze.
-        return HnHx + lambda_reg * x
-
-    def forward(self, rhs: torch.Tensor, x_init: torch.Tensor,
-                phys_enc: PhysicsEncoder, theta: torch.Tensor, snr_linear: torch.Tensor) -> torch.Tensor:
+    def forward(self, y: torch.Tensor, x_init: torch.Tensor,
+                phys_enc: 'PhysicsEncoder', theta: torch.Tensor,
+                snr_linear: torch.Tensor) -> torch.Tensor:
         """
-        CG Solver for (H^H H + λI) x = rhs
+        CG solver for: min_x ||y - Hx||² + λ||x||²
 
-        Args:
-            rhs: Right-hand side [B, N]
-            x_init: Initial estimate [B, N]
-            phys_enc: Physics encoder module
-            theta: Target parameters [B, 3]
-            snr_linear: LINEAR SNR values [B, 1] (NOT normalized!)
-                       This should be 10^(snr_db/10), typically in range [0.1, 1000]
-
-        Returns:
-            x: Solution [B, N]
+        For diagonal H, this has closed-form solution:
+            x = H^H y / (|H|² + λ)
         """
-        # Regularization: λ = 1/SNR (Tikhonov regularization)
-        # For SNR=15dB (linear ~31.6), λ ≈ 0.03
-        # For SNR=0dB (linear ~1), λ ≈ 1.0
+        # Get channel
+        h_diag = phys_enc.compute_channel_diag(theta)
+        h_eff = h_diag * phys_enc.bussgang_gain
+
+        # Regularization
         lambda_reg = 1.0 / (snr_linear + 1e-6)  # [B, 1]
 
-        x = x_init.clone()
-        r = rhs - self.matvec(x, phys_enc, theta, lambda_reg)
-        p = r.clone()
-        rsold = torch.sum(r.abs()**2, dim=1)  # [B]
+        # For diagonal system, use efficient closed-form
+        h_sq = h_eff.abs() ** 2  # [B, N]
+        rhs = torch.conj(h_eff) * y  # H^H y
 
-        for _ in range(self.steps):
-            Ap = self.matvec(p, phys_enc, theta, lambda_reg)
-
-            denom = torch.sum(torch.conj(p) * Ap, dim=1).real
-            # rsold is [B], denom is [B]. Div is [B]. unsqueeze -> [B, 1].
-            # This unsqueeze IS correct because rsold is 1D.
-            alpha = (rsold / (denom + 1e-9)).unsqueeze(1) * self.step_scale
-
-            x = x + alpha * p
-            r = r - alpha * Ap
-
-            rsnew = torch.sum(r.abs()**2, dim=1)
-            beta = (rsnew / (rsold + 1e-9)).unsqueeze(1)
-            p = r + beta * p
-            rsold = rsnew
+        # x = H^H y / (|H|² + λ)
+        x = rhs / (h_sq + lambda_reg)
 
         return x
 
 
+class ThetaUpdater(nn.Module):
+    """
+    [FIX 4] Theta Update Module - ACTUALLY UPDATES THETA!
+
+    Previous bug: theta_next = theta (no update)
+    Now: Uses residual-based gradient estimation
+    """
+
+    def __init__(self, cfg: GABVConfig):
+        super().__init__()
+        # Network to estimate theta gradient from residual statistics
+        self.grad_net = nn.Sequential(
+            nn.Linear(6, 32),  # Input: residual stats + gate
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 3),  # Output: Δθ
+        )
+
+        # Learnable step sizes for R, v, a (different scales)
+        self.lr_param = nn.Parameter(torch.tensor([1e-2, 1e-3, 1e-4]))
+
+        # Theta bounds for clamping
+        self.register_buffer('theta_min', torch.tensor([1e3, -1e4, -100.0]))
+        self.register_buffer('theta_max', torch.tensor([1e7, 1e4, 100.0]))
+
+    def forward(self, theta: torch.Tensor, resid: torch.Tensor,
+                x_est: torch.Tensor, g_theta: torch.Tensor,
+                fim_inv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Update theta based on residual.
+
+        Args:
+            theta: Current estimate [B, 3]
+            resid: Residual y - Hx [B, N]
+            x_est: Current symbol estimate [B, N]
+            g_theta: Update gate [B, 1]
+            fim_inv: Optional FIM inverse for natural gradient
+
+        Returns:
+            theta_new: Updated estimate [B, 3]
+        """
+        B = theta.shape[0]
+
+        # Compute residual statistics
+        resid_power = torch.mean(resid.abs() ** 2, dim=1, keepdim=True)  # [B, 1]
+        resid_phase_mean = torch.mean(torch.angle(resid + 1e-8), dim=1, keepdim=True)  # [B, 1]
+        resid_phase_var = torch.var(torch.angle(resid + 1e-8), dim=1, keepdim=True)  # [B, 1]
+
+        # Cross-correlation with x_est
+        cross_corr_real = torch.mean((resid * torch.conj(x_est)).real, dim=1, keepdim=True)
+        cross_corr_imag = torch.mean((resid * torch.conj(x_est)).imag, dim=1, keepdim=True)
+
+        # Feature vector
+        feat = torch.cat([
+            resid_power,
+            resid_phase_mean,
+            resid_phase_var,
+            cross_corr_real,
+            cross_corr_imag,
+            g_theta
+        ], dim=1)  # [B, 6]
+
+        # Estimate update direction
+        delta_theta = self.grad_net(feat)  # [B, 3]
+
+        # Apply FIM scaling if available (natural gradient)
+        if fim_inv is not None:
+            delta_theta = delta_theta * fim_inv
+
+        # Apply gate and step size
+        lr = torch.abs(self.lr_param)  # Ensure positive
+        theta_new = theta + g_theta * lr * delta_theta
+
+        # Clamp to reasonable range
+        theta_new = torch.clamp(theta_new, self.theta_min, self.theta_max)
+
+        return theta_new
+
+
 class FisherUpdater(nn.Module):
+    """Legacy updater - kept for compatibility."""
     def __init__(self, cfg: GABVConfig):
         super().__init__()
         self.lr = nn.Parameter(torch.tensor(0.01))
@@ -286,7 +428,7 @@ class GABVNet(nn.Module):
             self.pn_tracker = RiemannianPNTracker(cfg)
             self.refiner = BussgangRefiner(cfg)
             self.solver = UnrolledCGSolver(cfg)
-            self.updater = FisherUpdater(cfg)
+            self.theta_updater = ThetaUpdater(cfg)  # [FIX 4] New theta updater
         else:
             raise NotImplementedError("Per-layer weights not yet implemented.")
 
@@ -294,102 +436,71 @@ class GABVNet(nn.Module):
         """
         Forward pass of GA-BV-Net.
 
-        Args:
-            batch: Dictionary containing:
-                - 'y_q': Quantized received signal [B, N]
-                - 'meta': Normalized meta features [B, 6]
-                - 'theta_init': Initial target parameter estimate [B, 3]
-                - 'x_init' (optional): Initial signal estimate [B, N]
-
-        Returns:
-            Dictionary containing:
-                - 'x_hat': Estimated transmitted signal [B, N]
-                - 'theta_hat': Estimated target parameters [B, 3]
-                - 'phi_hat': Estimated phase noise [B, N]
-                - 'layers': Per-layer outputs
-                - 'geom_cache': Geometric information for loss computation
+        [FIX 4] Now actually updates theta!
         """
         y_q = batch['y_q']
         meta = batch['meta']
-        theta = batch['theta_init']
+        theta = batch['theta_init'].clone()  # Will be updated!
 
-        # =====================================================================
-        # CRITICAL FIX (v2): Denormalize meta features to physical values
-        # =====================================================================
-        # Meta features are normalized in train_gabv_net.py as:
-        #   meta[:, 0] = snr_db_norm = (snr_db - 15) / 15
-        #   meta[:, 1] = gamma_eff_db_norm = (10*log10(gamma_eff) - 10) / 20
-        #
-        # We need to convert back to physical values for the CG solver:
-        #   snr_linear = 10^(snr_db / 10)
-        #
-        # Example:
-        #   snr_db = 15 dB → snr_db_norm = 0 → snr_linear = 31.6
-        #   snr_db = 0 dB  → snr_db_norm = -1 → snr_linear = 1.0
-        #   snr_db = 30 dB → snr_db_norm = 1 → snr_linear = 1000
-        # =====================================================================
+        # Denormalize meta features
+        snr_db_norm = meta[:, 0:1]
+        gamma_eff_db_norm = meta[:, 1:2]
 
-        # Step 1: Extract normalized values
-        snr_db_norm = meta[:, 0:1]       # Normalized SNR (dB)
-        gamma_eff_db_norm = meta[:, 1:2] # Normalized Gamma_eff (dB)
-
-        # Step 2: Denormalize to dB values
         snr_db = snr_db_norm * META_CONSTANTS['snr_db_scale'] + META_CONSTANTS['snr_db_center']
         gamma_eff_db = gamma_eff_db_norm * META_CONSTANTS['gamma_eff_db_scale'] + META_CONSTANTS['gamma_eff_db_center']
 
-        # Step 3: Convert dB to linear scale
-        snr_linear = 10.0 ** (snr_db / 10.0)           # For CG solver regularization
-        gamma_eff_linear = 10.0 ** (gamma_eff_db / 10.0)  # For FIM computation
+        snr_linear = 10.0 ** (snr_db / 10.0)
+        gamma_eff_linear = 10.0 ** (gamma_eff_db / 10.0)
 
-        # =====================================================================
-        # End of CRITICAL FIX
-        # =====================================================================
-
-        if 'x_init' in batch:
-            x_est = batch['x_init']
-        else:
-            x_est = torch.zeros_like(y_q)
+        # Initialize
+        x_est = torch.zeros_like(y_q)
 
         layer_outputs = []
         geom_cache = {'log_vols': [], 'fim_invs': []}
 
         for k in range(self.cfg.n_layers):
-            # 1. Physics - use LINEAR gamma_eff for FIM
+            # 1. Physics - get FIM info
             fim_inv, log_vol = self.phys_enc.get_approx_fim_info(theta, gamma_eff_linear)
             if self.cfg.enable_geom_loss:
                 geom_cache['log_vols'].append(log_vol)
                 geom_cache['fim_invs'].append(fim_inv)
 
-            # 2. Pilot - uses normalized meta (network learns from normalized features)
+            # 2. Pilot - get gates
             gates = self.pilot(meta, log_vol=log_vol)
 
-            # 3. PN Tracking
-            resid_complex = y_q * torch.conj(x_est + 1e-6)
-            rotator = self.pn_tracker(resid_complex, gates['g_PN'])
-            y_corr = y_q * torch.conj(rotator)
+            # 3. PN Tracking - [FIX 5] improved tracker
+            derotator = self.pn_tracker(y_q, gates['g_PN'], x_est if k > 0 else None)
+            y_corr = y_q * derotator
 
             # 4. Refiner
             z_denoised, onsager = self.refiner(y_corr, gates['g_NL'])
 
-            # 5. Solver - use LINEAR snr for regularization
-            rhs = self.phys_enc.adjoint_operator(z_denoised, theta)
-            x_est = self.solver(rhs, x_est, self.phys_enc, theta, snr_linear)
+            # 5. Solver
+            x_est = self.solver(z_denoised, x_est, self.phys_enc, theta, snr_linear)
 
-            # 6. Update
-            theta_next = theta
+            # 6. [FIX 4] Theta Update - ACTUALLY UPDATE!
+            if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
+                # Compute residual
+                h_diag = self.phys_enc.compute_channel_diag(theta)
+                resid = z_denoised - h_diag * x_est
+
+                # Update theta
+                theta = self.theta_updater(
+                    theta, resid, x_est,
+                    gates['g_theta'], fim_inv
+                )
 
             layer_outputs.append({
-                'x_est': x_est,
-                'theta': theta_next,
+                'x_est': x_est.clone(),
+                'theta': theta.clone(),
                 'gates': gates,
-                'rotator': rotator
+                'derotator': derotator
             })
-            theta = theta_next
 
         return {
             'x_hat': x_est,
             'theta_hat': theta,
-            'phi_hat': layer_outputs[-1]['rotator'],
+            'phi_hat': layer_outputs[-1]['derotator'],
             'layers': layer_outputs,
             'geom_cache': geom_cache
         }
@@ -405,15 +516,7 @@ def create_gabv_model(cfg: Optional[GABVConfig] = None) -> GABVNet:
 # --- 4. Utility Functions ---
 
 def denormalize_meta(meta: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """
-    Utility function to denormalize meta features for debugging/logging.
-
-    Args:
-        meta: Normalized meta features [B, 6]
-
-    Returns:
-        Dictionary with denormalized physical values
-    """
+    """Utility function to denormalize meta features."""
     snr_db_norm = meta[:, 0:1]
     gamma_eff_db_norm = meta[:, 1:2]
     chi = meta[:, 2:3]
@@ -421,7 +524,6 @@ def denormalize_meta(meta: torch.Tensor) -> Dict[str, torch.Tensor]:
     pn_linewidth_norm = meta[:, 4:5]
     ibo_db_norm = meta[:, 5:6]
 
-    # Denormalize
     snr_db = snr_db_norm * META_CONSTANTS['snr_db_scale'] + META_CONSTANTS['snr_db_center']
     gamma_eff_db = gamma_eff_db_norm * META_CONSTANTS['gamma_eff_db_scale'] + META_CONSTANTS['gamma_eff_db_center']
     sigma_eta = sigma_eta_norm * META_CONSTANTS['sigma_eta_scale']
@@ -438,3 +540,23 @@ def denormalize_meta(meta: torch.Tensor) -> Dict[str, torch.Tensor]:
         'pn_linewidth': pn_linewidth,
         'ibo_db': ibo_db,
     }
+
+
+# --- 5. Verification ---
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("GABVNet Model - Fixed Version v3 Self-Test")
+    print("=" * 60)
+
+    # Check fs consistency
+    cfg = GABVConfig()
+    print(f"\n[Config Check]")
+    print(f"  fs = {cfg.fs/1e9:.1f} GHz (should be 10.0)")
+    print(f"  fc = {cfg.fc/1e9:.1f} GHz")
+    print(f"  N  = {cfg.N_sym}")
+    print(f"  enable_theta_update = {cfg.enable_theta_update}")
+
+    print("\n" + "=" * 60)
+    print("Self-Test Complete")
+    print("=" * 60)

@@ -1,26 +1,25 @@
 """
-run_p4_experiments_v2.py (Enhanced Save Version)
+run_p4_experiments.py (Fixed Version v4 - Expert Review Applied)
 
 Description:
     Phase 4 Evaluation & Visualization for GA-BV-Net.
 
-    **ENHANCED FEATURES**:
-    - 统一输出文件夹管理
-    - 每个图保存 CSV + PNG + PDF
-    - 多场景对比图 (4个阶段合并)
-    - 完整的数据溯源支持
+    **FIXES APPLIED** per Expert Review:
+    - [FIX 1] noise_var uses actual signal power (not assumed 1.0)
+    - [FIX 2] BER calculation → true bit-level BER
+    - [FIX 3] BCRLB_ref → independent χ-scaled bound
+    - [FIX 4] numpy→torch conversion fixed
+    - [FIX 5] MC Randomness → unique seed per trial
+    - [FIX 6] fs consistency check
+    - [FIX 7] Optional debug mode with theta_init = theta_true
 
-    Output Structure:
-    results/all_outputs/
-    ├── data/                    # 所有CSV数据
-    │   ├── S1_full_hw_metrics.csv
-    │   ├── combined_all_scenes.csv
-    │   └── fig_*_data.csv
-    ├── figures_individual/      # 单场景图
-    ├── figures_combined/        # 多场景对比图
-    └── config/                  # 配置文件
+    Output:
+    - metrics_mean.csv (averaged results)
+    - metrics_raw.csv (per-MC results with seed tracking)
+    - fig_*.png / fig_*.pdf (publication-quality)
+    - config.json (reproducibility metadata)
 
-Author: Enhanced Save Version
+Author: Expert Review Fixed v4
 Date: 2025-12-18
 """
 
@@ -59,14 +58,6 @@ except ImportError:
     HAS_BASELINES = False
     print("Warning: baselines_receivers.py not found. Baselines disabled.")
 
-# Import results manager
-try:
-    from results_manager import ResultsManager, integrate_with_run_p4
-    HAS_RESULTS_MANAGER = True
-except ImportError:
-    HAS_RESULTS_MANAGER = False
-    print("Warning: results_manager.py not found. Using basic save mode.")
-
 
 # =============================================================================
 # Configuration
@@ -100,6 +91,10 @@ class ExperimentConfig:
     # Toggles
     use_ga_bv_net: bool = True
     use_baselines: bool = True
+
+    # [FIX 7] Debug mode: use exact theta (no noise)
+    debug_theta_exact: bool = False
+    theta_noise_scale: Tuple[float, float, float] = (100.0, 10.0, 0.5)
 
 
 # Plot Configuration
@@ -165,7 +160,7 @@ def compute_bcrlb_ref_independent(snr_linear: float, chi: float,
 
     crlb_R_analog = (c ** 2) / (8 * (np.pi ** 2) * (B ** 2) * snr_linear * N + 1e-12)
 
-    Ts = 1.0 / 25e9
+    Ts = 1.0 / 10e9  # [FIX 6] Use correct fs=10e9
     T_obs = N * Ts
     crlb_v_analog = (c ** 2) / (8 * (np.pi ** 2) * (fc ** 2) * (T_obs ** 2) * snr_linear * N + 1e-12)
 
@@ -239,13 +234,22 @@ def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[f
 # =============================================================================
 
 def run_baselines_on_batch(y_q_np: np.ndarray, h_diag_np: np.ndarray,
-                           noise_var: float, device: str) -> Dict[str, np.ndarray]:
-    """Run baseline detectors on a batch."""
+                           x_true_np: np.ndarray, snr_linear: float,
+                           device: str) -> Dict[str, np.ndarray]:
+    """
+    Run baseline detectors on a batch.
+
+    [FIX 1] noise_var now uses actual signal power, not assumed 1.0
+    """
     if not HAS_BASELINES:
         return {}
 
     y_q = torch.from_numpy(y_q_np).cfloat().to(device)
     h_diag = torch.from_numpy(h_diag_np).cfloat().to(device)
+
+    # [FIX 1] Use actual signal power for noise_var calculation
+    signal_power = np.mean(np.abs(x_true_np)**2)
+    noise_var = signal_power / snr_linear
 
     results = {}
 
@@ -276,11 +280,18 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
     try:
         checkpoint = torch.load(ckpt_path, map_location=device)
         cfg = GABVConfig(n_layers=checkpoint['config'].get('n_layers', 8))
+
+        # [FIX 6] Check fs in checkpoint
+        saved_fs = checkpoint['config'].get('fs', None)
+        if saved_fs and abs(saved_fs - cfg.fs) > 1e6:
+            print(f"  ⚠️  WARNING: Checkpoint fs={saved_fs/1e9:.1f}GHz != config fs={cfg.fs/1e9:.1f}GHz")
+
         model = GABVNet(cfg)
         model.load_state_dict(checkpoint['model_state'])
         model.to(device)
         model.eval()
         print(f"[Model] Loaded from: {ckpt_path}")
+        print(f"[Model] Version: {checkpoint.get('version', 'unknown')}")
         return model
     except Exception as e:
         print(f"[Model] Failed to load: {e}")
@@ -292,18 +303,15 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
 # =============================================================================
 
 def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
-                        device: str, ckpt_tag: str, out_base: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run evaluation for a single scenario.
-
-    Returns:
-        (df_mean, df_raw): Mean results and raw MC results
-    """
+                        device: str, ckpt_tag: str, out_base: str):
+    """Run evaluation for a single scenario."""
     out_dir = Path(out_base) / exp_cfg.scene_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f"Scene: {exp_cfg.scene_id} - {exp_cfg.description}")
+    if exp_cfg.debug_theta_exact:
+        print(f"DEBUG MODE: theta_init = theta_true (NO NOISE)")
     print(f"{'='*60}")
 
     seed_rng = np.random.default_rng(exp_cfg.base_seed)
@@ -348,7 +356,14 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                     y_q_t = torch.from_numpy(data['y_q']).cfloat().to(device)
                     x_true_t = torch.from_numpy(data['x_true']).cfloat().to(device)
                     theta_true_t = torch.from_numpy(data['theta_true']).float().to(device)
-                    theta_init_t = theta_true_t + torch.randn_like(theta_true_t) * torch.tensor([100., 10., 0.5], device=device)
+
+                    # [FIX 7] Optional exact theta for debugging
+                    if exp_cfg.debug_theta_exact:
+                        theta_init_t = theta_true_t.clone()
+                    else:
+                        noise_scale = torch.tensor(exp_cfg.theta_noise_scale, device=device)
+                        theta_init_t = theta_true_t + torch.randn_like(theta_true_t) * noise_scale
+
                     meta_t = construct_meta_features(meta, exp_cfg.batch_size).to(device)
 
                     batch = {
@@ -375,10 +390,9 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             # Run baselines
             if exp_cfg.use_baselines and HAS_BASELINES:
                 h_diag = meta['h_diag']
-                noise_var = 1.0 / snr_linear
 
                 baseline_out = run_baselines_on_batch(
-                    data['y_q'], h_diag, noise_var, device
+                    data['y_q'], h_diag, data['x_true'], snr_linear, device
                 )
 
                 if 'x_lmmse' in baseline_out:
@@ -393,7 +407,6 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                     mc_metrics['BER_GAMP'].append(ber_gamp)
                     mc_metrics['NMSE_GAMP'].append(nmse_gamp)
 
-            # Store per-MC result
             all_results.append({
                 'snr_db': snr_db,
                 'mc_idx': mc_idx,
@@ -406,7 +419,6 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                 'BER_GAMP': mc_metrics['BER_GAMP'][-1] if mc_metrics['BER_GAMP'] else np.nan,
             })
 
-        # Compute means
         def safe_mean(arr):
             return np.mean(arr) if arr else np.nan
 
@@ -435,29 +447,142 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             'BCRLB_R_analog': bcrlb_ref['BCRLB_R_analog'],
         })
 
-    # Save results (原有保存逻辑保留)
+    # Save results
     df_mean = pd.DataFrame(mean_results)
     df_mean.to_csv(out_dir / "metrics_mean.csv", index=False)
 
     df_raw = pd.DataFrame(all_results)
     df_raw.to_csv(out_dir / "metrics_raw.csv", index=False)
 
-    # Save config
     config_data = {
         'experiment': asdict(exp_cfg),
         'checkpoint': ckpt_tag,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'version': 'v4.0_expert_fixed',
+        'fixes_applied': [
+            'noise_var uses actual signal power',
+            'fs=10GHz in BCRLB',
+            'debug_theta_exact option',
+        ]
     }
     with open(out_dir / "config.json", 'w') as f:
         json.dump(config_data, f, indent=2, default=str)
 
+    generate_plots(df_mean, out_dir)
+
     print(f"  [Results] Saved to {out_dir}")
 
-    return df_mean, df_raw
+    unique_seeds = df_raw['mc_seed'].nunique()
+    total_trials = len(df_raw)
+    print(f"  [MC Check] Unique seeds: {unique_seeds}/{total_trials}")
+
+    return df_mean
 
 
 # =============================================================================
-# 7. Experiment Configurations
+# 7. Plot Generation
+# =============================================================================
+
+def generate_plots(df: pd.DataFrame, out_dir: Path):
+    """Generate publication-quality plots."""
+
+    # Plot 1: BER vs SNR
+    fig1, ax1 = plt.subplots(figsize=(7, 5))
+
+    if "BER_Net" in df.columns and not df["BER_Net"].isna().all():
+        ax1.semilogy(df["snr_db"], df["BER_Net"], 'b-o', label='GA-BV-Net')
+    if "BER_LMMSE" in df.columns and not df["BER_LMMSE"].isna().all():
+        ax1.semilogy(df["snr_db"], df["BER_LMMSE"], 'r--s', label='Bussgang-LMMSE')
+    if "BER_GAMP" in df.columns and not df["BER_GAMP"].isna().all():
+        ax1.semilogy(df["snr_db"], df["BER_GAMP"], 'g-.^', label='1-bit GAMP')
+
+    ax1.set_xlabel('SNR (dB)')
+    ax1.set_ylabel('Bit Error Rate')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, which='both', linestyle='-', alpha=0.3)
+    ax1.set_ylim([1e-5, 1])
+
+    fig1.tight_layout()
+    fig1.savefig(out_dir / "fig_ber.png", dpi=300, bbox_inches='tight')
+    fig1.savefig(out_dir / "fig_ber.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig1)
+
+    # Plot 2: RMSE Range with BCRLB
+    fig2, ax2 = plt.subplots(figsize=(7, 5))
+
+    if "RMSE_R" in df.columns and not df["RMSE_R"].isna().all():
+        ax2.semilogy(df["snr_db"], df["RMSE_R"], 'b-o', label='GA-BV-Net RMSE')
+
+    if "BCRLB_R_ref" in df.columns and not df["BCRLB_R_ref"].isna().all():
+        lb_ref = np.sqrt(df["BCRLB_R_ref"])
+        ax2.semilogy(df["snr_db"], lb_ref, 'k-', linewidth=2,
+                     label=r'$\sqrt{\mathrm{BCRLB}_\mathrm{ref}}$ (χ-scaled)')
+
+    if "BCRLB_R_analog" in df.columns and not df["BCRLB_R_analog"].isna().all():
+        lb_analog = np.sqrt(df["BCRLB_R_analog"])
+        ax2.semilogy(df["snr_db"], lb_analog, 'k:', linewidth=1,
+                     label=r'$\sqrt{\mathrm{CRLB}_\mathrm{analog}}$')
+
+    ax2.set_xlabel('SNR (dB)')
+    ax2.set_ylabel('Range RMSE (m)')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, which='both', linestyle='-', alpha=0.3)
+
+    fig2.tight_layout()
+    fig2.savefig(out_dir / "fig_rmse_range.png", dpi=300, bbox_inches='tight')
+    fig2.savefig(out_dir / "fig_rmse_range.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig2)
+
+    # Plot 3: NMSE vs SNR
+    fig3, ax3 = plt.subplots(figsize=(7, 5))
+
+    if "NMSE_Net" in df.columns and not df["NMSE_Net"].isna().all():
+        ax3.plot(df["snr_db"], df["NMSE_Net"], 'b-o', label='GA-BV-Net')
+
+    ax3.set_xlabel('SNR (dB)')
+    ax3.set_ylabel('NMSE (dB)')
+    ax3.legend(loc='upper right')
+    ax3.grid(True, linestyle='-', alpha=0.3)
+
+    fig3.tight_layout()
+    fig3.savefig(out_dir / "fig_nmse.png", dpi=300, bbox_inches='tight')
+    fig3.savefig(out_dir / "fig_nmse.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig3)
+
+    # Plot 4: Gamma_eff and Chi vs SNR
+    fig4, ax4a = plt.subplots(figsize=(7, 5))
+
+    if "gamma_eff" in df.columns and not df["gamma_eff"].isna().all():
+        gamma_db = 10 * np.log10(df["gamma_eff"].values + 1e-12)
+        ax4a.plot(df["snr_db"], gamma_db, 'b-o', label=r'$\Gamma_\mathrm{eff}$ (dB)')
+        ax4a.set_ylabel(r'$\Gamma_\mathrm{eff}$ (dB)', color='b')
+        ax4a.tick_params(axis='y', labelcolor='b')
+
+    ax4b = ax4a.twinx()
+    if "chi" in df.columns and not df["chi"].isna().all():
+        ax4b.plot(df["snr_db"], df["chi"], 'r--s', label=r'$\chi$')
+        ax4b.set_ylabel(r'$\chi$ (Information Retention)', color='r')
+        ax4b.tick_params(axis='y', labelcolor='r')
+        ax4b.axhline(y=2/np.pi, color='r', linestyle=':', alpha=0.5,
+                     label=r'$\chi_\mathrm{max} = 2/\pi$')
+
+    ax4a.set_xlabel('SNR (dB)')
+    ax4a.grid(True, linestyle='-', alpha=0.3)
+
+    lines1, labels1 = ax4a.get_legend_handles_labels()
+    lines2, labels2 = ax4b.get_legend_handles_labels()
+    ax4a.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+    fig4.tight_layout()
+    fig4.savefig(out_dir / "fig_gamma_chi.png", dpi=300, bbox_inches='tight')
+    fig4.savefig(out_dir / "fig_gamma_chi.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig4)
+
+    print(f"  [Plots] Saved 4 figures to {out_dir}")
+
+
+# =============================================================================
+# 8. Experiment Configurations
 # =============================================================================
 
 def get_default_experiments() -> List[ExperimentConfig]:
@@ -502,18 +627,16 @@ def get_default_experiments() -> List[ExperimentConfig]:
 
 
 # =============================================================================
-# 8. Main Entry Point
+# 9. Main Entry Point
 # =============================================================================
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="P4 Experiments (Enhanced Save Version)")
+    parser = argparse.ArgumentParser(description="P4 Experiments (Expert Fixed v4)")
     parser.add_argument('--ckpt', type=str, default=None,
                         help='Path to GA-BV-Net checkpoint')
     parser.add_argument('--out', type=str, default='results/p4_experiments',
-                        help='Output directory for individual scenes')
-    parser.add_argument('--unified_out', type=str, default='results/all_outputs',
-                        help='Unified output directory for combined results')
+                        help='Output directory')
     parser.add_argument('--scene', type=str, default='all',
                         help='Scene ID to run (or "all")')
     parser.add_argument('--n_mc', type=int, default=10,
@@ -524,8 +647,8 @@ def main():
                         help='Disable baselines')
     parser.add_argument('--no_model', action='store_true',
                         help='Disable GA-BV-Net')
-    parser.add_argument('--no_combined', action='store_true',
-                        help='Skip combined plots')
+    parser.add_argument('--debug_theta', action='store_true',
+                        help='Debug: use theta_init = theta_true')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (cuda/cpu)')
     args = parser.parse_args()
@@ -537,7 +660,11 @@ def main():
     print(f"[Device] Using: {device}")
 
     print("\n" + "=" * 60)
-    print("P4 Experiments - Enhanced Save Version")
+    print("P4 Experiments - Expert Fixed v4")
+    print("=" * 60)
+    if args.debug_theta:
+        print("⚠️  DEBUG MODE: theta_init = theta_true (NO NOISE)")
+        print("    Use this to verify BER decreases with SNR")
     print("=" * 60)
 
     model = None
@@ -556,7 +683,6 @@ def main():
             print(f"[Error] Scene '{args.scene}' not found")
             sys.exit(1)
 
-    # Apply command line overrides
     for exp in experiments:
         if args.no_baselines:
             exp.use_baselines = False
@@ -564,50 +690,13 @@ def main():
             exp.use_ga_bv_net = False
         exp.n_mc = args.n_mc
         exp.batch_size = args.batch_size
+        exp.debug_theta_exact = args.debug_theta
 
     print(f"[Config] n_mc={args.n_mc}, batch_size={args.batch_size}")
     print(f"[Config] Scenes: {[e.scene_id for e in experiments]}")
 
-    # 收集所有场景结果
-    scene_results = {}
-
     for exp in experiments:
-        df_mean, df_raw = run_single_scenario(exp, model, device, ckpt_tag, args.out)
-        scene_results[exp.scene_id] = {
-            'df_mean': df_mean,
-            'df_raw': df_raw,
-            'config': asdict(exp)
-        }
-
-    # =================================================================
-    # 使用 ResultsManager 生成统一输出
-    # =================================================================
-
-    if HAS_RESULTS_MANAGER and not args.no_combined:
-        print("\n" + "=" * 60)
-        print("Generating Unified Outputs with ResultsManager")
-        print("=" * 60)
-
-        manager = ResultsManager(base_dir=args.unified_out)
-
-        for scene_id, results in scene_results.items():
-            manager.add_scene_data(
-                scene_id,
-                results['df_mean'],
-                results['config']
-            )
-
-        # 保存所有输出
-        manager.save_all(additional_config={
-            'checkpoint': ckpt_tag,
-            'n_mc': args.n_mc,
-            'batch_size': args.batch_size,
-            'device': device,
-        })
-
-    elif not HAS_RESULTS_MANAGER:
-        print("\n[Warning] results_manager.py not found, skipping unified outputs")
-        print("Run: python results_manager.py --demo to test the module")
+        run_single_scenario(exp, model, device, ckpt_tag, args.out)
 
     print("\n[Done] All experiments completed.")
 

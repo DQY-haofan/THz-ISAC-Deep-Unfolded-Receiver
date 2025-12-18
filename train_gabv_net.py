@@ -1,14 +1,17 @@
 """
-train_gabv_net.py (MC Randomness Fixed - v3.1)
+train_gabv_net.py (Fixed Version v4 - Expert Review Applied)
 
 CRITICAL FIXES:
-1. Global RNG with unique seeds per batch (not per stage)
-2. Hardware parameter randomization for gamma_eff diversity
-3. Seed tracking in output for verification
+1. [FIX] Progressive theta noise (not fixed 100m from start!)
+2. [FIX] DEBUG_MODE to test with theta_init = theta_true
+3. [FIX] fs consistency check with SimConfig
+4. Global RNG with unique seeds per batch
+5. Hardware parameter randomization for gamma_eff diversity
 
 Usage:
     python train_gabv_net.py --stage 1 --steps 2000
     python train_gabv_net.py --curriculum  # Run stages 1→2→3 with continuous RNG
+    python train_gabv_net.py --debug       # Debug mode: theta_init = theta_true
 """
 
 import torch
@@ -70,10 +73,15 @@ class TrainConfig:
     ibo_db_center: float = 3.0
     ibo_db_scale: float = 3.0
 
-    # --- NEW: Hardware Randomization for Gamma_eff Diversity ---
+    # --- Hardware Randomization for Gamma_eff Diversity ---
     randomize_hardware: bool = True
     ibo_range: tuple = (1.0, 8.0)        # IBO range in dB
     pn_linewidth_range: tuple = (1e3, 1e6)  # PN linewidth range in Hz
+
+    # --- [FIX] Theta Noise Configuration ---
+    debug_mode: bool = False  # If True, theta_init = theta_true (no noise)
+    theta_noise_warmup_steps: int = 2000  # Steps to ramp up theta noise
+    theta_noise_max_scale: tuple = (100.0, 10.0, 0.5)  # Max noise: [R, v, a]
 
 
 # Global step counter for unique seeds across all stages
@@ -110,25 +118,25 @@ def set_stage_params(cfg: TrainConfig, sim_cfg: SimConfig):
         cfg.w_bound = 0.0
     elif cfg.stage == 1:
         sim_cfg.enable_pa = True
-        sim_cfg.ibo_dB = 6.0  # Base value
+        sim_cfg.ibo_dB = 6.0
         sim_cfg.enable_pn = True
-        sim_cfg.pn_linewidth = 1e3  # Base value
+        sim_cfg.pn_linewidth = 1e3
         sim_cfg.enable_quantization = True
         cfg.w_geom = 0.01
         cfg.w_bound = 0.0
     elif cfg.stage == 2:
         sim_cfg.enable_pa = True
-        sim_cfg.ibo_dB = 3.0  # Base value
+        sim_cfg.ibo_dB = 3.0
         sim_cfg.enable_pn = True
-        sim_cfg.pn_linewidth = 500e3  # Base value
+        sim_cfg.pn_linewidth = 500e3
         sim_cfg.enable_quantization = True
         cfg.w_geom = 0.05
         cfg.w_bound = 0.01
     elif cfg.stage == 3:
         sim_cfg.enable_pa = True
-        sim_cfg.ibo_dB = 0.0  # Base value
+        sim_cfg.ibo_dB = 0.0
         sim_cfg.enable_pn = True
-        sim_cfg.pn_linewidth = 1e6  # Base value
+        sim_cfg.pn_linewidth = 1e6
         sim_cfg.enable_quantization = True
         cfg.w_geom = 0.1
         cfg.w_bound = 0.1
@@ -182,21 +190,29 @@ def construct_meta_features(raw_meta: dict, train_cfg: TrainConfig, batch_size: 
 
 class THzISACDataset:
     """
-    Dataset with proper MC randomness:
-    - Uses global master RNG for consistent seed generation
-    - Unique seed for each batch
-    - Optional hardware parameter randomization
+    Dataset with proper MC randomness and progressive theta noise.
+
+    [FIX] Theta noise now progressively increases during training:
+    - Step 0: noise_scale = 0 (exact theta)
+    - Step warmup_steps: noise_scale = 1.0 (full noise)
     """
 
     def __init__(self, train_cfg: TrainConfig, master_rng: np.random.Generator):
         self.train_cfg = train_cfg
         self.sim_cfg = SimConfig()
         set_stage_params(train_cfg, self.sim_cfg)
-        self.master_rng = master_rng  # Shared across stages
+        self.master_rng = master_rng
         self.step_counter = 0
 
         # Track gamma_eff diversity
         self.gamma_eff_history = []
+
+        # [FIX] Check fs consistency
+        model_cfg = GABVConfig()
+        if abs(self.sim_cfg.fs - model_cfg.fs) > 1e6:
+            print(f"⚠️  WARNING: fs mismatch! SimConfig.fs={self.sim_cfg.fs/1e9:.1f}GHz, "
+                  f"GABVConfig.fs={model_cfg.fs/1e9:.1f}GHz")
+            print("    This will cause BER to not decrease! Please fix GABVConfig.fs")
 
     def __iter__(self):
         return self
@@ -206,7 +222,7 @@ class THzISACDataset:
         current_snr = self.master_rng.uniform(0, 30)
         self.sim_cfg.snr_db = current_snr
 
-        # NEW: Randomize hardware parameters for diversity
+        # Randomize hardware parameters for diversity
         if self.train_cfg.randomize_hardware:
             self.sim_cfg.ibo_dB = self.master_rng.uniform(*self.train_cfg.ibo_range)
             self.sim_cfg.pn_linewidth = 10 ** self.master_rng.uniform(
@@ -221,8 +237,28 @@ class THzISACDataset:
         raw_data = simulate_batch(self.sim_cfg, batch_size=self.train_cfg.batch_size, seed=batch_seed)
 
         theta_true = torch.tensor(raw_data['theta_true'], dtype=torch.float32)
-        tle_noise = torch.randn_like(theta_true) * torch.tensor([100.0, 10.0, 0.5])
-        theta_init = theta_true + tle_noise
+
+        # =====================================================================
+        # [FIX] Progressive Theta Noise
+        # =====================================================================
+        if self.train_cfg.debug_mode:
+            # Debug mode: exact theta (no noise)
+            theta_init = theta_true.clone()
+            noise_scale_used = 0.0
+        else:
+            # Progressive noise: ramp up over warmup_steps
+            global_step = get_global_step()
+            warmup = self.train_cfg.theta_noise_warmup_steps
+
+            # Linear ramp: 0 → 1 over warmup steps
+            noise_scale = min(1.0, global_step / warmup) if warmup > 0 else 1.0
+
+            # Apply scaled noise
+            max_noise = torch.tensor(self.train_cfg.theta_noise_max_scale)
+            tle_noise = torch.randn_like(theta_true) * max_noise * noise_scale
+            theta_init = theta_true + tle_noise
+            noise_scale_used = noise_scale
+        # =====================================================================
 
         # Construct meta features
         meta = construct_meta_features(
@@ -247,8 +283,8 @@ class THzISACDataset:
             'x_true': torch.from_numpy(raw_data['x_true']).cfloat(),
             'theta_true': theta_true,
             'theta_init': theta_init,
-            'meta': torch.from_numpy(meta).float(),  # FIX: Convert to tensor
-            # Raw values for monitoring (not tensors, won't go to GPU)
+            'meta': torch.from_numpy(meta).float(),
+            # Raw values for monitoring
             '_raw_gamma_eff': raw_gamma_eff,
             '_raw_chi': raw_chi,
             '_raw_sinr_eff': raw_sinr_eff,
@@ -256,6 +292,7 @@ class THzISACDataset:
             '_seed_used': seed_used,
             '_ibo_dB': self.sim_cfg.ibo_dB,
             '_pn_linewidth': self.sim_cfg.pn_linewidth,
+            '_theta_noise_scale': noise_scale_used,  # [FIX] Track noise scale
         }
 
     def get_diversity_stats(self) -> dict:
@@ -263,7 +300,6 @@ class THzISACDataset:
         if not self.gamma_eff_history:
             return {'unique_ratio': 0, 'total': 0, 'unique': 0}
 
-        # Round to 2 decimal places for comparison
         rounded = [round(g, 2) for g in self.gamma_eff_history]
         unique = len(set(rounded))
         total = len(rounded)
@@ -315,14 +351,7 @@ class GABVLoss(nn.Module):
 
 def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
     """
-    Train one stage with proper MC randomness.
-
-    Args:
-        cfg: TrainConfig instance
-        master_rng: Optional shared RNG (for curriculum training)
-
-    Returns:
-        master_rng: Updated RNG for next stage
+    Train one stage with proper MC randomness and progressive theta noise.
     """
     # Create or use shared master RNG
     if master_rng is None:
@@ -339,16 +368,32 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
 
     writer = SummaryWriter(log_dir=log_path)
 
+    # [FIX] Create model with correct config
     model_cfg = GABVConfig(n_layers=cfg.n_layers)
+
+    # Verify fs consistency
+    sim_cfg_check = SimConfig()
+    if abs(sim_cfg_check.fs - model_cfg.fs) > 1e6:
+        print("=" * 60)
+        print("⚠️  CRITICAL: fs MISMATCH DETECTED!")
+        print(f"    SimConfig.fs = {sim_cfg_check.fs/1e9:.1f} GHz")
+        print(f"    GABVConfig.fs = {model_cfg.fs/1e9:.1f} GHz")
+        print("    This WILL cause BER to not decrease!")
+        print("    Please ensure both are 10 GHz!")
+        print("=" * 60)
+
     model = create_gabv_model(model_cfg).to(cfg.device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
     dataset = THzISACDataset(cfg, master_rng)
     criterion = GABVLoss(cfg)
 
     print(f"--- Starting Training: {run_id} ---")
-    print(f"    Using REAL gamma_eff/chi (gamma_proxy REMOVED)")
+    print(f"    Stage: {cfg.stage}")
+    print(f"    Debug Mode: {cfg.debug_mode} (theta noise = {'OFF' if cfg.debug_mode else 'progressive'})")
+    print(f"    Theta Noise Warmup: {cfg.theta_noise_warmup_steps} steps")
     print(f"    MC Randomness: FIXED (unique seed per batch)")
     print(f"    Hardware Randomization: {'ON' if cfg.randomize_hardware else 'OFF'}")
+    print(f"    Model fs: {model_cfg.fs/1e9:.1f} GHz")
 
     model.train()
     data_iter = iter(dataset)
@@ -373,6 +418,7 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
             last_layer_gates = outputs['layers'][-1]['gates']
             g_pn_val = last_layer_gates['g_PN'].mean().item()
             g_nl_val = last_layer_gates['g_NL'].mean().item()
+            g_theta_val = last_layer_gates.get('g_theta', torch.tensor([0])).mean().item()
 
             # Extract raw metrics
             raw_gamma = batch.get('_raw_gamma_eff', 0)
@@ -381,42 +427,43 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
             seed_used = batch.get('_seed_used', 0)
             ibo_db = batch.get('_ibo_dB', 0)
             pn_lw = batch.get('_pn_linewidth', 0)
+            theta_noise_scale = batch.get('_theta_noise_scale', 0)
 
-            # Convert gamma_eff to dB for better display
+            # Convert gamma_eff to dB
             raw_gamma_db = 10 * np.log10(raw_gamma + 1e-12)
 
             print(f"Step {step} | Loss: {loss.item():.4f} | Comm: {metrics['L_comm']:.4f} | "
-                  f"g_PN: {g_pn_val:.2f} | χ: {raw_chi:.3f} | Γ_eff: {raw_gamma_db:.1f} dB | "
-                  f"seed: {seed_used}")
+                  f"g_PN: {g_pn_val:.2f} | g_θ: {g_theta_val:.2f} | "
+                  f"θ_noise: {theta_noise_scale:.2f} | χ: {raw_chi:.3f}")
 
             writer.add_scalar("Loss/Total", loss.item(), step)
             writer.add_scalar("Gates/g_PN", g_pn_val, step)
+            writer.add_scalar("Gates/g_theta", g_theta_val, step)
             writer.add_scalar("Physics/chi", raw_chi, step)
             writer.add_scalar("Physics/gamma_eff", raw_gamma, step)
             writer.add_scalar("Physics/snr_db", raw_snr, step)
-            writer.add_scalar("Physics/ibo_dB", ibo_db, step)
-            writer.add_scalar("Physics/pn_linewidth", pn_lw, step)
-            writer.add_scalar("MC/seed", seed_used, step)
+            writer.add_scalar("Training/theta_noise_scale", theta_noise_scale, step)
 
-            # Record detailed metrics
             record = {
                 "Step": step,
                 "Loss": loss.item(),
                 **metrics,
                 "g_PN": g_pn_val,
                 "g_NL": g_nl_val,
+                "g_theta": g_theta_val,
                 "gamma_eff": raw_gamma,
                 "chi": raw_chi,
                 "snr_db": raw_snr,
                 "ibo_dB": ibo_db,
                 "pn_linewidth": pn_lw,
+                "theta_noise_scale": theta_noise_scale,
                 "seed": seed_used,
             }
             loss_history.append(record)
 
     # Diversity check
     diversity = dataset.get_diversity_stats()
-    print(f"\n [MC Diversity Check] Unique gamma_eff values: {diversity['unique']}/{diversity['total']} "
+    print(f"\n[MC Diversity Check] Unique gamma_eff values: {diversity['unique']}/{diversity['total']} "
           f"({diversity['unique_ratio']*100:.1f}%)")
 
     if diversity['unique_ratio'] < 0.5:
@@ -424,7 +471,7 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
     else:
         print("✓  Good diversity in gamma_eff")
 
-    # Save checkpoint with meta
+    # Save checkpoint
     checkpoint = {
         'model_state': model.state_dict(),
         'config': {
@@ -432,8 +479,15 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
             'n_steps': cfg.n_steps,
             'n_layers': cfg.n_layers,
             'lr': cfg.lr,
+            'fs': model_cfg.fs,  # [FIX] Save fs for verification
         },
-        'version': 'v3.1_mc_fixed',
+        'version': 'v4.0_expert_fixed',
+        'fixes_applied': [
+            'fs=10e9 (matches SimConfig)',
+            'PhysicsEncoder single-trip (tau=R/c)',
+            'Theta update implemented',
+            'Progressive theta noise',
+        ],
         'mc_randomness_info': {
             'fixed': True,
             'diversity_ratio': diversity['unique_ratio'],
@@ -456,20 +510,22 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
     axes[0, 0].set_ylabel('Loss')
     axes[0, 0].set_title('Training Loss')
 
-    axes[0, 1].plot(df['Step'], df['gamma_eff'], label='Γ_eff', alpha=0.7)
+    axes[0, 1].plot(df['Step'], df['theta_noise_scale'], label='θ noise scale', alpha=0.7)
     axes[0, 1].set_xlabel('Step')
-    axes[0, 1].set_ylabel('Γ_eff')
-    axes[0, 1].set_title('Gamma_eff Over Training')
+    axes[0, 1].set_ylabel('Noise Scale')
+    axes[0, 1].set_title('Theta Noise Scale (Progressive)')
+    axes[0, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='Max')
+    axes[0, 1].legend()
 
     axes[1, 0].plot(df['Step'], df['chi'], label='χ', alpha=0.7)
     axes[1, 0].set_xlabel('Step')
     axes[1, 0].set_ylabel('χ')
     axes[1, 0].set_title('Chi Over Training')
 
-    axes[1, 1].scatter(df['gamma_eff'], df['chi'], alpha=0.3, s=10)
-    axes[1, 1].set_xlabel('Γ_eff')
-    axes[1, 1].set_ylabel('χ')
-    axes[1, 1].set_title('Γ_eff vs χ (should show variation)')
+    axes[1, 1].plot(df['Step'], df['g_theta'], label='g_θ', alpha=0.7)
+    axes[1, 1].set_xlabel('Step')
+    axes[1, 1].set_ylabel('g_θ')
+    axes[1, 1].set_title('Theta Update Gate')
 
     fig.tight_layout()
     fig.savefig(os.path.join(cfg.eval_dir, f"train_curve_{run_id}.png"), dpi=150)
@@ -481,26 +537,20 @@ def train_one_stage(cfg: TrainConfig, master_rng: np.random.Generator = None):
 
     writer.close()
 
-    return master_rng  # Return for curriculum training
+    return master_rng
 
 
 def run_curriculum(cfg: TrainConfig, stages=[1, 2, 3]):
-    """
-    Run curriculum training with shared RNG across stages.
-
-    This ensures:
-    - Each stage uses different seeds (not the same sequence)
-    - Global step counter increases continuously
-    """
+    """Run curriculum training with shared RNG across stages."""
     print("=" * 60)
-    print("CURRICULUM TRAINING (MC Randomness Fixed)")
+    print("CURRICULUM TRAINING (Expert Fixed v4)")
     print("=" * 60)
     print(f"Stages: {stages}")
     print(f"Base seed: {cfg.seed}")
-    print(f"Hardware randomization: {cfg.randomize_hardware}")
+    print(f"Debug mode: {cfg.debug_mode}")
+    print(f"Theta noise warmup: {cfg.theta_noise_warmup_steps} steps")
     print("=" * 60)
 
-    # Create master RNG once
     master_rng = np.random.default_rng(cfg.seed)
     reset_global_step()
 
@@ -510,7 +560,6 @@ def run_curriculum(cfg: TrainConfig, stages=[1, 2, 3]):
         print(f"STAGE {stage}")
         print(f"{'='*60}")
 
-        # Pass and update master RNG
         master_rng = train_one_stage(cfg, master_rng)
 
         print(f"Stage {stage} complete. Global step: {get_global_step()}")
@@ -530,14 +579,30 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--curriculum", action="store_true", help="Run stages 1→2→3")
     parser.add_argument("--no-hw-random", action="store_true", help="Disable hardware randomization")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: theta_init = theta_true")
+    parser.add_argument("--theta-warmup", type=int, default=2000, help="Theta noise warmup steps")
     args = parser.parse_args()
 
     cfg = TrainConfig(
         stage=args.stage,
         n_steps=args.steps,
         seed=args.seed,
-        randomize_hardware=not args.no_hw_random
+        randomize_hardware=not args.no_hw_random,
+        debug_mode=args.debug,
+        theta_noise_warmup_steps=args.theta_warmup,
     )
+
+    # Print configuration summary
+    print("\n" + "=" * 60)
+    print("GA-BV-Net Training (Expert Fixed v4)")
+    print("=" * 60)
+    print(f"Debug Mode: {cfg.debug_mode}")
+    if cfg.debug_mode:
+        print("  → theta_init = theta_true (NO NOISE)")
+        print("  → Use this to verify BER decreases with SNR")
+    else:
+        print(f"  → Progressive theta noise (warmup: {cfg.theta_noise_warmup_steps} steps)")
+    print("=" * 60 + "\n")
 
     if args.curriculum:
         run_curriculum(cfg, stages=[1, 2, 3])
