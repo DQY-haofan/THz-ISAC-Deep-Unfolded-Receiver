@@ -383,7 +383,7 @@ class ThetaUpdater(nn.Module):
         self.register_buffer('max_delta_a', torch.tensor(1.0))  # m/s²
 
         # [FIX 9] Confidence threshold for gating
-        self.register_buffer('confidence_threshold', torch.tensor(0.3))
+        self.register_buffer('confidence_threshold', torch.tensor(0.005))
 
     def forward(self, theta: torch.Tensor, resid: torch.Tensor,
                 x_est: torch.Tensor, g_theta: torch.Tensor,
