@@ -1,5 +1,5 @@
 """
-gabv_net_model.py (Fixed Version v4 - Float64 Precision Fix)
+gabv_net_model.py (Fixed Version v5 - PN Tracker Normalization Fix)
 
 Description:
     PyTorch Implementation of Geometry-Aware Bussgang-VAMP Network (GA-BV-Net).
@@ -15,6 +15,10 @@ Description:
              At R=500km, fc=300GHz: phase ≈ 3e9 rad (500M cycles)
              Float32 has only 7 digits precision → ~300 rad error → BER ≈ 0.35
              Float64 has 15 digits precision → negligible error → BER ≈ 0.00
+    - [FIX 8] **CRITICAL** PN Tracker gate interpolation normalized!
+             Linear interpolation (1-g)*1 + g*exp(jφ) has |result| ≠ 1
+             This corrupted signal amplitude → BER ≈ 0.5
+             Added normalization: result / |result| → BER ≈ 0.00
 
     Meta Feature Schema (FROZEN - must match train_gabv_net.py):
         meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
@@ -24,7 +28,7 @@ Description:
         meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
         meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
 
-Author: Expert Review Fixed v4 (Float64 Precision)
+Author: Expert Review Fixed v5 (PN Tracker Normalization)
 Date: 2025-12-18
 """
 
@@ -279,7 +283,12 @@ class RiemannianPNTracker(nn.Module):
         derotator = torch.complex(cos_phi, -sin_phi)  # [B, N]
 
         # Apply gate: g_PN=0 means no de-rotation
+        # [FIX 8] CRITICAL: Must normalize after linear interpolation!
+        # Linear interpolation of complex numbers doesn't preserve unit magnitude:
+        #   (1-g)*1 + g*exp(jφ) has magnitude ≠ 1 in general
+        # This was causing BER ≈ 0.5 because signal amplitude was corrupted!
         eff_derotator = (1 - g_PN) * torch.ones_like(derotator) + g_PN * derotator
+        eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)  # Normalize!
 
         return eff_derotator
 
