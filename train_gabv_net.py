@@ -1,5 +1,5 @@
 """
-train_gabv_net.py (Fixed Version v4 - Expert Review Applied)
+train_gabv_net.py (Fixed Version v5 - FIX 11 Applied)
 
 CRITICAL FIXES:
 1. [FIX] Progressive theta noise (not fixed 100m from start!)
@@ -7,6 +7,7 @@ CRITICAL FIXES:
 3. [FIX] fs consistency check with SimConfig
 4. Global RNG with unique seeds per batch
 5. Hardware parameter randomization for gamma_eff diversity
+6. [FIX 11] construct_meta_features now checks enable_pn flag (matches run_p4_experiments.py)
 
 Usage:
     python train_gabv_net.py --stage 1 --steps 2000
@@ -176,7 +177,12 @@ def construct_meta_features(raw_meta: dict, train_cfg: TrainConfig, batch_size: 
     meta[:, 3] = sigma_eta / train_cfg.sigma_eta_scale
 
     # [4] PN Linewidth normalized (log-scale)
-    pn_linewidth = raw_meta.get('pn_linewidth', 100e3)
+    # [FIX 11] When enable_pn=False, pn_linewidth should be 0 (matches run_p4_experiments.py)
+    enable_pn = raw_meta.get('enable_pn', True)
+    if enable_pn:
+        pn_linewidth = raw_meta.get('pn_linewidth', 100e3)
+    else:
+        pn_linewidth = 0.0  # No PN
     meta[:, 4] = np.log10(pn_linewidth + 1) / np.log10(train_cfg.pn_linewidth_scale)
 
     # [5] IBO normalized
