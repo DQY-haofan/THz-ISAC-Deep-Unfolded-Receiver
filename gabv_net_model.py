@@ -527,6 +527,7 @@ class GABVNet(nn.Module):
 
             # 2. Pilot - get gates
             gates = self.pilot(meta, log_vol=log_vol)
+
             # [FIX 10] Adjust g_PN based on pn_linewidth_norm in meta
             # When pn_linewidth_norm < 0.1, there's no PN, so g_PN should be 0
             pn_norm = meta[:, 4:5]  # pn_linewidth_norm is at index 4
