@@ -243,7 +243,7 @@ class RiemannianPNTracker(nn.Module):
 
         # [FIX 12] Learnable phase bias correction
         # Initialize to 0, let training find the right value
-        self.phase_bias = nn.Parameter(torch.tensor(0.0))
+        self.phase_bias = nn.Parameter(torch.tensor(-1.5708))  # -π/2 ≈ -1.5708
 
     def forward(self, y_q: torch.Tensor, g_PN: torch.Tensor,
                 x_est: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -278,7 +278,7 @@ class RiemannianPNTracker(nn.Module):
         eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)
 
         return eff_derotator
-    
+
 class BussgangRefiner(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
