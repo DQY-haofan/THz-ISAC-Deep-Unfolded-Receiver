@@ -1,25 +1,27 @@
 """
-run_p4_experiments.py (Definition Freeze v3 - All Fixes Applied)
+run_p4_experiments_v2.py (Enhanced Save Version)
 
 Description:
     Phase 4 Evaluation & Visualization for GA-BV-Net.
 
-    **FIXES APPLIED** per Expert Review:
-    - FIX #1: noise_lmmse magic number 0.5 → chi-consistent noise
-    - FIX #2: BER calculation → true bit-level BER (I/Q separate)
-    - FIX #3: BCRLB_ref → independent χ-scaled bound (not from geom_cache)
-    - FIX #4: baseline numpy→torch conversion fixed
-    - FIX #5: MC Randomness → unique seed per trial (Blocker 3)
-    - REMOVED gamma_proxy - NO LONGER USED
+    **ENHANCED FEATURES**:
+    - 统一输出文件夹管理
+    - 每个图保存 CSV + PNG + PDF
+    - 多场景对比图 (4个阶段合并)
+    - 完整的数据溯源支持
 
-    Output:
-    - metrics_mean.csv (averaged results)
-    - metrics_raw.csv (per-MC results with seed tracking)
-    - fig_*.png / fig_*.pdf (publication-quality, NO titles)
-    - config.json (reproducibility metadata)
+    Output Structure:
+    results/all_outputs/
+    ├── data/                    # 所有CSV数据
+    │   ├── S1_full_hw_metrics.csv
+    │   ├── combined_all_scenes.csv
+    │   └── fig_*_data.csv
+    ├── figures_individual/      # 单场景图
+    ├── figures_combined/        # 多场景对比图
+    └── config/                  # 配置文件
 
-Author: Definition Freeze v3
-Date: 2025-12-17
+Author: Enhanced Save Version
+Date: 2025-12-18
 """
 
 import numpy as np
@@ -57,6 +59,14 @@ except ImportError:
     HAS_BASELINES = False
     print("Warning: baselines_receivers.py not found. Baselines disabled.")
 
+# Import results manager
+try:
+    from results_manager import ResultsManager, integrate_with_run_p4
+    HAS_RESULTS_MANAGER = True
+except ImportError:
+    HAS_RESULTS_MANAGER = False
+    print("Warning: results_manager.py not found. Using basic save mode.")
+
 
 # =============================================================================
 # Configuration
@@ -84,7 +94,7 @@ class ExperimentConfig:
     n_mc: int = 10
     batch_size: int = 64
 
-    # MC Randomness (FIX #5)
+    # MC Randomness
     base_seed: int = 42
 
     # Toggles
@@ -92,7 +102,7 @@ class ExperimentConfig:
     use_baselines: bool = True
 
 
-# Plot Configuration (NO TITLES for publication)
+# Plot Configuration
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams.update({
     'font.family': 'serif',
@@ -109,21 +119,11 @@ plt.rcParams.update({
 
 
 # =============================================================================
-# 1. Meta Feature Construction (Definition Freeze v3)
+# 1. Meta Feature Construction
 # =============================================================================
 
 def construct_meta_features(meta: dict, batch_size: int) -> torch.Tensor:
-    """
-    Constructs the FROZEN meta feature vector for GA-BV-Net.
-
-    **DEFINITION FREEZE v3** - 6 features:
-        [0] snr_db_norm:       (snr_db - 15) / 15
-        [1] gamma_eff_db_norm: (10*log10(gamma_eff) - 10) / 20
-        [2] chi:               Raw value [0, 2/π]
-        [3] sigma_eta_norm:    sigma_eta / 0.1
-        [4] pn_linewidth_norm: log10(pn_linewidth + 1) / 6
-        [5] ibo_db_norm:       (ibo_dB - 3) / 3
-    """
+    """Constructs the FROZEN meta feature vector for GA-BV-Net."""
     snr_db = float(meta.get('snr_db', 20.0))
     gamma_eff = float(meta.get('gamma_eff', 1e6))
     chi = float(meta.get('chi', 0.6366))
@@ -153,22 +153,14 @@ def construct_meta_features(meta: dict, batch_size: int) -> torch.Tensor:
 
 
 # =============================================================================
-# 2. Independent BCRLB Reference (FIX #3)
+# 2. Independent BCRLB Reference
 # =============================================================================
 
 def compute_bcrlb_ref_independent(snr_linear: float, chi: float,
                                    R: float, v_rel: float,
                                    fc: float = 300e9, B: float = 20e9,
                                    N: int = 1024) -> Dict[str, float]:
-    """
-    Computes INDEPENDENT BCRLB reference using χ-scaling.
-
-    This is NOT from network's geom_cache - it's an external reference
-    for fair comparison in paper figures.
-
-    Theory (per DR-P2-3):
-        BCRLB_1bit ≈ BCRLB_analog / χ²
-    """
+    """Computes INDEPENDENT BCRLB reference using χ-scaling."""
     c = 3e8
 
     crlb_R_analog = (c ** 2) / (8 * (np.pi ** 2) * (B ** 2) * snr_linear * N + 1e-12)
@@ -198,20 +190,11 @@ def compute_bcrlb_ref_independent(snr_linear: float, chi: float,
 
 
 # =============================================================================
-# 3. Metrics Calculation (FIX #2: True Bit-Level BER)
+# 3. Metrics Calculation
 # =============================================================================
 
 def compute_ber_qpsk_bitwise(x_hat: np.ndarray, x_true: np.ndarray) -> float:
-    """
-    Computes TRUE bit-level BER for QPSK.
-
-    **FIX #2**: Previous version counted symbol errors, not bit errors.
-    QPSK: 2 bits per symbol (I and Q each carry 1 bit)
-
-    Mapping (Gray coded):
-        bit_I = 0 if real > 0, else 1
-        bit_Q = 0 if imag > 0, else 1
-    """
+    """Computes TRUE bit-level BER for QPSK."""
     bit_I_true = (np.real(x_true) > 0).astype(int)
     bit_Q_true = (np.imag(x_true) > 0).astype(int)
 
@@ -228,7 +211,7 @@ def compute_ber_qpsk_bitwise(x_hat: np.ndarray, x_true: np.ndarray) -> float:
 
 
 def compute_ser_qpsk(x_hat: np.ndarray, x_true: np.ndarray) -> float:
-    """Symbol Error Rate for QPSK (for comparison with BER)."""
+    """Symbol Error Rate for QPSK."""
     constellation = np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
     idx_true = np.argmin(np.abs(x_true[..., None] - constellation), axis=-1)
     idx_hat = np.argmin(np.abs(x_hat[..., None] - constellation), axis=-1)
@@ -252,35 +235,26 @@ def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[f
 
 
 # =============================================================================
-# 4. Baseline Runners (FIX #4: numpy→torch)
+# 4. Baseline Runners
 # =============================================================================
 
 def run_baselines_on_batch(y_q_np: np.ndarray, h_diag_np: np.ndarray,
                            noise_var: float, device: str) -> Dict[str, np.ndarray]:
-    """
-    Run baseline detectors on a batch.
-
-    **FIX #4**: Proper numpy → torch conversion.
-    Previous version: y_q.to(device) on numpy array (no .to() method)
-    Fixed: torch.from_numpy(y_q_np).cfloat().to(device)
-    """
+    """Run baseline detectors on a batch."""
     if not HAS_BASELINES:
         return {}
 
-    # Proper conversion
     y_q = torch.from_numpy(y_q_np).cfloat().to(device)
     h_diag = torch.from_numpy(h_diag_np).cfloat().to(device)
 
     results = {}
 
-    # LMMSE
     try:
         x_lmmse = detector_lmmse_bussgang_torch(y_q, h_diag, noise_var)
         results['x_lmmse'] = x_lmmse.cpu().numpy()
     except Exception as e:
         print(f"  LMMSE failed: {e}")
 
-    # GAMP
     try:
         x_gamp = detector_gamp_1bit_torch(y_q, h_diag, noise_var)
         results['x_gamp'] = x_gamp.cpu().numpy()
@@ -314,18 +288,16 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
 
 
 # =============================================================================
-# 6. Single Scenario Runner (FIX #5: MC Randomness)
+# 6. Single Scenario Runner
 # =============================================================================
 
 def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
-                        device: str, ckpt_tag: str, out_base: str):
+                        device: str, ckpt_tag: str, out_base: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run evaluation for a single scenario.
 
-    **FIX #5** (Blocker 3): MC Randomness
-    - Uses base_seed to create seed RNG
-    - Each MC trial gets unique seed from RNG
-    - Seeds tracked in metrics_raw.csv for reproducibility
+    Returns:
+        (df_mean, df_raw): Mean results and raw MC results
     """
     out_dir = Path(out_base) / exp_cfg.scene_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -334,7 +306,6 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
     print(f"Scene: {exp_cfg.scene_id} - {exp_cfg.description}")
     print(f"{'='*60}")
 
-    # Seed RNG for MC trials (FIX #5)
     seed_rng = np.random.default_rng(exp_cfg.base_seed)
 
     sim_cfg = SimConfig()
@@ -346,7 +317,7 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
     sim_cfg.R = exp_cfg.R
     sim_cfg.v_rel = exp_cfg.v_rel
 
-    all_results = []  # Per-MC results
+    all_results = []
     mean_results = []
 
     for snr_db in tqdm(exp_cfg.snr_grid, desc="SNR sweep"):
@@ -358,15 +329,13 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             'NMSE_Net': [], 'NMSE_LMMSE': [], 'NMSE_GAMP': [],
             'RMSE_R': [], 'RMSE_v': [], 'RMSE_a': [],
             'gamma_eff': [], 'chi': [],
-            'mc_seed': []  # Track seeds (FIX #5)
+            'mc_seed': []
         }
 
         for mc_idx in range(exp_cfg.n_mc):
-            # Generate unique seed for this MC trial (FIX #5)
             mc_seed = int(seed_rng.integers(0, 2**31))
             mc_metrics['mc_seed'].append(mc_seed)
 
-            # Simulate with unique seed
             data = simulate_batch(sim_cfg, batch_size=exp_cfg.batch_size, seed=mc_seed)
             meta = data['meta']
 
@@ -444,7 +413,6 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
         def safe_std(arr):
             return np.std(arr) if len(arr) > 1 else 0.0
 
-        # Compute BCRLB reference (FIX #3)
         avg_chi = safe_mean(mc_metrics['chi'])
         bcrlb_ref = compute_bcrlb_ref_independent(
             snr_linear, avg_chi, exp_cfg.R, exp_cfg.v_rel
@@ -467,173 +435,29 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             'BCRLB_R_analog': bcrlb_ref['BCRLB_R_analog'],
         })
 
-    # Save results
+    # Save results (原有保存逻辑保留)
     df_mean = pd.DataFrame(mean_results)
     df_mean.to_csv(out_dir / "metrics_mean.csv", index=False)
 
     df_raw = pd.DataFrame(all_results)
     df_raw.to_csv(out_dir / "metrics_raw.csv", index=False)
 
-    # Save config (with MC randomness info)
+    # Save config
     config_data = {
         'experiment': asdict(exp_cfg),
         'checkpoint': ckpt_tag,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'mc_randomness_fixed': True,
-        'seed_strategy': {
-            'base_seed': exp_cfg.base_seed,
-            'method': 'unique_seed_per_trial',
-            'note': 'Each MC trial uses seed from RNG(base_seed)'
-        },
-        'fixes_applied': [
-            'FIX #1: chi-consistent noise',
-            'FIX #2: true bit-level BER',
-            'FIX #3: independent BCRLB_ref',
-            'FIX #4: numpy→torch conversion',
-            'FIX #5: MC randomness'
-        ]
     }
     with open(out_dir / "config.json", 'w') as f:
         json.dump(config_data, f, indent=2, default=str)
 
-    # Generate plots
-    generate_plots(df_mean, out_dir)
-
     print(f"  [Results] Saved to {out_dir}")
 
-    # Verify MC randomness worked
-    unique_seeds = df_raw['mc_seed'].nunique()
-    total_trials = len(df_raw)
-    print(f"  [MC Check] Unique seeds: {unique_seeds}/{total_trials}")
+    return df_mean, df_raw
 
 
 # =============================================================================
-# 7. Plot Generation
-# =============================================================================
-
-def generate_plots(df: pd.DataFrame, out_dir: Path):
-    """Generate publication-quality plots (NO TITLES)."""
-
-    # Plot 1: BER vs SNR
-    fig1, ax1 = plt.subplots(figsize=(7, 5))
-
-    if "BER_Net" in df.columns and not df["BER_Net"].isna().all():
-        ax1.semilogy(df["snr_db"], df["BER_Net"], 'b-o', label='GA-BV-Net')
-    if "BER_LMMSE" in df.columns and not df["BER_LMMSE"].isna().all():
-        ax1.semilogy(df["snr_db"], df["BER_LMMSE"], 'r--s', label='Bussgang-LMMSE')
-    if "BER_GAMP" in df.columns and not df["BER_GAMP"].isna().all():
-        ax1.semilogy(df["snr_db"], df["BER_GAMP"], 'g-.^', label='1-bit GAMP')
-
-    ax1.set_xlabel('SNR (dB)')
-    ax1.set_ylabel('Bit Error Rate')
-    ax1.legend(loc='upper right')
-    ax1.grid(True, which='both', linestyle='-', alpha=0.3)
-    ax1.set_ylim([1e-5, 1])
-
-    fig1.tight_layout()
-    fig1.savefig(out_dir / "fig_ber.png", dpi=300, bbox_inches='tight')
-    fig1.savefig(out_dir / "fig_ber.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig1)
-
-    # Plot 2: RMSE Range with BCRLB
-    fig2, ax2 = plt.subplots(figsize=(7, 5))
-
-    if "RMSE_R" in df.columns and not df["RMSE_R"].isna().all():
-        ax2.semilogy(df["snr_db"], df["RMSE_R"], 'b-o', label='GA-BV-Net RMSE')
-
-    if "BCRLB_R_ref" in df.columns and not df["BCRLB_R_ref"].isna().all():
-        lb_ref = np.sqrt(df["BCRLB_R_ref"])
-        ax2.semilogy(df["snr_db"], lb_ref, 'k-', linewidth=2,
-                     label=r'$\sqrt{\mathrm{BCRLB}_\mathrm{ref}}$ (χ-scaled)')
-
-    if "BCRLB_R_analog" in df.columns and not df["BCRLB_R_analog"].isna().all():
-        lb_analog = np.sqrt(df["BCRLB_R_analog"])
-        ax2.semilogy(df["snr_db"], lb_analog, 'k:', linewidth=1,
-                     label=r'$\sqrt{\mathrm{CRLB}_\mathrm{analog}}$')
-
-    ax2.set_xlabel('SNR (dB)')
-    ax2.set_ylabel('Range RMSE (m)')
-    ax2.legend(loc='upper right')
-    ax2.grid(True, which='both', linestyle='-', alpha=0.3)
-
-    fig2.tight_layout()
-    fig2.savefig(out_dir / "fig_rmse_range.png", dpi=300, bbox_inches='tight')
-    fig2.savefig(out_dir / "fig_rmse_range.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig2)
-
-    # Plot 3: NMSE vs SNR
-    fig3, ax3 = plt.subplots(figsize=(7, 5))
-
-    if "NMSE_Net" in df.columns and not df["NMSE_Net"].isna().all():
-        ax3.plot(df["snr_db"], df["NMSE_Net"], 'b-o', label='GA-BV-Net')
-
-    ax3.set_xlabel('SNR (dB)')
-    ax3.set_ylabel('NMSE (dB)')
-    ax3.legend(loc='upper right')
-    ax3.grid(True, linestyle='-', alpha=0.3)
-
-    fig3.tight_layout()
-    fig3.savefig(out_dir / "fig_nmse.png", dpi=300, bbox_inches='tight')
-    fig3.savefig(out_dir / "fig_nmse.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig3)
-
-    # Plot 4: Gamma_eff and Chi vs SNR
-    fig4, ax4a = plt.subplots(figsize=(7, 5))
-
-    if "gamma_eff" in df.columns and not df["gamma_eff"].isna().all():
-        gamma_db = 10 * np.log10(df["gamma_eff"].values + 1e-12)
-        ax4a.plot(df["snr_db"], gamma_db, 'b-o', label=r'$\Gamma_\mathrm{eff}$ (dB)')
-        ax4a.set_ylabel(r'$\Gamma_\mathrm{eff}$ (dB)', color='b')
-        ax4a.tick_params(axis='y', labelcolor='b')
-
-    ax4b = ax4a.twinx()
-    if "chi" in df.columns and not df["chi"].isna().all():
-        ax4b.plot(df["snr_db"], df["chi"], 'r--s', label=r'$\chi$')
-        ax4b.set_ylabel(r'$\chi$ (Information Retention)', color='r')
-        ax4b.tick_params(axis='y', labelcolor='r')
-        ax4b.axhline(y=2/np.pi, color='r', linestyle=':', alpha=0.5,
-                     label=r'$\chi_\mathrm{max} = 2/\pi$')
-
-    ax4a.set_xlabel('SNR (dB)')
-    ax4a.grid(True, linestyle='-', alpha=0.3)
-
-    lines1, labels1 = ax4a.get_legend_handles_labels()
-    lines2, labels2 = ax4b.get_legend_handles_labels()
-    ax4a.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
-
-    fig4.tight_layout()
-    fig4.savefig(out_dir / "fig_gamma_chi.png", dpi=300, bbox_inches='tight')
-    fig4.savefig(out_dir / "fig_gamma_chi.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig4)
-
-    # Plot 5: Gap to BCRLB
-    fig5, ax5 = plt.subplots(figsize=(7, 5))
-
-    if ("RMSE_R" in df.columns and "BCRLB_R_ref" in df.columns and
-        not df["RMSE_R"].isna().all() and not df["BCRLB_R_ref"].isna().all()):
-
-        rmse = df["RMSE_R"].values
-        bcrlb = np.sqrt(df["BCRLB_R_ref"].values)
-        gap_db = 20 * np.log10(rmse / (bcrlb + 1e-12) + 1e-12)
-
-        ax5.plot(df["snr_db"], gap_db, 'b-o', label='GA-BV-Net')
-        ax5.axhline(y=0, color='k', linestyle='--', label='BCRLB (0 dB gap)')
-
-    ax5.set_xlabel('SNR (dB)')
-    ax5.set_ylabel('Gap to BCRLB (dB)')
-    ax5.legend(loc='upper right')
-    ax5.grid(True, linestyle='-', alpha=0.3)
-
-    fig5.tight_layout()
-    fig5.savefig(out_dir / "fig_gap_bcrlb.png", dpi=300, bbox_inches='tight')
-    fig5.savefig(out_dir / "fig_gap_bcrlb.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig5)
-
-    print(f"  [Plots] Saved 5 figures to {out_dir}")
-
-
-# =============================================================================
-# 8. Experiment Configurations
+# 7. Experiment Configurations
 # =============================================================================
 
 def get_default_experiments() -> List[ExperimentConfig]:
@@ -678,28 +502,32 @@ def get_default_experiments() -> List[ExperimentConfig]:
 
 
 # =============================================================================
-# 9. Main Entry Point
+# 8. Main Entry Point
 # =============================================================================
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="P4 Experiments (Definition Freeze v3)")
+    parser = argparse.ArgumentParser(description="P4 Experiments (Enhanced Save Version)")
     parser.add_argument('--ckpt', type=str, default=None,
                         help='Path to GA-BV-Net checkpoint')
     parser.add_argument('--out', type=str, default='results/p4_experiments',
-                        help='Output directory')
+                        help='Output directory for individual scenes')
+    parser.add_argument('--unified_out', type=str, default='results/all_outputs',
+                        help='Unified output directory for combined results')
     parser.add_argument('--scene', type=str, default='all',
                         help='Scene ID to run (or "all")')
     parser.add_argument('--n_mc', type=int, default=10,
-                        help='Number of Monte Carlo trials (default: 10)')
+                        help='Number of Monte Carlo trials')
     parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size per trial (default: 64)')
+                        help='Batch size per trial')
     parser.add_argument('--no_baselines', action='store_true',
                         help='Disable baselines')
     parser.add_argument('--no_model', action='store_true',
-                        help='Disable GA-BV-Net (baselines only)')
+                        help='Disable GA-BV-Net')
+    parser.add_argument('--no_combined', action='store_true',
+                        help='Skip combined plots')
     parser.add_argument('--device', type=str, default=None,
-                        help='Device to use (cuda/cpu, default: auto-detect)')
+                        help='Device to use (cuda/cpu)')
     args = parser.parse_args()
 
     if args.device:
@@ -709,15 +537,7 @@ def main():
     print(f"[Device] Using: {device}")
 
     print("\n" + "=" * 60)
-    print("P4 Experiments - Definition Freeze v3 (All Fixes Applied)")
-    print("=" * 60)
-    print("FIXES APPLIED:")
-    print("  [✓] FIX #1: Chi-consistent noise (no magic 0.5)")
-    print("  [✓] FIX #2: True bit-level BER (not SER)")
-    print("  [✓] FIX #3: Independent BCRLB_ref (χ-scaled)")
-    print("  [✓] FIX #4: numpy→torch conversion fixed")
-    print("  [✓] FIX #5: MC randomness (unique seed per trial)")
-    print("  [✓] gamma_proxy REMOVED")
+    print("P4 Experiments - Enhanced Save Version")
     print("=" * 60)
 
     model = None
@@ -742,15 +562,52 @@ def main():
             exp.use_baselines = False
         if args.no_model:
             exp.use_ga_bv_net = False
-        # Override n_mc and batch_size from command line
         exp.n_mc = args.n_mc
         exp.batch_size = args.batch_size
 
     print(f"[Config] n_mc={args.n_mc}, batch_size={args.batch_size}")
     print(f"[Config] Scenes: {[e.scene_id for e in experiments]}")
 
+    # 收集所有场景结果
+    scene_results = {}
+
     for exp in experiments:
-        run_single_scenario(exp, model, device, ckpt_tag, args.out)
+        df_mean, df_raw = run_single_scenario(exp, model, device, ckpt_tag, args.out)
+        scene_results[exp.scene_id] = {
+            'df_mean': df_mean,
+            'df_raw': df_raw,
+            'config': asdict(exp)
+        }
+
+    # =================================================================
+    # 使用 ResultsManager 生成统一输出
+    # =================================================================
+
+    if HAS_RESULTS_MANAGER and not args.no_combined:
+        print("\n" + "=" * 60)
+        print("Generating Unified Outputs with ResultsManager")
+        print("=" * 60)
+
+        manager = ResultsManager(base_dir=args.unified_out)
+
+        for scene_id, results in scene_results.items():
+            manager.add_scene_data(
+                scene_id,
+                results['df_mean'],
+                results['config']
+            )
+
+        # 保存所有输出
+        manager.save_all(additional_config={
+            'checkpoint': ckpt_tag,
+            'n_mc': args.n_mc,
+            'batch_size': args.batch_size,
+            'device': device,
+        })
+
+    elif not HAS_RESULTS_MANAGER:
+        print("\n[Warning] results_manager.py not found, skipping unified outputs")
+        print("Run: python results_manager.py --demo to test the module")
 
     print("\n[Done] All experiments completed.")
 
