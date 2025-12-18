@@ -163,7 +163,14 @@ def construct_meta_features(meta: dict, batch_size: int) -> torch.Tensor:
     gamma_eff = float(meta.get('gamma_eff', 1e6))
     chi = float(meta.get('chi', 0.6366))
     sigma_eta = float(meta.get('sigma_eta', 0.0))
-    pn_linewidth = float(meta.get('pn_linewidth', 100e3))
+
+    # [FIX] When enable_pn=False, pn_linewidth should be 0
+    enable_pn = meta.get('enable_pn', True)
+    if enable_pn:
+        pn_linewidth = float(meta.get('pn_linewidth', 100e3))
+    else:
+        pn_linewidth = 0.0  # No PN
+
     ibo_dB = float(meta.get('ibo_dB', 3.0))
 
     snr_db_norm = (snr_db - 15.0) / 15.0
