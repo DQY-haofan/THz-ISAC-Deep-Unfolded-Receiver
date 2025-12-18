@@ -12,6 +12,7 @@ Description:
     - [FIX 5] MC Randomness → unique seed per trial
     - [FIX 6] fs consistency check
     - [FIX 7] Optional debug mode with theta_init = theta_true
+    - [NEW] Enhanced GPU detection for Colab compatibility
 
     Output:
     - metrics_mean.csv (averaged results)
@@ -35,6 +36,45 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Tuple, Optional, Dict
 from tqdm import tqdm
 import time
+
+# --- GPU Utilities ---
+try:
+    from gpu_utils import setup_device, print_gpu_info, clear_gpu_memory, memory_summary
+    HAS_GPU_UTILS = True
+except ImportError:
+    HAS_GPU_UTILS = False
+
+    def setup_device(preferred_device=None, verbose=True):
+        """Fallback device setup."""
+        if preferred_device:
+            device = torch.device(preferred_device)
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+
+        if verbose:
+            print(f"[Device] Using: {device}")
+            if device.type == 'cuda':
+                print(f"[GPU] {torch.cuda.get_device_name(0)}")
+                print(f"[GPU] Memory: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
+        return device
+
+    def print_gpu_info():
+        if torch.cuda.is_available():
+            print(f"[GPU] {torch.cuda.get_device_name(0)}")
+        else:
+            print("[GPU] CUDA not available, using CPU")
+
+    def clear_gpu_memory():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def memory_summary():
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"[GPU Memory] {allocated:.2f}/{total:.1f} GB")
 
 # Import modules
 try:
@@ -83,7 +123,7 @@ class ExperimentConfig:
     # Evaluation
     snr_grid: List[float] = field(default_factory=lambda: list(np.arange(-5, 26, 2)))
     n_mc: int = 10
-    batch_size: int = 512
+    batch_size: int = 64
 
     # MC Randomness
     base_seed: int = 42
@@ -653,24 +693,28 @@ def main():
                         help='Device to use (cuda/cpu)')
     args = parser.parse_args()
 
-    if args.device:
-        device = args.device
-    else:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"[Device] Using: {device}")
+    # =========================================================================
+    # GPU Setup - Important for Colab!
+    # =========================================================================
+    device = setup_device(preferred_device=args.device, verbose=True)
+    device_str = str(device)
 
     print("\n" + "=" * 60)
     print("P4 Experiments - Expert Fixed v4")
     print("=" * 60)
+    print(f"Device: {device_str}")
     if args.debug_theta:
         print("⚠️  DEBUG MODE: theta_init = theta_true (NO NOISE)")
         print("    Use this to verify BER decreases with SNR")
     print("=" * 60)
 
+    # Clear GPU memory before starting
+    clear_gpu_memory()
+
     model = None
     ckpt_tag = "none"
     if HAS_MODEL and args.ckpt and not args.no_model:
-        model = load_gabv_model(args.ckpt, device)
+        model = load_gabv_model(args.ckpt, device_str)
         ckpt_tag = Path(args.ckpt).stem
     elif not args.no_model:
         print("[Model] No checkpoint provided, GA-BV-Net disabled")
@@ -683,22 +727,215 @@ def main():
             print(f"[Error] Scene '{args.scene}' not found")
             sys.exit(1)
 
+    # Auto-adjust batch size based on GPU memory
+    batch_size = args.batch_size
+    if device.type == 'cuda':
+        total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_mem < 8 and batch_size > 32:
+            batch_size = 32
+            print(f"⚠️  Limited GPU memory ({total_mem:.1f}GB), reducing batch_size to {batch_size}")
+
     for exp in experiments:
         if args.no_baselines:
             exp.use_baselines = False
         if args.no_model:
             exp.use_ga_bv_net = False
         exp.n_mc = args.n_mc
-        exp.batch_size = args.batch_size
+        exp.batch_size = batch_size
         exp.debug_theta_exact = args.debug_theta
 
-    print(f"[Config] n_mc={args.n_mc}, batch_size={args.batch_size}")
+    print(f"[Config] n_mc={args.n_mc}, batch_size={batch_size}")
     print(f"[Config] Scenes: {[e.scene_id for e in experiments]}")
 
+    # Run all experiments and collect results
+    all_scene_results = {}
     for exp in experiments:
-        run_single_scenario(exp, model, device, ckpt_tag, args.out)
+        df_result = run_single_scenario(exp, model, device_str, ckpt_tag, args.out)
+        all_scene_results[exp.scene_id] = df_result
+        # Clear memory between experiments
+        clear_gpu_memory()
+
+    # ==========================================================================
+    # Save Combined Results for All Scenes
+    # ==========================================================================
+    if len(all_scene_results) > 1:
+        print("\n" + "=" * 60)
+        print("📊 Generating Combined Results for All Scenes")
+        print("=" * 60)
+
+        combined_dir = Path(args.out) / "combined"
+        combined_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Combined CSV with scene column
+        combined_rows = []
+        for scene_id, df in all_scene_results.items():
+            if df is not None:
+                df_copy = df.copy()
+                df_copy.insert(0, 'scene_id', scene_id)
+                combined_rows.append(df_copy)
+
+        if combined_rows:
+            df_combined = pd.concat(combined_rows, ignore_index=True)
+            df_combined.to_csv(combined_dir / "all_scenes_metrics.csv", index=False)
+            print(f"  ✅ Saved: {combined_dir}/all_scenes_metrics.csv")
+
+        # 2. Generate combined comparison plots
+        generate_combined_plots(all_scene_results, combined_dir)
+
+        print(f"  ✅ Combined results saved to: {combined_dir}")
 
     print("\n[Done] All experiments completed.")
+    memory_summary()
+
+
+def generate_combined_plots(results: Dict[str, pd.DataFrame], out_dir: Path):
+    """Generate combined comparison plots for all scenes."""
+
+    # Define colors and markers for each scene
+    scene_styles = {
+        'S1_full_hw': {'color': 'blue', 'marker': 'o', 'label': 'Full HW (PA+PN+1bit)'},
+        'S2_pa_only': {'color': 'red', 'marker': 's', 'label': 'PA Only'},
+        'S3_pn_only': {'color': 'green', 'marker': '^', 'label': 'PN + 1bit'},
+        'S4_ideal': {'color': 'black', 'marker': 'd', 'label': 'Ideal (No HW)'},
+    }
+
+    # =========================================================================
+    # Plot 1: BER Comparison (All Scenes)
+    # =========================================================================
+    fig1, ax1 = plt.subplots(figsize=(8, 6))
+
+    for scene_id, df in results.items():
+        if df is None:
+            continue
+        style = scene_styles.get(scene_id, {'color': 'gray', 'marker': 'x', 'label': scene_id})
+
+        # Plot GA-BV-Net if available
+        if 'BER_Net' in df.columns and not df['BER_Net'].isna().all():
+            ax1.semilogy(df['snr_db'], df['BER_Net'],
+                        color=style['color'], marker=style['marker'],
+                        linestyle='-', label=f"GA-BV-Net ({style['label']})")
+
+        # Plot LMMSE baseline
+        if 'BER_LMMSE' in df.columns and not df['BER_LMMSE'].isna().all():
+            ax1.semilogy(df['snr_db'], df['BER_LMMSE'],
+                        color=style['color'], marker=style['marker'],
+                        linestyle='--', alpha=0.6, label=f"LMMSE ({style['label']})")
+
+    ax1.set_xlabel('SNR (dB)')
+    ax1.set_ylabel('Bit Error Rate')
+    ax1.set_title('BER vs SNR - All Scenarios Comparison')
+    ax1.legend(loc='upper right', fontsize=8, ncol=2)
+    ax1.grid(True, which='both', linestyle='-', alpha=0.3)
+    ax1.set_ylim([1e-5, 1])
+
+    fig1.tight_layout()
+    fig1.savefig(out_dir / "combined_ber.png", dpi=300, bbox_inches='tight')
+    fig1.savefig(out_dir / "combined_ber.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig1)
+
+    # =========================================================================
+    # Plot 2: Chi Comparison (All Scenes)
+    # =========================================================================
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+
+    for scene_id, df in results.items():
+        if df is None:
+            continue
+        style = scene_styles.get(scene_id, {'color': 'gray', 'marker': 'x', 'label': scene_id})
+
+        if 'chi' in df.columns and not df['chi'].isna().all():
+            ax2.plot(df['snr_db'], df['chi'],
+                    color=style['color'], marker=style['marker'],
+                    linestyle='-', label=style['label'])
+
+    ax2.axhline(y=2/np.pi, color='gray', linestyle=':', alpha=0.7, label=r'$\chi_{max}=2/\pi$')
+    ax2.set_xlabel('SNR (dB)')
+    ax2.set_ylabel(r'$\chi$ (Information Retention)')
+    ax2.set_title('Chi vs SNR - All Scenarios Comparison')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, linestyle='-', alpha=0.3)
+    ax2.set_ylim([0, 0.7])
+
+    fig2.tight_layout()
+    fig2.savefig(out_dir / "combined_chi.png", dpi=300, bbox_inches='tight')
+    fig2.savefig(out_dir / "combined_chi.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig2)
+
+    # =========================================================================
+    # Plot 3: RMSE Range Comparison (All Scenes)
+    # =========================================================================
+    fig3, ax3 = plt.subplots(figsize=(8, 6))
+
+    has_rmse_data = False
+    for scene_id, df in results.items():
+        if df is None:
+            continue
+        style = scene_styles.get(scene_id, {'color': 'gray', 'marker': 'x', 'label': scene_id})
+
+        if 'RMSE_R' in df.columns and not df['RMSE_R'].isna().all():
+            ax3.semilogy(df['snr_db'], df['RMSE_R'],
+                        color=style['color'], marker=style['marker'],
+                        linestyle='-', label=style['label'])
+            has_rmse_data = True
+
+    if has_rmse_data:
+        ax3.set_xlabel('SNR (dB)')
+        ax3.set_ylabel('Range RMSE (m)')
+        ax3.set_title('Range RMSE vs SNR - All Scenarios Comparison')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, which='both', linestyle='-', alpha=0.3)
+
+        fig3.tight_layout()
+        fig3.savefig(out_dir / "combined_rmse.png", dpi=300, bbox_inches='tight')
+        fig3.savefig(out_dir / "combined_rmse.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig3)
+
+    # =========================================================================
+    # Plot 4: Summary Table as Figure
+    # =========================================================================
+    fig4, ax4 = plt.subplots(figsize=(10, 4))
+    ax4.axis('off')
+
+    # Create summary table
+    table_data = []
+    for scene_id, df in results.items():
+        if df is None:
+            continue
+
+        # Get metrics at SNR=15dB (or closest)
+        idx = (df['snr_db'] - 15).abs().idxmin()
+        row = df.iloc[idx]
+
+        ber_net = f"{row.get('BER_Net', np.nan):.4f}" if not pd.isna(row.get('BER_Net')) else "N/A"
+        ber_lmmse = f"{row.get('BER_LMMSE', np.nan):.4f}" if not pd.isna(row.get('BER_LMMSE')) else "N/A"
+        chi_val = f"{row.get('chi', np.nan):.3f}" if not pd.isna(row.get('chi')) else "N/A"
+
+        table_data.append([
+            scene_id,
+            scene_styles.get(scene_id, {}).get('label', scene_id),
+            ber_net,
+            ber_lmmse,
+            chi_val
+        ])
+
+    if table_data:
+        table = ax4.table(
+            cellText=table_data,
+            colLabels=['Scene ID', 'Description', 'BER (Net)', 'BER (LMMSE)', 'χ'],
+            loc='center',
+            cellLoc='center'
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.2, 1.5)
+        ax4.set_title('Summary at SNR = 15 dB', fontsize=12, fontweight='bold', y=0.9)
+
+        fig4.tight_layout()
+        fig4.savefig(out_dir / "summary_table.png", dpi=300, bbox_inches='tight')
+        fig4.savefig(out_dir / "summary_table.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig4)
+
+    print(f"  ✅ Generated 4 combined plots")
 
 
 if __name__ == "__main__":
