@@ -223,9 +223,6 @@ class RiemannianPNTracker(nn.Module):
 
     FIX 5: Explicit (cos, sin) output with normalization
     FIX 12: Learnable phase bias correction for initial phase ambiguity
-
-    The PN Tracker can track phase CHANGES but cannot determine absolute phase.
-    This causes a fixed ~45° bias. We add a learnable bias to correct this.
     """
 
     def __init__(self, cfg: GABVConfig):
@@ -238,64 +235,47 @@ class RiemannianPNTracker(nn.Module):
         )
         out_dim = cfg.hidden_dim_pn * 2 if cfg.use_bidirectional_pn else cfg.hidden_dim_pn
 
-        # Output (cos, sin) for stability
         self.head = nn.Sequential(
             nn.Linear(out_dim, cfg.hidden_dim_pn // 2),
             nn.ReLU(),
-            nn.Linear(cfg.hidden_dim_pn // 2, 2)  # (cos, sin)
+            nn.Linear(cfg.hidden_dim_pn // 2, 2)
         )
 
         # [FIX 12] Learnable phase bias correction
-        # Initialize to ~45° (0.785 rad) based on empirical observation
-        self.phase_bias = nn.Parameter(torch.tensor(0.785))
+        # Initialize to 0, let training find the right value
+        self.phase_bias = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, y_q: torch.Tensor, g_PN: torch.Tensor,
                 x_est: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Estimate phase noise and return de-rotation factor.
-
-        Args:
-            y_q: Quantized observation [B, N]
-            g_PN: PN gate [B, 1]
-            x_est: Optional symbol estimate (used if reliable)
-
-        Returns:
-            derotator: exp(-jφ) de-rotation factor [B, N]
         """
-        # Use residual if x_est is reliable, else use y_q directly
         if x_est is not None and x_est.abs().mean() > 0.1:
-            # Normalize x_est to unit magnitude for phase extraction
             x_norm = x_est / (x_est.abs() + 1e-6)
             resid = y_q * torch.conj(x_norm)
             feats = torch.stack([resid.real, resid.imag], dim=-1)
         else:
-            # Early layers: use y_q directly
-            feats = torch.stack([y_q.real, y_q.imag], dim=-1)  # [B, N, 2]
+            feats = torch.stack([y_q.real, y_q.imag], dim=-1)
 
-        rnn_out, _ = self.rnn(feats)  # [B, N, hidden*2]
+        rnn_out, _ = self.rnn(feats)
 
-        # Output (cos, sin)
-        cos_sin = self.head(rnn_out)  # [B, N, 2]
+        cos_sin = self.head(rnn_out)
         cos_phi = cos_sin[..., 0]
         sin_phi = cos_sin[..., 1]
 
-        # Normalize to unit circle
         mag = torch.sqrt(cos_phi ** 2 + sin_phi ** 2 + 1e-8)
         cos_phi = cos_phi / mag
         sin_phi = sin_phi / mag
 
-        # De-rotation factor: exp(-jφ) = cos(φ) - j*sin(φ)
-        derotator = torch.complex(cos_phi, -sin_phi)  # [B, N]
+        derotator = torch.complex(cos_phi, -sin_phi)
 
-        # [FIX 12] Apply learnable phase bias correction
-        # This corrects the ~45° initial phase ambiguity
-        bias_correction = torch.exp(torch.tensor(1j, device=derotator.device) * self.phase_bias)
+        # [FIX 12] Apply learnable phase bias correction (符号修正!)
+        bias_correction = torch.exp(-1j * self.phase_bias)
         derotator = derotator * bias_correction
 
-        # Apply gate: g_PN=0 means no de-rotation
-        # [FIX 8] CRITICAL: Must normalize after linear interpolation!
+        # [FIX 8] Normalize after interpolation
         eff_derotator = (1 - g_PN) * torch.ones_like(derotator) + g_PN * derotator
-        eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)  # Normalize!
+        eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)
 
         return eff_derotator
     
