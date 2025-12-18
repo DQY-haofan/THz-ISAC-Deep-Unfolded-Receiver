@@ -83,7 +83,7 @@ class ExperimentConfig:
     # Evaluation
     snr_grid: List[float] = field(default_factory=lambda: list(np.arange(-5, 26, 2)))
     n_mc: int = 10
-    batch_size: int = 64
+    batch_size: int = 512
 
     # MC Randomness
     base_seed: int = 42
