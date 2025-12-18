@@ -1,12 +1,22 @@
 """
-gabv_net_model.py (Fixed Version)
+gabv_net_model.py (Fixed Version v2)
 
 Description:
     PyTorch Implementation of Geometry-Aware Bussgang-VAMP Network (GA-BV-Net).
 
-    Fixes:
-    - Removed incorrect 'unsqueeze' calls that caused dimensionality explosion (4D tensors).
-    - Ensures correct broadcasting for [B, 1] * [B, N] operations.
+    Fixes Applied:
+    - [v1] Removed incorrect 'unsqueeze' calls that caused dimensionality explosion (4D tensors).
+    - [v1] Ensures correct broadcasting for [B, 1] * [B, N] operations.
+    - [v2] CRITICAL FIX: SNR denormalization in forward() - converts normalized meta features
+           back to physical values before use in CG solver regularization.
+
+    Meta Feature Schema (FROZEN - must match train_gabv_net.py):
+        meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
+        meta[:, 1] = gamma_eff_db_norm = (10*log10(gamma_eff) - 10) / 20
+        meta[:, 2] = chi              (raw, range [0, 2/π])
+        meta[:, 3] = sigma_eta_norm   = sigma_eta / 0.1
+        meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
+        meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
 """
 
 import torch
@@ -34,6 +44,22 @@ class GABVConfig:
     share_weights: bool = True
     enable_geom_loss: bool = True
     block_size_fim: int = 32
+
+
+# --- Meta Feature Normalization Constants (FROZEN) ---
+# These MUST match the constants in train_gabv_net.py exactly!
+
+META_CONSTANTS = {
+    'snr_db_center': 15.0,
+    'snr_db_scale': 15.0,
+    'gamma_eff_db_center': 10.0,
+    'gamma_eff_db_scale': 20.0,
+    'sigma_eta_scale': 0.1,
+    'pn_linewidth_scale': 1e6,
+    'ibo_db_center': 3.0,
+    'ibo_db_scale': 3.0,
+}
+
 
 # --- 2. Sub-Modules ---
 
@@ -67,6 +93,7 @@ class PilotNavigator(nn.Module):
             g_grad = learned_brake
 
         return {"g_PN": g_PN, "g_NL": g_NL, "g_grad": g_grad}
+
 
 class PhysicsEncoder(nn.Module):
     def __init__(self, cfg: GABVConfig):
@@ -123,6 +150,7 @@ class PhysicsEncoder(nn.Module):
         fim_inv_diag = torch.ones_like(theta) * reg
         return fim_inv_diag, log_vol
 
+
 class RiemannianPNTracker(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
@@ -151,6 +179,7 @@ class RiemannianPNTracker(nn.Module):
 
         return eff_rotator
 
+
 class BussgangRefiner(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
@@ -172,6 +201,7 @@ class BussgangRefiner(nn.Module):
 
         return z_out, onsager
 
+
 class UnrolledCGSolver(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
@@ -185,14 +215,30 @@ class UnrolledCGSolver(nn.Module):
         return HnHx + lambda_reg * x
 
     def forward(self, rhs: torch.Tensor, x_init: torch.Tensor,
-                phys_enc: PhysicsEncoder, theta: torch.Tensor, snr: torch.Tensor) -> torch.Tensor:
+                phys_enc: PhysicsEncoder, theta: torch.Tensor, snr_linear: torch.Tensor) -> torch.Tensor:
+        """
+        CG Solver for (H^H H + λI) x = rhs
 
-        lambda_reg = 1.0 / (snr + 1e-6) # [B, 1]
+        Args:
+            rhs: Right-hand side [B, N]
+            x_init: Initial estimate [B, N]
+            phys_enc: Physics encoder module
+            theta: Target parameters [B, 3]
+            snr_linear: LINEAR SNR values [B, 1] (NOT normalized!)
+                       This should be 10^(snr_db/10), typically in range [0.1, 1000]
+
+        Returns:
+            x: Solution [B, N]
+        """
+        # Regularization: λ = 1/SNR (Tikhonov regularization)
+        # For SNR=15dB (linear ~31.6), λ ≈ 0.03
+        # For SNR=0dB (linear ~1), λ ≈ 1.0
+        lambda_reg = 1.0 / (snr_linear + 1e-6)  # [B, 1]
 
         x = x_init.clone()
         r = rhs - self.matvec(x, phys_enc, theta, lambda_reg)
         p = r.clone()
-        rsold = torch.sum(r.abs()**2, dim=1) # [B]
+        rsold = torch.sum(r.abs()**2, dim=1)  # [B]
 
         for _ in range(self.steps):
             Ap = self.matvec(p, phys_enc, theta, lambda_reg)
@@ -212,6 +258,7 @@ class UnrolledCGSolver(nn.Module):
 
         return x
 
+
 class FisherUpdater(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
@@ -224,6 +271,7 @@ class FisherUpdater(nn.Module):
         nat_grad = fim_inv * task_grad
         delta = self.lr * g_grad * nat_grad
         return theta - delta
+
 
 # --- 3. Top-Level Model ---
 
@@ -243,19 +291,59 @@ class GABVNet(nn.Module):
             raise NotImplementedError("Per-layer weights not yet implemented.")
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass of GA-BV-Net.
+
+        Args:
+            batch: Dictionary containing:
+                - 'y_q': Quantized received signal [B, N]
+                - 'meta': Normalized meta features [B, 6]
+                - 'theta_init': Initial target parameter estimate [B, 3]
+                - 'x_init' (optional): Initial signal estimate [B, N]
+
+        Returns:
+            Dictionary containing:
+                - 'x_hat': Estimated transmitted signal [B, N]
+                - 'theta_hat': Estimated target parameters [B, 3]
+                - 'phi_hat': Estimated phase noise [B, N]
+                - 'layers': Per-layer outputs
+                - 'geom_cache': Geometric information for loss computation
+        """
         y_q = batch['y_q']
         meta = batch['meta']
         theta = batch['theta_init']
 
-        # FIX: Convert normalized SNR back to linear scale
-        # meta[:, 0] is snr_db_norm = (snr_db - 15) / 15
-        # Need to denormalize: snr_db = snr_db_norm * 15 + 15
-        # Then convert to linear: snr_linear = 10^(snr_db/10)
-        snr_db_norm = meta[:, 0:1]
-        snr_db = snr_db_norm * 15.0 + 15.0  # Denormalize
-        snr = 10 ** (snr_db / 10.0)  # Convert to linear
+        # =====================================================================
+        # CRITICAL FIX (v2): Denormalize meta features to physical values
+        # =====================================================================
+        # Meta features are normalized in train_gabv_net.py as:
+        #   meta[:, 0] = snr_db_norm = (snr_db - 15) / 15
+        #   meta[:, 1] = gamma_eff_db_norm = (10*log10(gamma_eff) - 10) / 20
+        #
+        # We need to convert back to physical values for the CG solver:
+        #   snr_linear = 10^(snr_db / 10)
+        #
+        # Example:
+        #   snr_db = 15 dB → snr_db_norm = 0 → snr_linear = 31.6
+        #   snr_db = 0 dB  → snr_db_norm = -1 → snr_linear = 1.0
+        #   snr_db = 30 dB → snr_db_norm = 1 → snr_linear = 1000
+        # =====================================================================
 
-        gamma_eff = meta[:, 1:2]
+        # Step 1: Extract normalized values
+        snr_db_norm = meta[:, 0:1]       # Normalized SNR (dB)
+        gamma_eff_db_norm = meta[:, 1:2] # Normalized Gamma_eff (dB)
+
+        # Step 2: Denormalize to dB values
+        snr_db = snr_db_norm * META_CONSTANTS['snr_db_scale'] + META_CONSTANTS['snr_db_center']
+        gamma_eff_db = gamma_eff_db_norm * META_CONSTANTS['gamma_eff_db_scale'] + META_CONSTANTS['gamma_eff_db_center']
+
+        # Step 3: Convert dB to linear scale
+        snr_linear = 10.0 ** (snr_db / 10.0)           # For CG solver regularization
+        gamma_eff_linear = 10.0 ** (gamma_eff_db / 10.0)  # For FIM computation
+
+        # =====================================================================
+        # End of CRITICAL FIX
+        # =====================================================================
 
         if 'x_init' in batch:
             x_est = batch['x_init']
@@ -266,13 +354,13 @@ class GABVNet(nn.Module):
         geom_cache = {'log_vols': [], 'fim_invs': []}
 
         for k in range(self.cfg.n_layers):
-            # 1. Physics
-            fim_inv, log_vol = self.phys_enc.get_approx_fim_info(theta, gamma_eff)
+            # 1. Physics - use LINEAR gamma_eff for FIM
+            fim_inv, log_vol = self.phys_enc.get_approx_fim_info(theta, gamma_eff_linear)
             if self.cfg.enable_geom_loss:
                 geom_cache['log_vols'].append(log_vol)
                 geom_cache['fim_invs'].append(fim_inv)
 
-            # 2. Pilot
+            # 2. Pilot - uses normalized meta (network learns from normalized features)
             gates = self.pilot(meta, log_vol=log_vol)
 
             # 3. PN Tracking
@@ -283,9 +371,9 @@ class GABVNet(nn.Module):
             # 4. Refiner
             z_denoised, onsager = self.refiner(y_corr, gates['g_NL'])
 
-            # 5. Solver
+            # 5. Solver - use LINEAR snr for regularization
             rhs = self.phys_enc.adjoint_operator(z_denoised, theta)
-            x_est = self.solver(rhs, x_est, self.phys_enc, theta, snr)
+            x_est = self.solver(rhs, x_est, self.phys_enc, theta, snr_linear)
 
             # 6. Update
             theta_next = theta
@@ -306,6 +394,47 @@ class GABVNet(nn.Module):
             'geom_cache': geom_cache
         }
 
+
 def create_gabv_model(cfg: Optional[GABVConfig] = None) -> GABVNet:
-    if cfg is None: cfg = GABVConfig()
+    """Factory function to create GA-BV-Net model."""
+    if cfg is None:
+        cfg = GABVConfig()
     return GABVNet(cfg)
+
+
+# --- 4. Utility Functions ---
+
+def denormalize_meta(meta: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """
+    Utility function to denormalize meta features for debugging/logging.
+
+    Args:
+        meta: Normalized meta features [B, 6]
+
+    Returns:
+        Dictionary with denormalized physical values
+    """
+    snr_db_norm = meta[:, 0:1]
+    gamma_eff_db_norm = meta[:, 1:2]
+    chi = meta[:, 2:3]
+    sigma_eta_norm = meta[:, 3:4]
+    pn_linewidth_norm = meta[:, 4:5]
+    ibo_db_norm = meta[:, 5:6]
+
+    # Denormalize
+    snr_db = snr_db_norm * META_CONSTANTS['snr_db_scale'] + META_CONSTANTS['snr_db_center']
+    gamma_eff_db = gamma_eff_db_norm * META_CONSTANTS['gamma_eff_db_scale'] + META_CONSTANTS['gamma_eff_db_center']
+    sigma_eta = sigma_eta_norm * META_CONSTANTS['sigma_eta_scale']
+    pn_linewidth = 10.0 ** (pn_linewidth_norm * math.log10(META_CONSTANTS['pn_linewidth_scale'])) - 1.0
+    ibo_db = ibo_db_norm * META_CONSTANTS['ibo_db_scale'] + META_CONSTANTS['ibo_db_center']
+
+    return {
+        'snr_db': snr_db,
+        'snr_linear': 10.0 ** (snr_db / 10.0),
+        'gamma_eff_db': gamma_eff_db,
+        'gamma_eff_linear': 10.0 ** (gamma_eff_db / 10.0),
+        'chi': chi,
+        'sigma_eta': sigma_eta,
+        'pn_linewidth': pn_linewidth,
+        'ibo_db': ibo_db,
+    }
