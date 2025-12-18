@@ -343,8 +343,6 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
     except Exception as e:
         print(f"[Model] Failed to load: {e}")
         return None
-
-
 # =============================================================================
 # 6. Single Scenario Runner
 # =============================================================================
