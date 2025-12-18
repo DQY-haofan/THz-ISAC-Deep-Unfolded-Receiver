@@ -316,6 +316,93 @@ def run_baselines_on_batch(y_q_np: np.ndarray, h_diag_np: np.ndarray,
 
 
 # =============================================================================
+# 5.1 Phase Bias Calibration (NEW)
+# =============================================================================
+
+def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> float:
+    """
+    Auto-calibrate phase_bias after loading checkpoint.
+
+    The optimal phase_bias depends on the trained RNN weights,
+    so we search for the best value using a quick grid search.
+
+    Args:
+        model: Loaded GA-BV-Net model
+        device: Device string
+        verbose: Print progress
+
+    Returns:
+        best_bias_deg: Optimal phase bias in degrees
+    """
+    if verbose:
+        print("\n[Calibration] Searching optimal phase_bias...")
+
+    # Setup test scenario (S3_pn_only at SNR=20dB)
+    sim_cfg = SimConfig()
+    sim_cfg.snr_db = 20.0
+    sim_cfg.enable_pa = False
+    sim_cfg.enable_pn = True
+    sim_cfg.pn_linewidth = 100e3
+    sim_cfg.enable_quantization = True
+
+    data = simulate_batch(sim_cfg, batch_size=64, seed=42)
+    meta_t = construct_meta_features(data['meta'], 64).to(device)
+    x_true_np = data['x_true']
+
+    batch = {
+        'y_q': torch.from_numpy(data['y_q']).cfloat().to(device),
+        'theta_init': torch.from_numpy(data['theta_true']).float().to(device),
+        'meta': meta_t
+    }
+
+    # Save original value
+    original_bias = model.pn_tracker.phase_bias.item()
+
+    # Grid search
+    best_bias_deg = 0
+    best_ber = 1.0
+
+    for bias_deg in range(-180, 181, 15):  # 15° steps
+        model.pn_tracker.phase_bias.data = torch.tensor(
+            np.radians(bias_deg), device=device
+        )
+
+        with torch.no_grad():
+            outputs = model(batch)
+
+        ber = compute_ber_qpsk_bitwise(outputs['x_hat'].cpu().numpy(), x_true_np)
+
+        if ber < best_ber:
+            best_ber = ber
+            best_bias_deg = bias_deg
+
+    # Fine search around best value
+    for bias_deg in range(best_bias_deg - 15, best_bias_deg + 16, 5):
+        model.pn_tracker.phase_bias.data = torch.tensor(
+            np.radians(bias_deg), device=device
+        )
+
+        with torch.no_grad():
+            outputs = model(batch)
+
+        ber = compute_ber_qpsk_bitwise(outputs['x_hat'].cpu().numpy(), x_true_np)
+
+        if ber < best_ber:
+            best_ber = ber
+            best_bias_deg = bias_deg
+
+    # Apply best value
+    model.pn_tracker.phase_bias.data = torch.tensor(
+        np.radians(best_bias_deg), device=device
+    )
+
+    if verbose:
+        print(f"[Calibration] Original: {np.degrees(original_bias):.1f}°")
+        print(f"[Calibration] Optimal:  {best_bias_deg}° (BER={best_ber:.4f})")
+
+    return best_bias_deg
+
+# =============================================================================
 # 5. Model Loading
 # =============================================================================
 
@@ -331,7 +418,7 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
         # [FIX 6] Check fs in checkpoint
         saved_fs = checkpoint['config'].get('fs', None)
         if saved_fs and abs(saved_fs - cfg.fs) > 1e6:
-            print(f"  ⚠️  WARNING: Checkpoint fs={saved_fs/1e9:.1f}GHz != config fs={cfg.fs/1e9:.1f}GHz")
+            print(f"  ⚠️  WARNING: Checkpoint fs={saved_fs / 1e9:.1f}GHz != config fs={cfg.fs / 1e9:.1f}GHz")
 
         model = GABVNet(cfg)
         model.load_state_dict(checkpoint['model_state'])
@@ -339,6 +426,10 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
         model.eval()
         print(f"[Model] Loaded from: {ckpt_path}")
         print(f"[Model] Version: {checkpoint.get('version', 'unknown')}")
+
+        # [NEW] Auto-calibrate phase_bias
+        calibrate_phase_bias(model, device, verbose=True)
+
         return model
     except Exception as e:
         print(f"[Model] Failed to load: {e}")
