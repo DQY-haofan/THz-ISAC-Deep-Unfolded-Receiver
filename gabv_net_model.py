@@ -60,7 +60,7 @@ class GABVConfig:
     block_size_fim: int = 32
 
     # [FIX 4] Enable theta update
-    enable_theta_update: bool = True
+    enable_theta_update: bool = False
     theta_update_start_layer: int = 1  # Start updating from layer 1
 
 
