@@ -219,12 +219,13 @@ class PhysicsEncoder(nn.Module):
 
 class RiemannianPNTracker(nn.Module):
     """
-    [FIX 5] Improved Phase Noise Tracker with explicit (cos, sin) output
+    [FIX 5 + FIX 12] Improved Phase Noise Tracker
 
-    Changes:
-    - Output explicit (cos, sin) instead of angle for stability
-    - Can work without x_est in early layers
-    - Proper normalization to unit circle
+    FIX 5: Explicit (cos, sin) output with normalization
+    FIX 12: Learnable phase bias correction for initial phase ambiguity
+
+    The PN Tracker can track phase CHANGES but cannot determine absolute phase.
+    This causes a fixed ~45° bias. We add a learnable bias to correct this.
     """
 
     def __init__(self, cfg: GABVConfig):
@@ -243,6 +244,10 @@ class RiemannianPNTracker(nn.Module):
             nn.ReLU(),
             nn.Linear(cfg.hidden_dim_pn // 2, 2)  # (cos, sin)
         )
+
+        # [FIX 12] Learnable phase bias correction
+        # Initialize to ~45° (0.785 rad) based on empirical observation
+        self.phase_bias = nn.Parameter(torch.tensor(0.785))
 
     def forward(self, y_q: torch.Tensor, g_PN: torch.Tensor,
                 x_est: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -275,24 +280,25 @@ class RiemannianPNTracker(nn.Module):
         sin_phi = cos_sin[..., 1]
 
         # Normalize to unit circle
-        mag = torch.sqrt(cos_phi**2 + sin_phi**2 + 1e-8)
+        mag = torch.sqrt(cos_phi ** 2 + sin_phi ** 2 + 1e-8)
         cos_phi = cos_phi / mag
         sin_phi = sin_phi / mag
 
         # De-rotation factor: exp(-jφ) = cos(φ) - j*sin(φ)
         derotator = torch.complex(cos_phi, -sin_phi)  # [B, N]
 
+        # [FIX 12] Apply learnable phase bias correction
+        # This corrects the ~45° initial phase ambiguity
+        bias_correction = torch.exp(torch.tensor(1j, device=derotator.device) * self.phase_bias)
+        derotator = derotator * bias_correction
+
         # Apply gate: g_PN=0 means no de-rotation
         # [FIX 8] CRITICAL: Must normalize after linear interpolation!
-        # Linear interpolation of complex numbers doesn't preserve unit magnitude:
-        #   (1-g)*1 + g*exp(jφ) has magnitude ≠ 1 in general
-        # This was causing BER ≈ 0.5 because signal amplitude was corrupted!
         eff_derotator = (1 - g_PN) * torch.ones_like(derotator) + g_PN * derotator
         eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)  # Normalize!
 
         return eff_derotator
-
-
+    
 class BussgangRefiner(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
