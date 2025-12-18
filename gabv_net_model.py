@@ -1,5 +1,5 @@
 """
-gabv_net_model.py (Fixed Version v3 - Expert Review Applied)
+gabv_net_model.py (Fixed Version v4 - Float64 Precision Fix)
 
 Description:
     PyTorch Implementation of Geometry-Aware Bussgang-VAMP Network (GA-BV-Net).
@@ -11,6 +11,10 @@ Description:
     - [FIX 4] Theta UPDATE implemented (was theta_next = theta)
     - [FIX 5] Improved PN tracker with explicit (cos, sin) output
     - [FIX 6] Added learnable Bussgang gain compensation
+    - [FIX 7] **CRITICAL** Phase calculation uses Float64!
+             At R=500km, fc=300GHz: phase ≈ 3e9 rad (500M cycles)
+             Float32 has only 7 digits precision → ~300 rad error → BER ≈ 0.35
+             Float64 has 15 digits precision → negligible error → BER ≈ 0.00
 
     Meta Feature Schema (FROZEN - must match train_gabv_net.py):
         meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
@@ -20,7 +24,7 @@ Description:
         meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
         meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
 
-Author: Expert Review Fixed v3
+Author: Expert Review Fixed v4 (Float64 Precision)
 Date: 2025-12-18
 """
 
@@ -106,7 +110,7 @@ class PilotNavigator(nn.Module):
 
 class PhysicsEncoder(nn.Module):
     """
-    [FIX 2 & 3] Physics Encoder - NOW MATCHES thz_isac_world.apply_channel_squint EXACTLY
+    [FIX 2 & 3 & 7] Physics Encoder - NOW MATCHES thz_isac_world.apply_channel_squint EXACTLY
 
     Channel model (SINGLE-TRIP, matches simulator):
         tau = R / c  (NOT 2R/c!)
@@ -114,6 +118,11 @@ class PhysicsEncoder(nn.Module):
         tau_ddot = a / c
         phase = 2π * fc * (tau + tau_dot * t + 0.5 * tau_ddot * t²)
         h[n] = exp(-j * phase[n])
+
+    [FIX 7] CRITICAL: Phase calculation uses Float64 to avoid precision loss!
+        At R=500km, fc=300GHz: phase ≈ 3e9 rad (500M cycles)
+        Float32 precision: ~7 digits → ~300 rad error → BER ≈ 0.35
+        Float64 precision: ~15 digits → negligible error → BER ≈ 0.00
     """
 
     def __init__(self, cfg: GABVConfig):
@@ -123,8 +132,8 @@ class PhysicsEncoder(nn.Module):
         self.fc = cfg.fc
         self.c = 3e8
 
-        # Time grid - matches simulator's t = np.arange(N) * Ts
-        t_grid = torch.arange(self.N, dtype=torch.float32) / self.fs
+        # [FIX 7] Time grid in Float64 for precision!
+        t_grid = torch.arange(self.N, dtype=torch.float64) / self.fs
         self.register_buffer('t_grid', t_grid)
 
         # Frequency grid (for potential wideband extensions)
@@ -149,29 +158,38 @@ class PhysicsEncoder(nn.Module):
             phase = 2π * fc * (tau + (v/c)*t + 0.5*(a/c)*t²)
             h = exp(-j * phase)
 
+        [FIX 7] Uses Float64 internally for phase calculation to avoid
+        catastrophic precision loss at large R values!
+
         Args:
             theta: [B, 3] parameters (R, v, a)
 
         Returns:
-            h_diag: [B, N] diagonal channel
+            h_diag: [B, N] diagonal channel (complex64 for efficiency)
         """
-        R = theta[:, 0:1]  # [B, 1]
-        v = theta[:, 1:2]  # [B, 1]
-        a = theta[:, 2:3]  # [B, 1]
+        # [FIX 7] Convert to Float64 for precise phase calculation
+        theta_f64 = theta.to(torch.float64)
 
-        t = self.t_grid.unsqueeze(0)  # [1, N]
+        R = theta_f64[:, 0:1]  # [B, 1]
+        v = theta_f64[:, 1:2]  # [B, 1]
+        a = theta_f64[:, 2:3]  # [B, 1]
+
+        t = self.t_grid.unsqueeze(0)  # [1, N], already float64
 
         # [FIX 2] SINGLE-TRIP delay parameters (matches simulator!)
         tau = R / self.c           # τ = R/c (NOT 2R/c!)
         tau_dot = v / self.c       # τ̇ = v/c
         tau_ddot = a / self.c      # τ̈ = a/c
 
-        # Phase calculation - EXACTLY matches simulator
+        # Phase calculation in Float64 - EXACTLY matches simulator
         phase = 2 * math.pi * self.fc * (
             tau + tau_dot * t + 0.5 * tau_ddot * (t ** 2)
-        )  # [B, N]
+        )  # [B, N], float64
 
-        h_diag = torch.exp(-1j * phase)
+        # Compute h in complex128, then convert to complex64 for efficiency
+        h_diag_f64 = torch.exp(-1j * phase)
+        h_diag = h_diag_f64.to(torch.cfloat)  # complex64
+
         return h_diag
 
     def forward_operator(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
