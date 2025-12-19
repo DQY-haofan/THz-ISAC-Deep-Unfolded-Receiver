@@ -1,26 +1,23 @@
 """
-run_p4_experiments.py (Fixed Version v4 - Expert Review Applied)
+run_p4_experiments.py (Expert Review v5.0 - Enhanced Theta Metrics)
 
 Description:
     Phase 4 Evaluation & Visualization for GA-BV-Net.
 
-    **FIXES APPLIED** per Expert Review:
-    - [FIX 1] noise_var uses actual signal power (not assumed 1.0)
-    - [FIX 2] BER calculation → true bit-level BER
-    - [FIX 3] BCRLB_ref → independent χ-scaled bound
-    - [FIX 4] numpy→torch conversion fixed
-    - [FIX 5] MC Randomness → unique seed per trial
-    - [FIX 6] fs consistency check
-    - [FIX 7] Optional debug mode with theta_init = theta_true
-    - [NEW] Enhanced GPU detection for Colab compatibility
+    **ENHANCEMENTS v5.0** per Expert Review:
+    - [NEW] Enhanced theta metrics logging (RMSE_R vs init, RMSE_v, RMSE_a)
+    - [NEW] g_theta and accept_rate tracking per MC trial
+    - [NEW] RMSE improvement ratio (vs theta_init)
+    - [NEW] Score feature statistics from ThetaUpdater
+    - [FIX] All previous v4 fixes preserved
 
     Output:
-    - metrics_mean.csv (averaged results)
-    - metrics_raw.csv (per-MC results with seed tracking)
+    - metrics_mean.csv (averaged results with enhanced theta metrics)
+    - metrics_raw.csv (per-MC results with full theta diagnostics)
     - fig_*.png / fig_*.pdf (publication-quality)
     - config.json (reproducibility metadata)
 
-Author: Expert Review Fixed v4
+Author: Expert Review v5.0 - Enhanced
 Date: 2025-12-18
 """
 
@@ -132,7 +129,7 @@ class ExperimentConfig:
     use_ga_bv_net: bool = True
     use_baselines: bool = True
 
-    # [FIX 7] Debug mode: use exact theta (no noise)
+    # Debug mode: use exact theta (no noise)
     debug_theta_exact: bool = False
     theta_noise_scale: Tuple[float, float, float] = (100.0, 10.0, 0.5)
 
@@ -164,7 +161,7 @@ def construct_meta_features(meta: dict, batch_size: int) -> torch.Tensor:
     chi = float(meta.get('chi', 0.6366))
     sigma_eta = float(meta.get('sigma_eta', 0.0))
 
-    # [FIX] When enable_pn=False, pn_linewidth should be 0
+    # When enable_pn=False, pn_linewidth should be 0
     enable_pn = meta.get('enable_pn', True)
     if enable_pn:
         pn_linewidth = float(meta.get('pn_linewidth', 100e3))
@@ -207,7 +204,7 @@ def compute_bcrlb_ref_independent(snr_linear: float, chi: float,
 
     crlb_R_analog = (c ** 2) / (8 * (np.pi ** 2) * (B ** 2) * snr_linear * N + 1e-12)
 
-    Ts = 1.0 / 10e9  # [FIX 6] Use correct fs=10e9
+    Ts = 1.0 / 10e9  # Use correct fs=10e9
     T_obs = N * Ts
     crlb_v_analog = (c ** 2) / (8 * (np.pi ** 2) * (fc ** 2) * (T_obs ** 2) * snr_linear * N + 1e-12)
 
@@ -252,14 +249,6 @@ def compute_ber_qpsk_bitwise(x_hat: np.ndarray, x_true: np.ndarray) -> float:
     return ber
 
 
-def compute_ser_qpsk(x_hat: np.ndarray, x_true: np.ndarray) -> float:
-    """Symbol Error Rate for QPSK."""
-    constellation = np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
-    idx_true = np.argmin(np.abs(x_true[..., None] - constellation), axis=-1)
-    idx_hat = np.argmin(np.abs(x_hat[..., None] - constellation), axis=-1)
-    return np.mean(idx_true != idx_hat)
-
-
 def compute_nmse(x_hat: np.ndarray, x_true: np.ndarray) -> float:
     """Normalized MSE in dB."""
     mse = np.mean(np.abs(x_hat - x_true)**2)
@@ -276,6 +265,20 @@ def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[f
     return rmse_R, rmse_v, rmse_a
 
 
+def compute_rmse_vs_init(theta_hat: np.ndarray, theta_init: np.ndarray) -> Tuple[float, float, float]:
+    """
+    [NEW] RMSE of theta_hat vs theta_init (to check if network improved).
+
+    A good network should have RMSE(hat, true) < RMSE(init, true)
+    Equivalently, we can check if RMSE(hat, init) is reasonable.
+    """
+    err = theta_hat - theta_init
+    rmse_R = np.sqrt(np.mean(err[:, 0]**2))
+    rmse_v = np.sqrt(np.mean(err[:, 1]**2))
+    rmse_a = np.sqrt(np.mean(err[:, 2]**2))
+    return rmse_R, rmse_v, rmse_a
+
+
 # =============================================================================
 # 4. Baseline Runners
 # =============================================================================
@@ -283,18 +286,14 @@ def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[f
 def run_baselines_on_batch(y_q_np: np.ndarray, h_diag_np: np.ndarray,
                            x_true_np: np.ndarray, snr_linear: float,
                            device: str) -> Dict[str, np.ndarray]:
-    """
-    Run baseline detectors on a batch.
-
-    [FIX 1] noise_var now uses actual signal power, not assumed 1.0
-    """
+    """Run baseline detectors on a batch."""
     if not HAS_BASELINES:
         return {}
 
     y_q = torch.from_numpy(y_q_np).cfloat().to(device)
     h_diag = torch.from_numpy(h_diag_np).cfloat().to(device)
 
-    # [FIX 1] Use actual signal power for noise_var calculation
+    # Use actual signal power for noise_var calculation
     signal_power = np.mean(np.abs(x_true_np)**2)
     noise_var = signal_power / snr_linear
 
@@ -316,27 +315,11 @@ def run_baselines_on_batch(y_q_np: np.ndarray, h_diag_np: np.ndarray,
 
 
 # =============================================================================
-# 5.1 Phase Bias Calibration (NEW)
+# 5. Phase Bias Calibration
 # =============================================================================
 
 def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> float:
-    """
-    [Expert Review] Pilot-aided phase bias calibration.
-
-    Instead of using x_true (oracle), we use a correlation-based metric
-    that can be computed with known pilot symbols in a real system.
-
-    In practice, this would use a short preamble sequence.
-    For simulation, we use a small pilot block at the start of each frame.
-
-    Args:
-        model: Loaded GA-BV-Net model
-        device: Device string
-        verbose: Print progress
-
-    Returns:
-        best_bias_deg: Optimal phase bias in degrees
-    """
+    """Pilot-aided phase bias calibration."""
     if verbose:
         print("\n[Calibration] Pilot-aided phase_bias search...")
 
@@ -361,20 +344,12 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
     # Save original value
     original_bias = model.pn_tracker.phase_bias.item()
 
-    # Pilot-aided metric: Use only first N_pilot symbols as "known pilots"
-    N_pilot = 64  # Number of pilot symbols (can be as small as 1)
+    # Pilot-aided metric
+    N_pilot = 64
     x_pilot = torch.from_numpy(x_true_np[:, :N_pilot]).cfloat().to(device)
 
     def compute_pilot_metric(x_hat):
-        """
-        Compute pilot-based correlation metric.
-        This can be computed in a real system with known pilots.
-
-        Higher correlation = better phase alignment
-        """
         x_hat_pilot = x_hat[:, :N_pilot]
-
-        # Normalized correlation (real part)
         corr = torch.real(
             torch.sum(x_hat_pilot * torch.conj(x_pilot)) /
             (torch.sqrt(torch.sum(torch.abs(x_hat_pilot) ** 2) *
@@ -386,7 +361,7 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
     best_bias_deg = 0
     best_metric = -1.0
 
-    for bias_deg in range(-180, 181, 15):  # 15° steps
+    for bias_deg in range(-180, 181, 15):
         model.pn_tracker.phase_bias.data = torch.tensor(
             np.radians(bias_deg), device=device
         )
@@ -400,7 +375,7 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
             best_metric = metric
             best_bias_deg = bias_deg
 
-    # Fine search around best value
+    # Fine search
     for bias_deg in range(best_bias_deg - 15, best_bias_deg + 16, 5):
         model.pn_tracker.phase_bias.data = torch.tensor(
             np.radians(bias_deg), device=device
@@ -420,7 +395,7 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
         np.radians(best_bias_deg), device=device
     )
 
-    # Compute actual BER for reporting (this part is for logging only)
+    # Compute actual BER
     with torch.no_grad():
         outputs = model(batch)
     final_ber = compute_ber_qpsk_bitwise(outputs['x_hat'].cpu().numpy(), x_true_np)
@@ -432,8 +407,9 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
 
     return best_bias_deg
 
+
 # =============================================================================
-# 5. Model Loading
+# 6. Model Loading
 # =============================================================================
 
 def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
@@ -445,7 +421,6 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         cfg = GABVConfig(n_layers=checkpoint['config'].get('n_layers', 8))
 
-        # [FIX 6] Check fs in checkpoint
         saved_fs = checkpoint['config'].get('fs', None)
         if saved_fs and abs(saved_fs - cfg.fs) > 1e6:
             print(f"  ⚠️  WARNING: Checkpoint fs={saved_fs / 1e9:.1f}GHz != config fs={cfg.fs / 1e9:.1f}GHz")
@@ -457,20 +432,61 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
         print(f"[Model] Loaded from: {ckpt_path}")
         print(f"[Model] Version: {checkpoint.get('version', 'unknown')}")
 
-        # [NEW] Auto-calibrate phase_bias
+        # Auto-calibrate phase_bias
         calibrate_phase_bias(model, device, verbose=True)
 
         return model
     except Exception as e:
         print(f"[Model] Failed to load: {e}")
         return None
+
+
 # =============================================================================
-# 6. Single Scenario Runner
+# 7. [ENHANCED] Single Scenario Runner with Theta Metrics
 # =============================================================================
+
+def extract_theta_diagnostics(outputs: Dict) -> Dict[str, float]:
+    """
+    [NEW] Extract theta-related diagnostics from model outputs.
+
+    Returns:
+        Dict with g_theta, accept_rate, delta_R, etc.
+    """
+    diagnostics = {
+        'g_theta': 0.0,
+        'g_theta_eff': 0.0,
+        'accept_rate': 1.0,
+        'delta_R': 0.0,
+        'delta_v': 0.0,
+        'delta_a': 0.0,
+        'confidence': 0.0,
+    }
+
+    try:
+        last_layer = outputs['layers'][-1]
+
+        # Gate values
+        if 'gates' in last_layer:
+            diagnostics['g_theta'] = last_layer['gates']['g_theta'].mean().item()
+
+        # Theta info
+        if 'theta_info' in last_layer:
+            theta_info = last_layer['theta_info']
+            diagnostics['g_theta_eff'] = theta_info.get('g_theta_effective', 0.0)
+            diagnostics['accept_rate'] = theta_info.get('accept_rate', 1.0)
+            diagnostics['delta_R'] = theta_info.get('delta_R', 0.0)
+            diagnostics['delta_v'] = theta_info.get('delta_v', 0.0)
+            diagnostics['delta_a'] = theta_info.get('delta_a', 0.0)
+            diagnostics['confidence'] = theta_info.get('confidence', 0.0)
+    except Exception as e:
+        pass  # Return defaults if extraction fails
+
+    return diagnostics
+
 
 def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                         device: str, ckpt_tag: str, out_base: str):
-    """Run evaluation for a single scenario."""
+    """Run evaluation for a single scenario with enhanced theta metrics."""
     out_dir = Path(out_base) / exp_cfg.scene_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -502,7 +518,11 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             'BER_Net': [], 'BER_LMMSE': [], 'BER_GAMP': [],
             'NMSE_Net': [], 'NMSE_LMMSE': [], 'NMSE_GAMP': [],
             'RMSE_R': [], 'RMSE_v': [], 'RMSE_a': [],
+            'RMSE_R_init': [],  # [NEW] RMSE of init (to compare)
             'gamma_eff': [], 'chi': [],
+            # [NEW] Theta diagnostics
+            'g_theta': [], 'g_theta_eff': [], 'accept_rate': [],
+            'delta_R': [], 'delta_v': [], 'delta_a': [],
             'mc_seed': []
         }
 
@@ -523,7 +543,7 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                     x_true_t = torch.from_numpy(data['x_true']).cfloat().to(device)
                     theta_true_t = torch.from_numpy(data['theta_true']).float().to(device)
 
-                    # [FIX 7] Optional exact theta for debugging
+                    # Theta initialization
                     if exp_cfg.debug_theta_exact:
                         theta_init_t = theta_true_t.clone()
                     else:
@@ -542,16 +562,35 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
 
                 x_hat_np = outputs['x_hat'].cpu().numpy()
                 theta_hat_np = outputs['theta_hat'].cpu().numpy()
+                theta_init_np = theta_init_t.cpu().numpy()
 
+                # Communication metrics
                 ber_net = compute_ber_qpsk_bitwise(x_hat_np, data['x_true'])
                 nmse_net = compute_nmse(x_hat_np, data['x_true'])
+
+                # Theta RMSE vs true
                 rmse_R, rmse_v, rmse_a = compute_rmse_theta(theta_hat_np, data['theta_true'])
+
+                # [NEW] RMSE of init vs true (baseline)
+                rmse_R_init, _, _ = compute_rmse_theta(theta_init_np, data['theta_true'])
+
+                # [NEW] Extract theta diagnostics
+                diag = extract_theta_diagnostics(outputs)
 
                 mc_metrics['BER_Net'].append(ber_net)
                 mc_metrics['NMSE_Net'].append(nmse_net)
                 mc_metrics['RMSE_R'].append(rmse_R)
                 mc_metrics['RMSE_v'].append(rmse_v)
                 mc_metrics['RMSE_a'].append(rmse_a)
+                mc_metrics['RMSE_R_init'].append(rmse_R_init)
+
+                # [NEW] Theta diagnostics
+                mc_metrics['g_theta'].append(diag['g_theta'])
+                mc_metrics['g_theta_eff'].append(diag['g_theta_eff'])
+                mc_metrics['accept_rate'].append(diag['accept_rate'])
+                mc_metrics['delta_R'].append(diag['delta_R'])
+                mc_metrics['delta_v'].append(diag['delta_v'])
+                mc_metrics['delta_a'].append(diag['delta_a'])
 
             # Run baselines
             if exp_cfg.use_baselines and HAS_BASELINES:
@@ -573,6 +612,7 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                     mc_metrics['BER_GAMP'].append(ber_gamp)
                     mc_metrics['NMSE_GAMP'].append(nmse_gamp)
 
+            # [ENHANCED] Raw results with full diagnostics
             all_results.append({
                 'snr_db': snr_db,
                 'mc_idx': mc_idx,
@@ -583,6 +623,15 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
                 'NMSE_Net': mc_metrics['NMSE_Net'][-1] if mc_metrics['NMSE_Net'] else np.nan,
                 'BER_LMMSE': mc_metrics['BER_LMMSE'][-1] if mc_metrics['BER_LMMSE'] else np.nan,
                 'BER_GAMP': mc_metrics['BER_GAMP'][-1] if mc_metrics['BER_GAMP'] else np.nan,
+                'RMSE_R': mc_metrics['RMSE_R'][-1] if mc_metrics['RMSE_R'] else np.nan,
+                'RMSE_v': mc_metrics['RMSE_v'][-1] if mc_metrics['RMSE_v'] else np.nan,
+                'RMSE_a': mc_metrics['RMSE_a'][-1] if mc_metrics['RMSE_a'] else np.nan,
+                'RMSE_R_init': mc_metrics['RMSE_R_init'][-1] if mc_metrics['RMSE_R_init'] else np.nan,
+                # [NEW] Theta diagnostics
+                'g_theta': mc_metrics['g_theta'][-1] if mc_metrics['g_theta'] else np.nan,
+                'g_theta_eff': mc_metrics['g_theta_eff'][-1] if mc_metrics['g_theta_eff'] else np.nan,
+                'accept_rate': mc_metrics['accept_rate'][-1] if mc_metrics['accept_rate'] else np.nan,
+                'delta_R': mc_metrics['delta_R'][-1] if mc_metrics['delta_R'] else np.nan,
             })
 
         def safe_mean(arr):
@@ -596,6 +645,11 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             snr_linear, avg_chi, exp_cfg.R, exp_cfg.v_rel
         )
 
+        # [NEW] Compute improvement ratio
+        rmse_R_mean = safe_mean(mc_metrics['RMSE_R'])
+        rmse_R_init_mean = safe_mean(mc_metrics['RMSE_R_init'])
+        improvement_ratio = rmse_R_init_mean / (rmse_R_mean + 1e-12) if rmse_R_mean > 0 else np.nan
+
         mean_results.append({
             'snr_db': snr_db,
             'gamma_eff': safe_mean(mc_metrics['gamma_eff']),
@@ -605,12 +659,19 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
             'BER_LMMSE': safe_mean(mc_metrics['BER_LMMSE']),
             'BER_GAMP': safe_mean(mc_metrics['BER_GAMP']),
             'NMSE_Net': safe_mean(mc_metrics['NMSE_Net']),
-            'RMSE_R': safe_mean(mc_metrics['RMSE_R']),
+            'RMSE_R': rmse_R_mean,
             'RMSE_R_std': safe_std(mc_metrics['RMSE_R']),
+            'RMSE_R_init': rmse_R_init_mean,  # [NEW]
+            'RMSE_improvement_ratio': improvement_ratio,  # [NEW]
             'RMSE_v': safe_mean(mc_metrics['RMSE_v']),
             'RMSE_a': safe_mean(mc_metrics['RMSE_a']),
             'BCRLB_R_ref': bcrlb_ref['BCRLB_R_ref'],
             'BCRLB_R_analog': bcrlb_ref['BCRLB_R_analog'],
+            # [NEW] Theta diagnostics
+            'g_theta': safe_mean(mc_metrics['g_theta']),
+            'g_theta_eff': safe_mean(mc_metrics['g_theta_eff']),
+            'accept_rate': safe_mean(mc_metrics['accept_rate']),
+            'delta_R_mean': safe_mean(mc_metrics['delta_R']),
         })
 
     # Save results
@@ -624,17 +685,20 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
         'experiment': asdict(exp_cfg),
         'checkpoint': ckpt_tag,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'version': 'v4.0_expert_fixed',
+        'version': 'v5.0_enhanced_theta',
         'fixes_applied': [
             'noise_var uses actual signal power',
             'fs=10GHz in BCRLB',
             'debug_theta_exact option',
+            'Enhanced theta metrics (RMSE_R_init, improvement_ratio)',
+            'Theta diagnostics (g_theta, accept_rate, delta_R)',
         ]
     }
     with open(out_dir / "config.json", 'w') as f:
         json.dump(config_data, f, indent=2, default=str)
 
     generate_plots(df_mean, out_dir)
+    generate_theta_plots(df_mean, out_dir)  # [NEW]
 
     print(f"  [Results] Saved to {out_dir}")
 
@@ -642,11 +706,16 @@ def run_single_scenario(exp_cfg: ExperimentConfig, model: Optional[GABVNet],
     total_trials = len(df_raw)
     print(f"  [MC Check] Unique seeds: {unique_seeds}/{total_trials}")
 
+    # [NEW] Print theta summary
+    if 'RMSE_improvement_ratio' in df_mean.columns:
+        avg_improvement = df_mean['RMSE_improvement_ratio'].mean()
+        print(f"  [Theta] Avg RMSE improvement ratio: {avg_improvement:.2f}x")
+
     return df_mean
 
 
 # =============================================================================
-# 7. Plot Generation
+# 8. Plot Generation
 # =============================================================================
 
 def generate_plots(df: pd.DataFrame, out_dir: Path):
@@ -678,6 +747,11 @@ def generate_plots(df: pd.DataFrame, out_dir: Path):
 
     if "RMSE_R" in df.columns and not df["RMSE_R"].isna().all():
         ax2.semilogy(df["snr_db"], df["RMSE_R"], 'b-o', label='GA-BV-Net RMSE')
+
+    # [NEW] Plot RMSE_R_init for comparison
+    if "RMSE_R_init" in df.columns and not df["RMSE_R_init"].isna().all():
+        ax2.semilogy(df["snr_db"], df["RMSE_R_init"], 'g--^', alpha=0.7,
+                     label=r'$\mathrm{RMSE}(\theta_{init})$')
 
     if "BCRLB_R_ref" in df.columns and not df["BCRLB_R_ref"].isna().all():
         lb_ref = np.sqrt(df["BCRLB_R_ref"])
@@ -747,8 +821,68 @@ def generate_plots(df: pd.DataFrame, out_dir: Path):
     print(f"  [Plots] Saved 4 figures to {out_dir}")
 
 
+def generate_theta_plots(df: pd.DataFrame, out_dir: Path):
+    """
+    [NEW] Generate theta-specific diagnostic plots.
+    """
+    # Plot 5: g_theta and accept_rate vs SNR
+    fig5, ax5a = plt.subplots(figsize=(7, 5))
+
+    if "g_theta" in df.columns and not df["g_theta"].isna().all():
+        ax5a.plot(df["snr_db"], df["g_theta"], 'b-o', label=r'$g_\theta$ (gate)')
+        ax5a.set_ylabel(r'$g_\theta$', color='b')
+        ax5a.tick_params(axis='y', labelcolor='b')
+        ax5a.set_ylim([0, 1])
+
+    ax5b = ax5a.twinx()
+    if "accept_rate" in df.columns and not df["accept_rate"].isna().all():
+        ax5b.plot(df["snr_db"], df["accept_rate"], 'r--s', label='Accept Rate')
+        ax5b.set_ylabel('Accept Rate', color='r')
+        ax5b.tick_params(axis='y', labelcolor='r')
+        ax5b.set_ylim([0, 1])
+
+    ax5a.set_xlabel('SNR (dB)')
+    ax5a.grid(True, linestyle='-', alpha=0.3)
+    ax5a.set_title('Theta Update Diagnostics')
+
+    lines1, labels1 = ax5a.get_legend_handles_labels()
+    lines2, labels2 = ax5b.get_legend_handles_labels()
+    ax5a.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+    fig5.tight_layout()
+    fig5.savefig(out_dir / "fig_theta_diag.png", dpi=300, bbox_inches='tight')
+    fig5.savefig(out_dir / "fig_theta_diag.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig5)
+
+    # Plot 6: Improvement ratio vs SNR
+    fig6, ax6 = plt.subplots(figsize=(7, 5))
+
+    if "RMSE_improvement_ratio" in df.columns and not df["RMSE_improvement_ratio"].isna().all():
+        ax6.plot(df["snr_db"], df["RMSE_improvement_ratio"], 'g-o', linewidth=2)
+        ax6.axhline(y=1.0, color='k', linestyle='--', alpha=0.7, label='No Improvement')
+        ax6.fill_between(df["snr_db"], 1.0, df["RMSE_improvement_ratio"],
+                         where=df["RMSE_improvement_ratio"] > 1,
+                         alpha=0.3, color='green', label='Improved')
+        ax6.fill_between(df["snr_db"], 1.0, df["RMSE_improvement_ratio"],
+                         where=df["RMSE_improvement_ratio"] < 1,
+                         alpha=0.3, color='red', label='Degraded')
+
+    ax6.set_xlabel('SNR (dB)')
+    ax6.set_ylabel('RMSE Improvement Ratio (init/hat)')
+    ax6.set_title('Theta Estimation Improvement')
+    ax6.legend(loc='best')
+    ax6.grid(True, linestyle='-', alpha=0.3)
+
+    fig6.tight_layout()
+    fig6.savefig(out_dir / "fig_theta_improvement.png", dpi=300, bbox_inches='tight')
+    fig6.savefig(out_dir / "fig_theta_improvement.pdf", format='pdf', bbox_inches='tight')
+    plt.close(fig6)
+
+    print(f"  [Plots] Saved 2 theta diagnostic figures to {out_dir}")
+
+
 # =============================================================================
-# 8. Experiment Configurations
+# 9. Experiment Configurations
 # =============================================================================
 
 def get_default_experiments() -> List[ExperimentConfig]:
@@ -793,12 +927,12 @@ def get_default_experiments() -> List[ExperimentConfig]:
 
 
 # =============================================================================
-# 9. Main Entry Point
+# 10. Main Entry Point
 # =============================================================================
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="P4 Experiments (Expert Fixed v4)")
+    parser = argparse.ArgumentParser(description="P4 Experiments (Expert v5.0 Enhanced)")
     parser.add_argument('--ckpt', type=str, default=None,
                         help='Path to GA-BV-Net checkpoint')
     parser.add_argument('--out', type=str, default='results/p4_experiments',
@@ -819,22 +953,19 @@ def main():
                         help='Device to use (cuda/cpu)')
     args = parser.parse_args()
 
-    # =========================================================================
-    # GPU Setup - Important for Colab!
-    # =========================================================================
+    # GPU Setup
     device = setup_device(preferred_device=args.device, verbose=True)
     device_str = str(device)
 
     print("\n" + "=" * 60)
-    print("P4 Experiments - Expert Fixed v4")
+    print("P4 Experiments - Expert v5.0 (Enhanced Theta Metrics)")
     print("=" * 60)
     print(f"Device: {device_str}")
     if args.debug_theta:
         print("⚠️  DEBUG MODE: theta_init = theta_true (NO NOISE)")
-        print("    Use this to verify BER decreases with SNR")
     print("=" * 60)
 
-    # Clear GPU memory before starting
+    # Clear GPU memory
     clear_gpu_memory()
 
     model = None
@@ -853,7 +984,7 @@ def main():
             print(f"[Error] Scene '{args.scene}' not found")
             sys.exit(1)
 
-    # Auto-adjust batch size based on GPU memory
+    # Auto-adjust batch size
     batch_size = args.batch_size
     if device.type == 'cuda':
         total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -873,195 +1004,15 @@ def main():
     print(f"[Config] n_mc={args.n_mc}, batch_size={batch_size}")
     print(f"[Config] Scenes: {[e.scene_id for e in experiments]}")
 
-    # Run all experiments and collect results
+    # Run all experiments
     all_scene_results = {}
     for exp in experiments:
         df_result = run_single_scenario(exp, model, device_str, ckpt_tag, args.out)
         all_scene_results[exp.scene_id] = df_result
-        # Clear memory between experiments
         clear_gpu_memory()
-
-    # ==========================================================================
-    # Save Combined Results for All Scenes
-    # ==========================================================================
-    if len(all_scene_results) > 1:
-        print("\n" + "=" * 60)
-        print("📊 Generating Combined Results for All Scenes")
-        print("=" * 60)
-
-        combined_dir = Path(args.out) / "combined"
-        combined_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Combined CSV with scene column
-        combined_rows = []
-        for scene_id, df in all_scene_results.items():
-            if df is not None:
-                df_copy = df.copy()
-                df_copy.insert(0, 'scene_id', scene_id)
-                combined_rows.append(df_copy)
-
-        if combined_rows:
-            df_combined = pd.concat(combined_rows, ignore_index=True)
-            df_combined.to_csv(combined_dir / "all_scenes_metrics.csv", index=False)
-            print(f"  ✅ Saved: {combined_dir}/all_scenes_metrics.csv")
-
-        # 2. Generate combined comparison plots
-        generate_combined_plots(all_scene_results, combined_dir)
-
-        print(f"  ✅ Combined results saved to: {combined_dir}")
 
     print("\n[Done] All experiments completed.")
     memory_summary()
-
-
-def generate_combined_plots(results: Dict[str, pd.DataFrame], out_dir: Path):
-    """Generate combined comparison plots for all scenes."""
-
-    # Define colors and markers for each scene
-    scene_styles = {
-        'S1_full_hw': {'color': 'blue', 'marker': 'o', 'label': 'Full HW (PA+PN+1bit)'},
-        'S2_pa_only': {'color': 'red', 'marker': 's', 'label': 'PA Only'},
-        'S3_pn_only': {'color': 'green', 'marker': '^', 'label': 'PN + 1bit'},
-        'S4_ideal': {'color': 'black', 'marker': 'd', 'label': 'Ideal (No HW)'},
-    }
-
-    # =========================================================================
-    # Plot 1: BER Comparison (All Scenes)
-    # =========================================================================
-    fig1, ax1 = plt.subplots(figsize=(8, 6))
-
-    for scene_id, df in results.items():
-        if df is None:
-            continue
-        style = scene_styles.get(scene_id, {'color': 'gray', 'marker': 'x', 'label': scene_id})
-
-        # Plot GA-BV-Net if available
-        if 'BER_Net' in df.columns and not df['BER_Net'].isna().all():
-            ax1.semilogy(df['snr_db'], df['BER_Net'],
-                        color=style['color'], marker=style['marker'],
-                        linestyle='-', label=f"GA-BV-Net ({style['label']})")
-
-        # Plot LMMSE baseline
-        if 'BER_LMMSE' in df.columns and not df['BER_LMMSE'].isna().all():
-            ax1.semilogy(df['snr_db'], df['BER_LMMSE'],
-                        color=style['color'], marker=style['marker'],
-                        linestyle='--', alpha=0.6, label=f"LMMSE ({style['label']})")
-
-    ax1.set_xlabel('SNR (dB)')
-    ax1.set_ylabel('Bit Error Rate')
-    ax1.set_title('BER vs SNR - All Scenarios Comparison')
-    ax1.legend(loc='upper right', fontsize=8, ncol=2)
-    ax1.grid(True, which='both', linestyle='-', alpha=0.3)
-    ax1.set_ylim([1e-5, 1])
-
-    fig1.tight_layout()
-    fig1.savefig(out_dir / "combined_ber.png", dpi=300, bbox_inches='tight')
-    fig1.savefig(out_dir / "combined_ber.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig1)
-
-    # =========================================================================
-    # Plot 2: Chi Comparison (All Scenes)
-    # =========================================================================
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-
-    for scene_id, df in results.items():
-        if df is None:
-            continue
-        style = scene_styles.get(scene_id, {'color': 'gray', 'marker': 'x', 'label': scene_id})
-
-        if 'chi' in df.columns and not df['chi'].isna().all():
-            ax2.plot(df['snr_db'], df['chi'],
-                    color=style['color'], marker=style['marker'],
-                    linestyle='-', label=style['label'])
-
-    ax2.axhline(y=2/np.pi, color='gray', linestyle=':', alpha=0.7, label=r'$\chi_{max}=2/\pi$')
-    ax2.set_xlabel('SNR (dB)')
-    ax2.set_ylabel(r'$\chi$ (Information Retention)')
-    ax2.set_title('Chi vs SNR - All Scenarios Comparison')
-    ax2.legend(loc='upper right')
-    ax2.grid(True, linestyle='-', alpha=0.3)
-    ax2.set_ylim([0, 0.7])
-
-    fig2.tight_layout()
-    fig2.savefig(out_dir / "combined_chi.png", dpi=300, bbox_inches='tight')
-    fig2.savefig(out_dir / "combined_chi.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig2)
-
-    # =========================================================================
-    # Plot 3: RMSE Range Comparison (All Scenes)
-    # =========================================================================
-    fig3, ax3 = plt.subplots(figsize=(8, 6))
-
-    has_rmse_data = False
-    for scene_id, df in results.items():
-        if df is None:
-            continue
-        style = scene_styles.get(scene_id, {'color': 'gray', 'marker': 'x', 'label': scene_id})
-
-        if 'RMSE_R' in df.columns and not df['RMSE_R'].isna().all():
-            ax3.semilogy(df['snr_db'], df['RMSE_R'],
-                        color=style['color'], marker=style['marker'],
-                        linestyle='-', label=style['label'])
-            has_rmse_data = True
-
-    if has_rmse_data:
-        ax3.set_xlabel('SNR (dB)')
-        ax3.set_ylabel('Range RMSE (m)')
-        ax3.set_title('Range RMSE vs SNR - All Scenarios Comparison')
-        ax3.legend(loc='upper right')
-        ax3.grid(True, which='both', linestyle='-', alpha=0.3)
-
-        fig3.tight_layout()
-        fig3.savefig(out_dir / "combined_rmse.png", dpi=300, bbox_inches='tight')
-        fig3.savefig(out_dir / "combined_rmse.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig3)
-
-    # =========================================================================
-    # Plot 4: Summary Table as Figure
-    # =========================================================================
-    fig4, ax4 = plt.subplots(figsize=(10, 4))
-    ax4.axis('off')
-
-    # Create summary table
-    table_data = []
-    for scene_id, df in results.items():
-        if df is None:
-            continue
-
-        # Get metrics at SNR=15dB (or closest)
-        idx = (df['snr_db'] - 15).abs().idxmin()
-        row = df.iloc[idx]
-
-        ber_net = f"{row.get('BER_Net', np.nan):.4f}" if not pd.isna(row.get('BER_Net')) else "N/A"
-        ber_lmmse = f"{row.get('BER_LMMSE', np.nan):.4f}" if not pd.isna(row.get('BER_LMMSE')) else "N/A"
-        chi_val = f"{row.get('chi', np.nan):.3f}" if not pd.isna(row.get('chi')) else "N/A"
-
-        table_data.append([
-            scene_id,
-            scene_styles.get(scene_id, {}).get('label', scene_id),
-            ber_net,
-            ber_lmmse,
-            chi_val
-        ])
-
-    if table_data:
-        table = ax4.table(
-            cellText=table_data,
-            colLabels=['Scene ID', 'Description', 'BER (Net)', 'BER (LMMSE)', 'χ'],
-            loc='center',
-            cellLoc='center'
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.2, 1.5)
-        ax4.set_title('Summary at SNR = 15 dB', fontsize=12, fontweight='bold', y=0.9)
-
-        fig4.tight_layout()
-        fig4.savefig(out_dir / "summary_table.png", dpi=300, bbox_inches='tight')
-        fig4.savefig(out_dir / "summary_table.pdf", format='pdf', bbox_inches='tight')
-    plt.close(fig4)
-
-    print(f"  ✅ Generated 4 combined plots")
 
 
 if __name__ == "__main__":

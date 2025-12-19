@@ -1,24 +1,17 @@
 """
-gabv_net_model.py (Fixed Version v5 - PN Tracker Normalization Fix)
+gabv_net_model.py (Expert Review v6.0 - Stable ThetaUpdater)
 
 Description:
     PyTorch Implementation of Geometry-Aware Bussgang-VAMP Network (GA-BV-Net).
 
-    **CRITICAL FIXES APPLIED (Expert Review):**
-    - [FIX 1] fs = 10e9 (matches SimConfig, was 25e9)
-    - [FIX 2] PhysicsEncoder uses SINGLE-TRIP model: tau = R/c (was 2R/c)
-    - [FIX 3] PhysicsEncoder matches thz_isac_world.apply_channel_squint exactly
-    - [FIX 4] Theta UPDATE implemented (was theta_next = theta)
-    - [FIX 5] Improved PN tracker with explicit (cos, sin) output
-    - [FIX 6] Added learnable Bussgang gain compensation
-    - [FIX 7] **CRITICAL** Phase calculation uses Float64!
-             At R=500km, fc=300GHz: phase ≈ 3e9 rad (500M cycles)
-             Float32 has only 7 digits precision → ~300 rad error → BER ≈ 0.35
-             Float64 has 15 digits precision → negligible error → BER ≈ 0.00
-    - [FIX 8] **CRITICAL** PN Tracker gate interpolation normalized!
-             Linear interpolation (1-g)*1 + g*exp(jφ) has |result| ≠ 1
-             This corrupted signal amplitude → BER ≈ 0.5
-             Added normalization: result / |result| → BER ≈ 0.00
+    **CRITICAL FIXES APPLIED (Expert Review v6.0):**
+    - [FIX 1-8] All previous fixes preserved
+    - [FIX 13] ThetaUpdater: Replaced unstable angle stats with physics-based score features
+    - [FIX 14] ThetaUpdater: Outputs step sizes (μ) instead of raw delta_theta
+    - [FIX 15] ThetaUpdater: Consistent residual domain for acceptance criterion
+    - [FIX 16] ThetaUpdater: Log-scale power feature for stability
+    - [NEW] g_theta scheduling support from training loop
+    - [NEW] Score-based Gauss-Newton direction features
 
     Meta Feature Schema (FROZEN - must match train_gabv_net.py):
         meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
@@ -28,7 +21,7 @@ Description:
         meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
         meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
 
-Author: Expert Review Fixed v5 (PN Tracker Normalization)
+Author: Expert Review Fixed v6.0 (Stable ThetaUpdater)
 Date: 2025-12-18
 """
 
@@ -196,6 +189,36 @@ class PhysicsEncoder(nn.Module):
 
         return h_diag
 
+    def compute_channel_jacobian(self, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        [NEW] Compute channel Jacobian ∂h/∂θ for physics-based features.
+
+        Returns derivatives with respect to R, v, a:
+            ∂h/∂R = h * (-j * 2π * fc / c)
+            ∂h/∂v = h * (-j * 2π * fc / c * t)
+            ∂h/∂a = h * (-j * 2π * fc / c * 0.5 * t²)
+
+        Args:
+            theta: [B, 3] parameters (R, v, a)
+
+        Returns:
+            dh_dR: [B, N] complex
+            dh_dv: [B, N] complex
+            dh_da: [B, N] complex
+        """
+        h_diag = self.compute_channel_diag(theta)  # [B, N]
+        t = self.t_grid.unsqueeze(0).to(theta.device)  # [1, N]
+
+        # Common factor: -j * 2π * fc / c
+        factor = -1j * 2 * math.pi * self.fc / self.c
+
+        # Jacobians
+        dh_dR = h_diag * factor  # [B, N]
+        dh_dv = h_diag * (factor * t)  # [B, N]
+        dh_da = h_diag * (factor * 0.5 * t ** 2)  # [B, N]
+
+        return dh_dR, dh_dv, dh_da
+
     def forward_operator(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """Forward operator: y = H @ x (diagonal channel = element-wise multiply)"""
         h_diag = self.compute_channel_diag(theta)
@@ -324,6 +347,7 @@ class RiemannianPNTracker(nn.Module):
 
         return eff_derotator, wiener_loss
 
+
 class BussgangRefiner(nn.Module):
     def __init__(self, cfg: GABVConfig):
         super().__init__()
@@ -380,32 +404,42 @@ class UnrolledCGSolver(nn.Module):
 
 class ThetaUpdater(nn.Module):
     """
-    [B-lite] Physics-Aware Theta Updater with Acceptance Criterion
+    [Expert v6.0] Physics-Aware Theta Updater with Score-Based Features
 
-    Key Features:
-    - [FIX 9] Physical clamping: max 20m per layer
-    - [FIX 9] Confidence gating: don't update when x_est is unreliable
-    - [NEW B-lite] Acceptance criterion: reject if residual doesn't decrease
+    Key Changes from v5:
+    - [FIX 13] Replaced unstable angle(resid) stats with physics-based score features
+    - [FIX 14] Network outputs step sizes (μ) instead of raw delta_theta
+    - [FIX 15] Consistent residual domain for acceptance criterion
+    - [FIX 16] Log-scale power feature for numerical stability
+
+    The score features are derived from the Gauss-Newton direction:
+        s_k = Re(⟨∂(h·x)/∂θ_k, r⟩) / ||∂(h·x)/∂θ_k||²
+
+    This is physics-consistent and much more stable than learning raw deltas.
     """
 
     def __init__(self, cfg):
         super().__init__()
-        # Feature extraction network
-        self.grad_net = nn.Sequential(
+        self.cfg = cfg
+
+        # [FIX 14] Network outputs step sizes (μ), not raw delta_theta
+        # Input: [log_power, |s_R|, |s_v|, |s_a|, g_theta, confidence] = 6 features
+        self.step_net = nn.Sequential(
             nn.Linear(6, 32),
             nn.ReLU(),
             nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(32, 3)  # Output: delta for (R, v, a)
+            nn.Linear(32, 3),  # Output: step sizes for (R, v, a)
+            nn.Softplus()  # Ensure non-negative step sizes
         )
 
-        # Learnable step size
-        self.lr_param = nn.Parameter(torch.tensor(0.1))
+        # Base step size scaling (learnable)
+        self.base_step_scale = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))
 
         # Physical limits [FIX 9]
         self.max_delta_R = 20.0  # meters per layer
-        self.max_delta_v = 5.0  # m/s per layer
-        self.max_delta_a = 1.0  # m/s^2 per layer
+        self.max_delta_v = 5.0   # m/s per layer
+        self.max_delta_a = 1.0   # m/s^2 per layer
 
         # Confidence threshold [FIX 9]
         self.confidence_threshold = 0.5
@@ -417,21 +451,74 @@ class ThetaUpdater(nn.Module):
         # [NEW B-lite] Enable acceptance criterion
         self.use_acceptance_criterion = True
 
+    def compute_score_features(self, resid: torch.Tensor, x_est: torch.Tensor,
+                               phys_enc: 'PhysicsEncoder', theta: torch.Tensor) -> torch.Tensor:
+        """
+        [FIX 13] Compute physics-based score features (Gauss-Newton direction).
+
+        Score for parameter k:
+            s_k = Re(⟨∂y_pred/∂θ_k, r⟩) / ||∂y_pred/∂θ_k||²
+
+        where y_pred = h * x_est, r = residual
+
+        This gives the steepest descent direction in the θ space.
+
+        Args:
+            resid: Residual signal [B, N]
+            x_est: Current symbol estimate [B, N]
+            phys_enc: Physics encoder (for Jacobian computation)
+            theta: Current parameters [B, 3]
+
+        Returns:
+            scores: [B, 3] score features (s_R, s_v, s_a)
+        """
+        # Get channel Jacobians: ∂h/∂R, ∂h/∂v, ∂h/∂a
+        dh_dR, dh_dv, dh_da = phys_enc.compute_channel_jacobian(theta)
+
+        # Compute ∂y_pred/∂θ = (∂h/∂θ) * x_est
+        dy_dR = dh_dR * x_est  # [B, N]
+        dy_dv = dh_dv * x_est  # [B, N]
+        dy_da = dh_da * x_est  # [B, N]
+
+        # Score: s_k = Re(⟨∂y/∂θ_k, r⟩) / ||∂y/∂θ_k||²
+        def compute_score(dy_dtheta, r):
+            # Inner product: ⟨∂y/∂θ_k, r⟩
+            inner = torch.sum(torch.conj(dy_dtheta) * r, dim=1)  # [B]
+            inner_real = inner.real
+
+            # Norm squared: ||∂y/∂θ_k||²
+            norm_sq = torch.sum(dy_dtheta.abs() ** 2, dim=1) + 1e-12  # [B]
+
+            # Score
+            score = inner_real / norm_sq  # [B]
+            return score
+
+        s_R = compute_score(dy_dR, resid)  # [B]
+        s_v = compute_score(dy_dv, resid)  # [B]
+        s_a = compute_score(dy_da, resid)  # [B]
+
+        # Stack into [B, 3]
+        scores = torch.stack([s_R, s_v, s_a], dim=1)
+
+        return scores
+
     def forward(self, theta: torch.Tensor, resid: torch.Tensor, x_est: torch.Tensor,
                 g_theta: torch.Tensor, fim_inv: Optional[torch.Tensor] = None,
-                y_q: Optional[torch.Tensor] = None,
-                h_func: Optional[callable] = None) -> Tuple[torch.Tensor, Dict]:
+                phys_enc: Optional['PhysicsEncoder'] = None,
+                z_denoised: Optional[torch.Tensor] = None,
+                g_theta_sched: float = 1.0) -> Tuple[torch.Tensor, Dict]:
         """
-        Update theta with physical constraints and acceptance criterion.
+        Update theta with physics-based score features.
 
         Args:
             theta: Current parameters [B, 3] (R, v, a)
-            resid: Residual signal [B, N]
+            resid: Residual signal [B, N] (in z_denoised domain)
             x_est: Current symbol estimate [B, N]
             g_theta: Update gate from PilotNavigator [B, 1]
             fim_inv: Optional FIM inverse for natural gradient [B, 3]
-            y_q: Original observation (for acceptance criterion)
-            h_func: Function to compute h(theta) (for acceptance criterion)
+            phys_enc: Physics encoder (required for score computation)
+            z_denoised: Denoised observation (for acceptance criterion)
+            g_theta_sched: Scheduling factor from training loop [0, 1]
 
         Returns:
             theta_new: Updated parameters [B, 3]
@@ -440,67 +527,75 @@ class ThetaUpdater(nn.Module):
         B = theta.shape[0]
         device = theta.device
 
-        # Compute residual statistics as features
+        # [FIX 16] Log-scale power feature for stability
         resid_power = torch.mean(resid.abs() ** 2, dim=1, keepdim=True)  # [B, 1]
-        resid_phase_mean = torch.mean(torch.angle(resid + 1e-8), dim=1, keepdim=True)
-        resid_phase_var = torch.var(torch.angle(resid + 1e-8), dim=1, keepdim=True)
+        log_power = torch.log10(resid_power + 1e-9)  # Log scale for stability
 
-        # Cross-correlation with x_est
-        cross_corr_real = torch.mean((resid * torch.conj(x_est)).real, dim=1, keepdim=True)
-        cross_corr_imag = torch.mean((resid * torch.conj(x_est)).imag, dim=1, keepdim=True)
+        # [FIX 13] Compute physics-based score features
+        if phys_enc is not None:
+            scores = self.compute_score_features(resid, x_est, phys_enc, theta)  # [B, 3]
+            # Use absolute values as features (direction comes from sign)
+            score_magnitudes = scores.abs()  # [B, 3]
+        else:
+            # Fallback: use zero scores (no physics-based direction)
+            scores = torch.zeros(B, 3, device=device)
+            score_magnitudes = torch.zeros(B, 3, device=device)
 
-        # Feature vector [B, 6]
+        # Confidence based on x_est quality
+        confidence = torch.mean(x_est.abs(), dim=1, keepdim=True)  # [B, 1]
+
+        # [FIX 14] Feature vector for step size network
         feat = torch.cat([
-            resid_power,
-            resid_phase_mean,
-            resid_phase_var,
-            cross_corr_real,
-            cross_corr_imag,
-            g_theta
-        ], dim=1)
+            log_power,                    # [B, 1] - log scale power
+            score_magnitudes,             # [B, 3] - score magnitudes
+            g_theta,                      # [B, 1] - gate from pilot
+            confidence,                   # [B, 1] - symbol confidence
+        ], dim=1)  # [B, 6]
 
-        # Predict update direction
-        delta_theta = self.grad_net(feat)  # [B, 3]
+        # [FIX 14] Predict step sizes (μ), not raw delta_theta
+        step_sizes = self.step_net(feat)  # [B, 3], non-negative via Softplus
 
-        # Apply FIM scaling (natural gradient) if available
-        if fim_inv is not None:
-            delta_theta = delta_theta * fim_inv
+        # Scale by base step size
+        step_sizes = step_sizes * torch.abs(self.base_step_scale)
 
-        # Apply step size
-        lr = torch.abs(self.lr_param)
-        delta_theta_scaled = lr * delta_theta
+        # [FIX 14] Compute update direction from scores: Δθ = -μ ⊙ s
+        # Negative sign: we want to minimize residual, scores point uphill
+        delta_theta = -step_sizes * scores  # [B, 3]
 
-        # [FIX 9] Physical clamping
-        delta_R = torch.clamp(delta_theta_scaled[:, 0:1], -self.max_delta_R, self.max_delta_R)
-        delta_v = torch.clamp(delta_theta_scaled[:, 1:2], -self.max_delta_v, self.max_delta_v)
-        delta_a = torch.clamp(delta_theta_scaled[:, 2:3], -self.max_delta_a, self.max_delta_a)
+        # Physical clamping per component
+        delta_R = torch.clamp(delta_theta[:, 0:1], -self.max_delta_R, self.max_delta_R)
+        delta_v = torch.clamp(delta_theta[:, 1:2], -self.max_delta_v, self.max_delta_v)
+        delta_a = torch.clamp(delta_theta[:, 2:3], -self.max_delta_a, self.max_delta_a)
         delta_theta_clipped = torch.cat([delta_R, delta_v, delta_a], dim=1)
 
-        # [FIX 9] Confidence gating
-        confidence = torch.mean(x_est.abs(), dim=1, keepdim=True)  # [B, 1]
+        # Confidence gating
         confidence_gate = torch.sigmoid((confidence - self.confidence_threshold) * 10)
 
+        # [NEW] Apply g_theta scheduling from training loop
+        g_theta_scheduled = g_theta * g_theta_sched
+
         # Combined gate
-        effective_gate = g_theta * confidence_gate
+        effective_gate = g_theta_scheduled * confidence_gate
 
         # Compute candidate theta
         theta_candidate = theta + effective_gate * delta_theta_clipped
 
-        # [NEW B-lite] Acceptance criterion
+        # [FIX 15] Acceptance criterion with CONSISTENT residual domain
         accept_rate = 1.0
-        if self.use_acceptance_criterion and y_q is not None and h_func is not None:
+        if self.use_acceptance_criterion and z_denoised is not None and phys_enc is not None:
             with torch.no_grad():
-                # Current residual norm
+                # Current residual norm (already computed in resid)
                 resid_norm_before = torch.mean(resid.abs() ** 2, dim=1)  # [B]
 
                 # Compute new channel and residual with candidate theta
-                h_new = h_func(theta_candidate)
+                # [FIX 15] Use z_denoised domain (same as resid), NOT y_q
+                h_new = phys_enc.compute_channel_diag(theta_candidate)
                 y_reconstructed_new = h_new * x_est
-                resid_new = y_q - y_reconstructed_new
+                resid_new = z_denoised - y_reconstructed_new
                 resid_norm_after = torch.mean(resid_new.abs() ** 2, dim=1)  # [B]
 
-                # Accept only if residual decreased
-                accept_mask = (resid_norm_after < resid_norm_before).float()  # [B]
+                # Accept only if residual decreased (with small tolerance)
+                accept_mask = (resid_norm_after < resid_norm_before * 1.01).float()  # [B]
                 accept_rate = accept_mask.mean().item()
 
                 # Apply acceptance: use candidate if accepted, else keep original
@@ -520,6 +615,12 @@ class ThetaUpdater(nn.Module):
             'g_theta_effective': effective_gate.mean().item(),
             'confidence': confidence.mean().item(),
             'accept_rate': accept_rate,
+            'score_R': scores[:, 0].mean().item() if scores is not None else 0.0,
+            'score_v': scores[:, 1].mean().item() if scores is not None else 0.0,
+            'score_a': scores[:, 2].mean().item() if scores is not None else 0.0,
+            'step_size_R': step_sizes[:, 0].mean().item(),
+            'step_size_v': step_sizes[:, 1].mean().item(),
+            'step_size_a': step_sizes[:, 2].mean().item(),
         }
 
         return theta_new, info
@@ -553,123 +654,9 @@ class GABVNet(nn.Module):
             self.pn_tracker = RiemannianPNTracker(cfg)  # B-lite version
             self.refiner = BussgangRefiner(cfg)
             self.solver = UnrolledCGSolver(cfg)
-            self.theta_updater = ThetaUpdater(cfg)  # B-lite version
+            self.theta_updater = ThetaUpdater(cfg)  # v6.0 physics-based version
         else:
             raise NotImplementedError("Per-layer weights not yet implemented.")
-
-    def gabvnet_forward_blite(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass of GA-BV-Net with B-lite enhancements.
-
-        B-lite Features:
-        - Accumulates wiener_loss from PN tracker across layers
-        - ThetaUpdater with acceptance criterion
-        - Returns theta_info for debugging
-
-        Args:
-            batch: Dictionary containing:
-                - 'y_q': Quantized observation [B, N]
-                - 'meta': Meta features [B, 6]
-                - 'theta_init': Initial theta estimate [B, 3]
-
-        Returns:
-            Dictionary containing:
-                - 'x_hat': Symbol estimate [B, N]
-                - 'theta_hat': Final theta estimate [B, 3]
-                - 'phi_hat': Final de-rotation factor [B, N]
-                - 'layers': Per-layer outputs
-                - 'geom_cache': FIM information
-                - 'wiener_loss': Total Wiener prior loss (for training)
-        """
-        y_q = batch['y_q']
-        meta = batch['meta']
-        theta = batch['theta_init'].clone()
-
-        B, N = y_q.shape
-        device = y_q.device
-
-        # Denormalize meta features
-        snr_db_norm = meta[:, 0:1]
-        gamma_eff_db_norm = meta[:, 1:2]
-
-        snr_db = snr_db_norm * self.cfg.snr_db_scale + self.cfg.snr_db_center \
-            if hasattr(self.cfg, 'snr_db_scale') else snr_db_norm * 15.0 + 15.0
-        gamma_eff_db = gamma_eff_db_norm * 20.0 + 10.0
-
-        snr_linear = 10.0 ** (snr_db / 10.0)
-        gamma_eff_linear = 10.0 ** (gamma_eff_db / 10.0)
-
-        # Initialize
-        x_est = torch.zeros_like(y_q)
-
-        layer_outputs = []
-        geom_cache = {'log_vols': [], 'fim_invs': []}
-
-        # [NEW B-lite] Accumulate Wiener prior loss across layers
-        total_wiener_loss = torch.tensor(0.0, device=device)
-
-        for k in range(self.cfg.n_layers):
-            # 1. Physics - get FIM info
-            fim_inv, log_vol = self.phys_enc.get_approx_fim_info(theta, gamma_eff_linear)
-            if self.cfg.enable_geom_loss:
-                geom_cache['log_vols'].append(log_vol)
-                geom_cache['fim_invs'].append(fim_inv)
-
-            # 2. Pilot - get gates
-            gates = self.pilot(meta, log_vol=log_vol)
-
-            # [FIX 10] Adjust g_PN based on pn_linewidth_norm in meta
-            pn_norm = meta[:, 4:5]  # pn_linewidth_norm is at index 4
-            gates['g_PN'] = gates['g_PN'] * (pn_norm > 0.1).float()
-
-            # 3. PN Tracking - [B-lite] Now returns wiener_loss
-            derotator, wiener_loss = self.pn_tracker(y_q, gates['g_PN'], x_est if k > 0 else None)
-            total_wiener_loss = total_wiener_loss + wiener_loss
-
-            y_corr = y_q * derotator
-
-            # 4. Refiner
-            z_denoised, onsager = self.refiner(y_corr, gates['g_NL'])
-
-            # 5. Solver
-            x_est = self.solver(z_denoised, x_est, self.phys_enc, theta, snr_linear)
-
-            # 6. Theta Update with acceptance criterion
-            theta_info = {}
-            if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # Compute channel and residual
-                h_diag = self.phys_enc.compute_channel_diag(theta)
-                resid = z_denoised - h_diag * x_est
-
-                # Create h_func for acceptance criterion
-                def h_func(theta_new):
-                    return self.phys_enc.compute_channel_diag(theta_new)
-
-                # Update theta with acceptance criterion
-                theta, theta_info = self.theta_updater(
-                    theta, resid, x_est,
-                    gates['g_theta'], fim_inv,
-                    y_q=y_corr,  # Pass corrected observation
-                    h_func=h_func
-                )
-
-            layer_outputs.append({
-                'x_est': x_est.clone(),
-                'theta': theta.clone(),
-                'gates': gates,
-                'derotator': derotator,
-                'theta_info': theta_info,  # [NEW] For debugging
-                'wiener_loss_layer': wiener_loss.item() if torch.is_tensor(wiener_loss) else wiener_loss,
-            })
-
-        return {
-            'x_hat': x_est,
-            'theta_hat': theta,
-            'phi_hat': layer_outputs[-1]['derotator'],
-            'layers': layer_outputs,
-            'geom_cache': geom_cache,
-            'wiener_loss': total_wiener_loss,  # [NEW B-lite] For training loss
-        }
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -677,14 +664,16 @@ class GABVNet(nn.Module):
 
         B-lite Features:
         - Accumulates wiener_loss from PN tracker across layers
-        - ThetaUpdater returns debug info
-        - Full support for FIX 7-12
+        - ThetaUpdater with physics-based score features
+        - Full support for FIX 7-16
+        - g_theta scheduling support
 
         Args:
             batch: Dictionary containing:
                 - 'y_q': Quantized observation [B, N]
                 - 'meta': Meta features [B, 6]
                 - 'theta_init': Initial theta estimate [B, 3]
+                - 'g_theta_sched': (optional) Scheduling factor [0, 1]
 
         Returns:
             Dictionary containing:
@@ -698,6 +687,9 @@ class GABVNet(nn.Module):
         y_q = batch['y_q']
         meta = batch['meta']
         theta = batch['theta_init'].clone()
+
+        # [NEW] g_theta scheduling from training loop
+        g_theta_sched = batch.get('g_theta_sched', 1.0)
 
         B, N = y_q.shape
         device = y_q.device
@@ -755,7 +747,7 @@ class GABVNet(nn.Module):
             # 5. Solver
             x_est = self.solver(z_denoised, x_est, self.phys_enc, theta, snr_linear)
 
-            # 6. [FIX 4] Theta Update
+            # 6. [FIX 4] Theta Update with physics-based features
             theta_info = {
                 'delta_R': 0.0,
                 'delta_v': 0.0,
@@ -769,23 +761,14 @@ class GABVNet(nn.Module):
                 h_diag = self.phys_enc.compute_channel_diag(theta)
                 resid = z_denoised - h_diag * x_est
 
-                # Update theta - handle different ThetaUpdater signatures
-                try:
-                    # New B-lite version returns (theta, info)
-                    theta_result = self.theta_updater(
-                        theta, resid, x_est,
-                        gates['g_theta'], fim_inv
-                    )
-                    if isinstance(theta_result, tuple):
-                        theta, theta_info = theta_result
-                    else:
-                        theta = theta_result
-                except TypeError:
-                    # Fallback for old version
-                    theta = self.theta_updater(
-                        theta, resid, x_est,
-                        gates['g_theta'], fim_inv
-                    )
+                # [FIX 15] Update theta with consistent residual domain
+                theta, theta_info = self.theta_updater(
+                    theta, resid, x_est,
+                    gates['g_theta'], fim_inv,
+                    phys_enc=self.phys_enc,
+                    z_denoised=z_denoised,  # Pass for acceptance criterion
+                    g_theta_sched=g_theta_sched,  # Pass scheduling factor
+                )
 
             layer_outputs.append({
                 'x_est': x_est.clone(),
@@ -845,7 +828,7 @@ def denormalize_meta(meta: torch.Tensor) -> Dict[str, torch.Tensor]:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("GABVNet Model - Fixed Version v3 Self-Test")
+    print("GABVNet Model - Expert Fixed Version v6.0 Self-Test")
     print("=" * 60)
 
     # Check fs consistency
@@ -855,6 +838,43 @@ if __name__ == "__main__":
     print(f"  fc = {cfg.fc/1e9:.1f} GHz")
     print(f"  N  = {cfg.N_sym}")
     print(f"  enable_theta_update = {cfg.enable_theta_update}")
+
+    # Test model creation
+    print(f"\n[Model Creation Test]")
+    model = create_gabv_model(cfg)
+    print(f"  Model created successfully")
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    theta_params = sum(p.numel() for n, p in model.named_parameters() if 'theta_updater' in n)
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  ThetaUpdater parameters: {theta_params:,}")
+
+    # Test forward pass
+    print(f"\n[Forward Pass Test]")
+    B, N = 4, 1024
+    device = 'cpu'
+
+    batch = {
+        'y_q': torch.randn(B, N, dtype=torch.cfloat, device=device),
+        'meta': torch.randn(B, 6, device=device),
+        'theta_init': torch.tensor([[5e5, 7500.0, 10.0]] * B, device=device),
+        'g_theta_sched': 0.5,
+    }
+
+    with torch.no_grad():
+        outputs = model(batch)
+
+    print(f"  x_hat shape: {outputs['x_hat'].shape}")
+    print(f"  theta_hat shape: {outputs['theta_hat'].shape}")
+    print(f"  wiener_loss: {outputs['wiener_loss'].item():.4f}")
+
+    # Check theta_info
+    last_layer = outputs['layers'][-1]
+    theta_info = last_layer['theta_info']
+    print(f"  theta_info keys: {list(theta_info.keys())}")
+    print(f"  delta_R: {theta_info['delta_R']:.4f}")
+    print(f"  accept_rate: {theta_info['accept_rate']:.4f}")
 
     print("\n" + "=" * 60)
     print("Self-Test Complete")

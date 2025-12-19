@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-train_gabv_net.py - GA-BV-Net Training Script (Expert Review v4.1)
+train_gabv_net.py - GA-BV-Net Training Script (Expert Review v5.0 - Stable)
 
-Expert Review Changes:
-- Three-stage curriculum learning with ThetaUpdater progression
-- Sensing loss and BCRLB regularization
-- Enhanced monitoring (g_theta, delta_R, RMSE_R)
-- Confidence-based gating support
+Expert Review Changes v5.0:
+- [CRITICAL FIX] Normalized sensing loss (THETA_SCALE) to prevent gradient explosion
+- [CRITICAL FIX] Warmup applied to Stage 2/3 (was only Stage 1)
+- [FIX] Reduced theta_params LR from 5x to 1x base_lr
+- [FIX] Added g_theta scheduling (curriculum)
+- [FIX] Renamed loss_bcrlb to loss_prior (correct terminology)
+- [NEW] Stage2a/2b for freeze-then-unfreeze training
+- [NEW] Mahalanobis-style loss option with FIM weighting
+- [NEW] Enhanced logging (RMSE per component, accept_rate, effective_gate)
 """
 
 import argparse
@@ -32,6 +36,7 @@ from gabv_net_model import GABVNet, GABVConfig, create_gabv_model
 # Optional: matplotlib for training curves
 try:
     import matplotlib.pyplot as plt
+
     HAS_PLT = True
 except ImportError:
     HAS_PLT = False
@@ -56,11 +61,27 @@ class TrainConfig:
     # Debug mode
     debug_mode: bool = False
 
-    # Theta noise (progressive)
+    # Theta noise warmup (applies to ALL stages now)
     theta_noise_warmup_steps: int = 500
+
+    # g_theta scheduling warmup steps
+    g_theta_warmup_steps: int = 300
 
     # Output
     out_dir: str = "results/checkpoints"
+
+
+# =============================================================================
+# [CRITICAL FIX] Theta Normalization Scales
+# =============================================================================
+
+# Physical scales for theta = [R, v, a]
+# These represent "acceptable tolerance" for each parameter
+# A 100m error in R contributes same loss as 10m/s error in v
+THETA_SCALE = torch.tensor([1000.0, 10.0, 1.0])  # [1km, 10m/s, 1m/s²]
+
+# Prior variance for MAP-style regularization (squared of noise std)
+THETA_PRIOR_VAR = torch.tensor([100.0 ** 2, 10.0 ** 2, 0.5 ** 2])  # Stage3 noise level
 
 
 @dataclass
@@ -72,18 +93,22 @@ class StageConfig:
     n_steps: int
 
     # Theta configuration
-    theta_noise_std: Tuple[float, float, float]  # (R, v, a)
+    theta_noise_std: Tuple[float, float, float]  # (R, v, a) in physical units
     enable_theta_update: bool
 
     # Loss weights
     loss_weight_comm: float = 1.0
     loss_weight_sens: float = 0.0
-    loss_weight_bcrlb: float = 0.0
+    loss_weight_prior: float = 0.0  # Renamed from loss_weight_bcrlb
 
     # Training settings
     snr_range: Tuple[float, float] = (-5, 25)
     enable_pn: bool = True
     lr_multiplier: float = 1.0
+
+    # [NEW] Freeze settings for Stage2a/2b
+    freeze_comm_modules: bool = False
+    freeze_pn_tracker: bool = False
 
 
 # =============================================================================
@@ -133,6 +158,112 @@ def construct_meta_features(raw_meta: dict, batch_size: int) -> torch.Tensor:
 
 
 # =============================================================================
+# [CRITICAL FIX] Normalized Loss Functions
+# =============================================================================
+
+def compute_normalized_sensing_loss(theta_hat: torch.Tensor,
+                                    theta_true: torch.Tensor,
+                                    device: torch.device) -> Tuple[torch.Tensor, Dict]:
+    """
+    Compute normalized sensing loss to prevent gradient explosion.
+
+    The key insight: R ~ 5e5 m, so raw MSE(R) ~ 1e10 dominates everything.
+    By normalizing with THETA_SCALE, we get balanced gradients across all parameters.
+
+    Args:
+        theta_hat: Predicted theta [B, 3]
+        theta_true: Ground truth theta [B, 3]
+        device: Torch device
+
+    Returns:
+        loss_sens: Normalized MSE loss (scalar)
+        metrics: Dict with per-component RMSE for logging
+    """
+    scales = THETA_SCALE.to(device)
+
+    # Normalized error: (theta_hat - theta_true) / scale
+    # This makes each component contribute equally to the loss
+    diff_normalized = (theta_hat - theta_true) / scales
+    loss_sens = torch.mean(diff_normalized ** 2)
+
+    # Compute per-component RMSE for logging (in original units)
+    with torch.no_grad():
+        rmse_R = torch.sqrt(torch.mean((theta_hat[:, 0] - theta_true[:, 0]) ** 2)).item()
+        rmse_v = torch.sqrt(torch.mean((theta_hat[:, 1] - theta_true[:, 1]) ** 2)).item()
+        rmse_a = torch.sqrt(torch.mean((theta_hat[:, 2] - theta_true[:, 2]) ** 2)).item()
+
+    metrics = {
+        'rmse_R': rmse_R,
+        'rmse_v': rmse_v,
+        'rmse_a': rmse_a,
+    }
+
+    return loss_sens, metrics
+
+
+def compute_prior_loss(theta_hat: torch.Tensor,
+                       theta_init: torch.Tensor,
+                       theta_noise_std: Tuple[float, float, float],
+                       device: torch.device) -> torch.Tensor:
+    """
+    Compute prior/regularization loss (MAP-style).
+
+    This is the correct implementation of "BCRLB regularization":
+    - Acts as a prior term preventing theta from drifting too far from init
+    - Weighted by the inverse variance of the prior (1/σ²)
+
+    Args:
+        theta_hat: Predicted theta [B, 3]
+        theta_init: Initial theta estimate [B, 3]
+        theta_noise_std: Standard deviation of theta noise (R, v, a)
+        device: Torch device
+
+    Returns:
+        loss_prior: Prior regularization loss (scalar)
+    """
+    # Use the theta noise std as the prior standard deviation
+    # This makes physical sense: the network shouldn't update theta
+    # more than the expected noise range
+    prior_std = torch.tensor(theta_noise_std, device=device) + 1e-6
+
+    # Normalized prior loss: (theta_hat - theta_init)² / σ²
+    diff = (theta_hat - theta_init) / prior_std
+    loss_prior = torch.mean(diff ** 2)
+
+    return loss_prior
+
+
+def compute_mahalanobis_loss(theta_hat: torch.Tensor,
+                             theta_true: torch.Tensor,
+                             fim_inv_diag: torch.Tensor,
+                             device: torch.device) -> torch.Tensor:
+    """
+    [OPTIONAL] Compute Mahalanobis-style loss using FIM inverse.
+
+    This is the "proper BCRLB loss" - weights errors by their estimability.
+    High FIM = easy to estimate = high weight on error.
+    Low FIM = hard to estimate = low weight on error.
+
+    Args:
+        theta_hat: Predicted theta [B, 3]
+        theta_true: Ground truth theta [B, 3]
+        fim_inv_diag: Diagonal FIM inverse (approx CRLB variance) [B, 3]
+        device: Torch device
+
+    Returns:
+        loss: Mahalanobis loss (scalar)
+    """
+    # FIM inverse is approximately the variance lower bound
+    # Mahalanobis: (θ - θ*)ᵀ FIM (θ - θ*) = (θ - θ*)² / var_lb
+    var_lb = fim_inv_diag.detach() + 1e-9  # Detach to avoid backprop through FIM
+
+    diff_sq = (theta_hat - theta_true) ** 2
+    loss = torch.mean(torch.sum(diff_sq / var_lb, dim=1))
+
+    return loss
+
+
+# =============================================================================
 # BER Computation
 # =============================================================================
 
@@ -146,7 +277,7 @@ def compute_ber(x_hat: np.ndarray, x_true: np.ndarray) -> float:
 
 
 # =============================================================================
-# Curriculum Stage Definitions
+# Curriculum Stage Definitions (Fixed)
 # =============================================================================
 
 def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
@@ -154,7 +285,8 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
     Define curriculum learning stages per expert recommendations.
 
     Stage 1: Communication only, exact theta (warm-up)
-    Stage 2: Enable theta update with small noise (10m)
+    Stage 2a: Freeze comm, train theta_updater only (NEW)
+    Stage 2b: Unfreeze PN tracker, continue theta training (NEW)
     Stage 3: Full theta noise (100m) - paper target
     """
     return [
@@ -167,7 +299,83 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             enable_theta_update=False,
             loss_weight_comm=1.0,
             loss_weight_sens=0.0,
-            loss_weight_bcrlb=0.0,
+            loss_weight_prior=0.0,
+            snr_range=(-5, 25),
+            enable_pn=True,
+            freeze_comm_modules=False,
+            freeze_pn_tracker=False,
+        ),
+        # Stage 2a: Freeze comm modules, train only theta_updater
+        StageConfig(
+            stage=2,
+            name="Stage2a_ThetaFreeze",
+            description="Freeze comm, train theta_updater with 10m noise",
+            n_steps=base_steps // 2,
+            theta_noise_std=(10.0, 1.0, 0.1),  # Small noise
+            enable_theta_update=True,
+            loss_weight_comm=0.5,  # Lower weight since comm is frozen
+            loss_weight_sens=1.0,
+            loss_weight_prior=0.2,
+            snr_range=(10, 25),  # Higher SNR for stability
+            enable_pn=True,
+            lr_multiplier=1.0,  # Normal LR for theta
+            freeze_comm_modules=True,  # Freeze phys_enc, solver, refiner
+            freeze_pn_tracker=True,  # Freeze PN tracker too
+        ),
+        # Stage 2b: Unfreeze PN tracker
+        StageConfig(
+            stage=3,
+            name="Stage2b_ThetaUnfreeze",
+            description="Unfreeze PN tracker, continue theta training",
+            n_steps=base_steps // 2,
+            theta_noise_std=(10.0, 1.0, 0.1),  # Same noise as 2a
+            enable_theta_update=True,
+            loss_weight_comm=1.0,
+            loss_weight_sens=1.0,
+            loss_weight_prior=0.1,
+            snr_range=(5, 25),
+            enable_pn=True,
+            lr_multiplier=0.5,
+            freeze_comm_modules=True,  # Keep solver frozen
+            freeze_pn_tracker=False,  # Unfreeze PN tracker
+        ),
+        # Stage 3: Full noise, full fine-tuning
+        StageConfig(
+            stage=4,
+            name="Stage3_ThetaFull",
+            description="Full theta noise (100m) - paper target",
+            n_steps=base_steps,
+            theta_noise_std=(100.0, 10.0, 0.5),  # Full noise
+            enable_theta_update=True,
+            loss_weight_comm=1.0,
+            loss_weight_sens=1.0,
+            loss_weight_prior=0.2,
+            snr_range=(-5, 25),
+            enable_pn=True,
+            lr_multiplier=0.3,
+            freeze_comm_modules=False,  # Full fine-tuning
+            freeze_pn_tracker=False,
+        ),
+    ]
+
+
+def get_simple_curriculum_stages(base_steps: int) -> List[StageConfig]:
+    """
+    Simplified 3-stage curriculum (backward compatible).
+
+    Use this if you don't need the freeze/unfreeze stages.
+    """
+    return [
+        StageConfig(
+            stage=1,
+            name="Stage1_CommOnly",
+            description="Communication only, exact theta, PN tracking",
+            n_steps=base_steps,
+            theta_noise_std=(0.0, 0.0, 0.0),
+            enable_theta_update=False,
+            loss_weight_comm=1.0,
+            loss_weight_sens=0.0,
+            loss_weight_prior=0.0,
             snr_range=(-5, 25),
             enable_pn=True,
         ),
@@ -176,25 +384,25 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             name="Stage2_ThetaMicro",
             description="Enable theta update with 10m noise",
             n_steps=base_steps,
-            theta_noise_std=(10.0, 1.0, 0.1),  # Small noise
+            theta_noise_std=(10.0, 1.0, 0.1),
             enable_theta_update=True,
             loss_weight_comm=1.0,
             loss_weight_sens=0.5,
-            loss_weight_bcrlb=0.1,
-            snr_range=(5, 25),  # Higher SNR for stability
+            loss_weight_prior=0.1,
+            snr_range=(5, 25),
             enable_pn=True,
-            lr_multiplier=0.5,  # Lower LR for fine-tuning
+            lr_multiplier=0.5,
         ),
         StageConfig(
             stage=3,
             name="Stage3_ThetaFull",
             description="Full theta noise (100m) - paper target",
             n_steps=base_steps,
-            theta_noise_std=(100.0, 10.0, 0.5),  # Full noise
+            theta_noise_std=(100.0, 10.0, 0.5),
             enable_theta_update=True,
             loss_weight_comm=1.0,
             loss_weight_sens=1.0,
-            loss_weight_bcrlb=0.2,
+            loss_weight_prior=0.2,
             snr_range=(-5, 25),
             enable_pn=True,
             lr_multiplier=0.3,
@@ -203,14 +411,51 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
 
 
 # =============================================================================
+# Module Freezing Utilities
+# =============================================================================
+
+def freeze_module(module: nn.Module, freeze: bool = True):
+    """Freeze or unfreeze a module's parameters."""
+    for param in module.parameters():
+        param.requires_grad = not freeze
+
+
+def apply_freeze_schedule(model: GABVNet, stage_cfg: StageConfig):
+    """Apply freeze schedule based on stage configuration."""
+    if stage_cfg.freeze_comm_modules:
+        # Freeze communication modules
+        freeze_module(model.phys_enc, True)
+        freeze_module(model.solver, True)
+        freeze_module(model.refiner, True)
+        print("  [Freeze] phys_enc, solver, refiner FROZEN")
+    else:
+        # Unfreeze
+        freeze_module(model.phys_enc, False)
+        freeze_module(model.solver, False)
+        freeze_module(model.refiner, False)
+        print("  [Freeze] phys_enc, solver, refiner ACTIVE")
+
+    if stage_cfg.freeze_pn_tracker:
+        freeze_module(model.pn_tracker, True)
+        print("  [Freeze] pn_tracker FROZEN")
+    else:
+        freeze_module(model.pn_tracker, False)
+        print("  [Freeze] pn_tracker ACTIVE")
+
+    # theta_updater and pilot are always trainable
+    freeze_module(model.theta_updater, False)
+    freeze_module(model.pilot, False)
+
+
+# =============================================================================
 # Single Stage Training
 # =============================================================================
 
 def train_one_stage(
-    cfg: TrainConfig,
-    stage_cfg: Optional[StageConfig] = None,
-    model: Optional[GABVNet] = None,
-    prev_ckpt: Optional[str] = None,
+        cfg: TrainConfig,
+        stage_cfg: Optional[StageConfig] = None,
+        model: Optional[GABVNet] = None,
+        prev_ckpt: Optional[str] = None,
 ) -> Tuple[GABVNet, str]:
     """
     Train one stage of curriculum learning.
@@ -222,9 +467,12 @@ def train_one_stage(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
+    # Move THETA_SCALE to device
+    theta_scale = THETA_SCALE.to(device)
+
     # Use default stage config if not provided
     if stage_cfg is None:
-        stages = get_curriculum_stages(cfg.n_steps)
+        stages = get_simple_curriculum_stages(cfg.n_steps)
         stage_cfg = stages[cfg.stage - 1]
 
     print(f"\n{'=' * 60}")
@@ -233,7 +481,7 @@ def train_one_stage(
     print(f"Theta noise std: {stage_cfg.theta_noise_std}")
     print(f"Enable theta update: {stage_cfg.enable_theta_update}")
     print(f"Loss weights: comm={stage_cfg.loss_weight_comm}, "
-          f"sens={stage_cfg.loss_weight_sens}, bcrlb={stage_cfg.loss_weight_bcrlb}")
+          f"sens={stage_cfg.loss_weight_sens}, prior={stage_cfg.loss_weight_prior}")
     print(f"{'=' * 60}\n")
 
     # Set random seed
@@ -257,20 +505,30 @@ def train_one_stage(
 
     model.to(device)
 
-    # Create optimizer with different LR for theta updater
+    # [NEW] Apply freeze schedule
+    apply_freeze_schedule(model, stage_cfg)
+
+    # [FIX] Create optimizer with SAME LR for theta updater (was 5x, now 1x)
     theta_params = []
     other_params = []
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # Skip frozen params
         if 'theta_updater' in name:
             theta_params.append(param)
         else:
             other_params.append(param)
 
     base_lr = cfg.lr * stage_cfg.lr_multiplier
+
+    # [FIX] theta_params now use SAME lr as others (was 5x)
     optimizer = optim.AdamW([
         {'params': other_params, 'lr': base_lr},
-        {'params': theta_params, 'lr': base_lr * 5},  # Higher LR for theta updater
+        {'params': theta_params, 'lr': base_lr},  # Changed from base_lr * 5
     ], weight_decay=1e-4)
+
+    print(f"[Optimizer] base_lr={base_lr:.6f}, theta_lr={base_lr:.6f}")
+    print(f"[Optimizer] other_params={len(other_params)}, theta_params={len(theta_params)}")
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=stage_cfg.n_steps, eta_min=base_lr * 0.1
@@ -305,18 +563,19 @@ def train_one_stage(
         x_true = torch.from_numpy(data['x_true']).cfloat().to(device)
         theta_true = torch.from_numpy(data['theta_true']).float().to(device)
 
-        # Add theta noise (progressive warmup in Stage 1)
+        # [CRITICAL FIX] Apply theta noise with warmup for ALL stages (not just Stage 1)
         if cfg.debug_mode:
             theta_init = theta_true.clone()
+            warmup_factor = 0.0
         else:
-            # Progressive noise warmup
-            if stage_cfg.stage == 1:
-                warmup_factor = min(1.0, step / max(cfg.theta_noise_warmup_steps, 1))
-            else:
-                warmup_factor = 1.0
+            # Progressive noise warmup - applies to ALL stages now
+            warmup_factor = min(1.0, step / max(cfg.theta_noise_warmup_steps, 1))
 
             theta_noise_std = torch.tensor(stage_cfg.theta_noise_std, device=device)
             theta_init = theta_true + warmup_factor * torch.randn_like(theta_true) * theta_noise_std
+
+        # [NEW] g_theta scheduling - ramp up gradually
+        g_theta_sched = min(1.0, step / max(cfg.g_theta_warmup_steps, 1))
 
         # Construct meta features
         meta_t = construct_meta_features(data['meta'], cfg.batch_size).to(device)
@@ -328,6 +587,7 @@ def train_one_stage(
             'theta_init': theta_init,
             'theta_true': theta_true,
             'meta': meta_t,
+            'g_theta_sched': g_theta_sched,  # Pass to model
         }
 
         optimizer.zero_grad()
@@ -337,33 +597,34 @@ def train_one_stage(
         x_hat = outputs['x_hat']
         theta_hat = outputs['theta_hat']
 
-        # === Compute losses ===
+        # === Compute losses with NORMALIZATION ===
 
-        # Communication loss (MSE on symbols)
-        # Communication loss (MSE on symbols)
+        # Communication loss (MSE on symbols) - unchanged
         loss_comm = F.mse_loss(
             torch.stack([x_hat.real, x_hat.imag], dim=-1),
             torch.stack([x_true.real, x_true.imag], dim=-1)
         )
 
-        # Sensing loss (MSE on theta)
-        loss_sens = F.mse_loss(theta_hat, theta_true)
+        # [CRITICAL FIX] Sensing loss with NORMALIZATION
+        loss_sens, sens_metrics = compute_normalized_sensing_loss(
+            theta_hat, theta_true, device
+        )
 
-        # BCRLB regularization
-        snr_weight = torch.sigmoid(torch.tensor((sim_cfg.snr_db - 10) / 5))
-        loss_bcrlb = snr_weight * F.mse_loss(theta_hat, theta_init)
+        # [FIX] Prior loss (renamed from BCRLB - correct terminology)
+        loss_prior = compute_prior_loss(
+            theta_hat, theta_init, stage_cfg.theta_noise_std, device
+        )
 
-        # [NEW B-lite] Wiener prior loss from PN tracker
-        # This is accumulated across layers in the forward pass
-        loss_wiener = outputs.get('wiener_loss', torch.tensor(0.0))
+        # Wiener prior loss from PN tracker
+        loss_wiener = outputs.get('wiener_loss', torch.tensor(0.0, device=device))
 
         # Total loss with all components
         loss = (stage_cfg.loss_weight_comm * loss_comm +
                 stage_cfg.loss_weight_sens * loss_sens +
-                stage_cfg.loss_weight_bcrlb * loss_bcrlb +
-                0.1 * loss_wiener)  # Wiener prior weight
+                stage_cfg.loss_weight_prior * loss_prior +
+                0.1 * loss_wiener)
 
-        # Backward pass
+        # Backward pass with gradient clipping
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -372,7 +633,6 @@ def train_one_stage(
         # === Compute metrics ===
         with torch.no_grad():
             ber = compute_ber(x_hat.cpu().numpy(), data['x_true'])
-            rmse_R = torch.sqrt(F.mse_loss(theta_hat[:, 0], theta_true[:, 0])).item()
 
             # Get gate values from last layer
             last_layer = outputs['layers'][-1]
@@ -382,17 +642,30 @@ def train_one_stage(
             # Get theta update info if available
             theta_info = last_layer.get('theta_info', {})
             delta_R = theta_info.get('delta_R', 0.0)
+            delta_v = theta_info.get('delta_v', 0.0)
+            delta_a = theta_info.get('delta_a', 0.0)
+            accept_rate = theta_info.get('accept_rate', 1.0)
+            g_theta_eff = theta_info.get('g_theta_effective', g_theta)
 
         metrics_history.append({
             'step': step,
             'loss': loss.item(),
             'loss_comm': loss_comm.item(),
             'loss_sens': loss_sens.item(),
+            'loss_prior': loss_prior.item(),
             'ber': ber,
-            'rmse_R': rmse_R,
+            'rmse_R': sens_metrics['rmse_R'],
+            'rmse_v': sens_metrics['rmse_v'],
+            'rmse_a': sens_metrics['rmse_a'],
             'g_pn': g_pn,
             'g_theta': g_theta,
+            'g_theta_eff': g_theta_eff,
             'delta_R': delta_R,
+            'delta_v': delta_v,
+            'delta_a': delta_a,
+            'accept_rate': accept_rate,
+            'warmup_factor': warmup_factor,
+            'g_theta_sched': g_theta_sched,
             'snr_db': sim_cfg.snr_db,
         })
 
@@ -400,9 +673,10 @@ def train_one_stage(
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
             'BER': f'{ber:.4f}',
-            'RMSE': f'{rmse_R:.1f}m',
+            'RMSE_R': f'{sens_metrics["rmse_R"]:.1f}m',
             'g_θ': f'{g_theta:.3f}',
             'ΔR': f'{delta_R:.1f}',
+            'acc': f'{accept_rate:.2f}',
         })
 
         # Periodic logging
@@ -410,17 +684,18 @@ def train_one_stage(
             recent = metrics_history[-200:]
             avg_loss = np.mean([m['loss'] for m in recent])
             avg_ber = np.mean([m['ber'] for m in recent])
-            avg_rmse = np.mean([m['rmse_R'] for m in recent])
+            avg_rmse_R = np.mean([m['rmse_R'] for m in recent])
             avg_g_theta = np.mean([m['g_theta'] for m in recent])
+            avg_accept = np.mean([m['accept_rate'] for m in recent])
             print(f"\n  [Step {step}] loss={avg_loss:.4f}, BER={avg_ber:.4f}, "
-                  f"RMSE_R={avg_rmse:.1f}m, g_theta={avg_g_theta:.4f}")
+                  f"RMSE_R={avg_rmse_R:.1f}m, g_theta={avg_g_theta:.4f}, accept={avg_accept:.2f}")
 
     # === Check MC diversity ===
     gamma_effs = [simulate_batch(SimConfig(), 1, seed=None)['meta']['gamma_eff']
                   for _ in range(1000)]
     unique_gamma = len(set([f'{g:.6f}' for g in gamma_effs]))
     print(f"\n[MC Diversity Check] Unique gamma_eff values: {unique_gamma}/1000 "
-          f"({unique_gamma/10:.1f}%) {'✓' if unique_gamma > 900 else '✗'}")
+          f"({unique_gamma / 10:.1f}%) {'✓' if unique_gamma > 900 else '✗'}")
 
     # === Save checkpoint ===
     timestamp = int(time.time())
@@ -439,7 +714,7 @@ def train_one_stage(
             'theta_noise_std': stage_cfg.theta_noise_std,
             'enable_theta_update': stage_cfg.enable_theta_update,
         },
-        'version': 'v4.1_curriculum',
+        'version': 'v5.0_stable',
         'metrics': metrics_history[-100:],
     }, ckpt_path)
 
@@ -454,7 +729,7 @@ def train_one_stage(
     df.to_csv(ckpt_dir / "metrics.csv", index=False)
 
     print(f"[Result] Saved training curves to {ckpt_dir}/")
-    print(f"Training Complete.  Stage {stage_cfg.stage} complete. Global step: {stage_cfg.n_steps}")
+    print(f"Training Complete. Stage {stage_cfg.stage} complete.")
 
     return model, str(ckpt_path)
 
@@ -463,52 +738,73 @@ def save_training_curves(metrics: List[Dict], out_dir: Path, name: str):
     """Save training curves as plots."""
     df = pd.DataFrame(metrics)
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     fig.suptitle(f'Training Curves: {name}', fontsize=14)
 
-    # Loss
+    # Row 0: Losses
     axes[0, 0].plot(df['step'], df['loss'], alpha=0.7, linewidth=0.8)
     axes[0, 0].set_xlabel('Step')
     axes[0, 0].set_ylabel('Loss')
     axes[0, 0].set_title('Total Loss')
     axes[0, 0].grid(True, alpha=0.3)
 
-    # BER
-    axes[0, 1].semilogy(df['step'], df['ber'], alpha=0.7, linewidth=0.8)
+    axes[0, 1].plot(df['step'], df['loss_comm'], alpha=0.7, linewidth=0.8, label='comm')
+    axes[0, 1].plot(df['step'], df['loss_sens'], alpha=0.7, linewidth=0.8, label='sens')
+    axes[0, 1].plot(df['step'], df['loss_prior'], alpha=0.7, linewidth=0.8, label='prior')
     axes[0, 1].set_xlabel('Step')
-    axes[0, 1].set_ylabel('BER')
-    axes[0, 1].set_title('Bit Error Rate')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].set_title('Loss Components')
+    axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
-    # RMSE_R
-    axes[0, 2].plot(df['step'], df['rmse_R'], alpha=0.7, linewidth=0.8)
+    axes[0, 2].semilogy(df['step'], df['ber'], alpha=0.7, linewidth=0.8)
     axes[0, 2].set_xlabel('Step')
-    axes[0, 2].set_ylabel('RMSE_R (m)')
-    axes[0, 2].set_title('Range RMSE')
+    axes[0, 2].set_ylabel('BER')
+    axes[0, 2].set_title('Bit Error Rate')
     axes[0, 2].grid(True, alpha=0.3)
 
-    # g_PN
-    axes[1, 0].plot(df['step'], df['g_pn'], alpha=0.7, linewidth=0.8)
+    # Row 1: RMSE components
+    axes[1, 0].plot(df['step'], df['rmse_R'], alpha=0.7, linewidth=0.8)
     axes[1, 0].set_xlabel('Step')
-    axes[1, 0].set_ylabel('g_PN')
-    axes[1, 0].set_title('PN Gate')
-    axes[1, 0].set_ylim([0, 1])
+    axes[1, 0].set_ylabel('RMSE_R (m)')
+    axes[1, 0].set_title('Range RMSE')
     axes[1, 0].grid(True, alpha=0.3)
 
-    # g_theta
-    axes[1, 1].plot(df['step'], df['g_theta'], alpha=0.7, linewidth=0.8)
+    axes[1, 1].plot(df['step'], df['rmse_v'], alpha=0.7, linewidth=0.8)
     axes[1, 1].set_xlabel('Step')
-    axes[1, 1].set_ylabel('g_theta')
-    axes[1, 1].set_title('Theta Gate')
-    axes[1, 1].set_ylim([0, 1])
+    axes[1, 1].set_ylabel('RMSE_v (m/s)')
+    axes[1, 1].set_title('Velocity RMSE')
     axes[1, 1].grid(True, alpha=0.3)
 
-    # delta_R
-    axes[1, 2].plot(df['step'], df['delta_R'], alpha=0.7, linewidth=0.8)
+    axes[1, 2].plot(df['step'], df['rmse_a'], alpha=0.7, linewidth=0.8)
     axes[1, 2].set_xlabel('Step')
-    axes[1, 2].set_ylabel('delta_R (m)')
-    axes[1, 2].set_title('Theta Update (ΔR)')
+    axes[1, 2].set_ylabel('RMSE_a (m/s²)')
+    axes[1, 2].set_title('Acceleration RMSE')
     axes[1, 2].grid(True, alpha=0.3)
+
+    # Row 2: Gates and deltas
+    axes[2, 0].plot(df['step'], df['g_pn'], alpha=0.7, linewidth=0.8, label='g_PN')
+    axes[2, 0].plot(df['step'], df['g_theta'], alpha=0.7, linewidth=0.8, label='g_θ')
+    axes[2, 0].plot(df['step'], df['g_theta_eff'], alpha=0.7, linewidth=0.8, label='g_θ_eff')
+    axes[2, 0].set_xlabel('Step')
+    axes[2, 0].set_ylabel('Gate Value')
+    axes[2, 0].set_title('Gates')
+    axes[2, 0].set_ylim([0, 1])
+    axes[2, 0].legend()
+    axes[2, 0].grid(True, alpha=0.3)
+
+    axes[2, 1].plot(df['step'], df['delta_R'], alpha=0.7, linewidth=0.8)
+    axes[2, 1].set_xlabel('Step')
+    axes[2, 1].set_ylabel('delta_R (m)')
+    axes[2, 1].set_title('Theta Update (ΔR)')
+    axes[2, 1].grid(True, alpha=0.3)
+
+    axes[2, 2].plot(df['step'], df['accept_rate'], alpha=0.7, linewidth=0.8)
+    axes[2, 2].set_xlabel('Step')
+    axes[2, 2].set_ylabel('Accept Rate')
+    axes[2, 2].set_title('Acceptance Rate')
+    axes[2, 2].set_ylim([0, 1])
+    axes[2, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(out_dir / f'train_curve_{name}.png', dpi=150, bbox_inches='tight')
@@ -520,25 +816,36 @@ def save_training_curves(metrics: List[Dict], out_dir: Path, name: str):
 # Curriculum Learning
 # =============================================================================
 
-def run_curriculum(cfg: TrainConfig, stages: List[int] = [1, 2, 3]):
+def run_curriculum(cfg: TrainConfig, stages: List[int] = [1, 2, 3], use_extended: bool = False):
     """
     Run curriculum learning through specified stages.
 
-    Each stage builds on the previous stage's checkpoint.
+    Args:
+        cfg: Training configuration
+        stages: List of stage numbers to run
+        use_extended: If True, use 4-stage (freeze/unfreeze) curriculum
     """
     print("\n" + "=" * 70)
     print("CURRICULUM LEARNING")
     print(f"Stages: {stages}")
     print(f"Steps per stage: {cfg.n_steps}")
+    print(f"Extended (freeze/unfreeze): {use_extended}")
     print("=" * 70)
 
-    stage_configs = get_curriculum_stages(cfg.n_steps)
+    if use_extended:
+        stage_configs = get_curriculum_stages(cfg.n_steps)
+    else:
+        stage_configs = get_simple_curriculum_stages(cfg.n_steps)
 
     model = None
     prev_ckpt = None
     global_step = 0
 
     for stage_num in stages:
+        if stage_num > len(stage_configs):
+            print(f"[Warning] Stage {stage_num} not defined, skipping")
+            continue
+
         stage_cfg = stage_configs[stage_num - 1]
 
         model, ckpt_path = train_one_stage(
@@ -566,13 +873,14 @@ def run_curriculum(cfg: TrainConfig, stages: List[int] = [1, 2, 3]):
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GA-BV-Net Training (Expert v4.1)")
+    parser = argparse.ArgumentParser(description="GA-BV-Net Training (Expert v5.0 Stable)")
     parser.add_argument("--stage", type=int, default=1, help="Single stage to run (1, 2, or 3)")
     parser.add_argument("--steps", type=int, default=1000, help="Steps per stage")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=0.002, help="Base learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--curriculum", action="store_true", help="Run stages 1→2→3")
+    parser.add_argument("--extended", action="store_true", help="Use extended 4-stage curriculum")
     parser.add_argument("--no-hw-random", action="store_true", help="Disable hardware randomization")
     parser.add_argument("--debug", action="store_true", help="Debug mode: theta_init = theta_true")
     parser.add_argument("--theta-warmup", type=int, default=500, help="Theta noise warmup steps")
@@ -593,19 +901,24 @@ if __name__ == "__main__":
 
     # Print configuration summary
     print("\n" + "=" * 60)
-    print("GA-BV-Net Training (Expert Fixed v4.1)")
+    print("GA-BV-Net Training (Expert Fixed v5.0 - Stable)")
     print("=" * 60)
     print(f"Mode: {'Curriculum (1→2→3)' if args.curriculum else f'Single Stage {cfg.stage}'}")
+    print(f"Extended curriculum: {args.extended}")
     print(f"Steps per stage: {cfg.n_steps}")
     print(f"Batch size: {cfg.batch_size}")
     print(f"Learning rate: {cfg.lr}")
     print(f"Hardware randomization: {cfg.randomize_hardware}")
     print(f"Debug Mode: {cfg.debug_mode}")
+    print(f"Theta warmup steps: {cfg.theta_noise_warmup_steps}")
     if cfg.debug_mode:
         print("  → theta_init = theta_true (NO NOISE)")
     print("=" * 60 + "\n")
 
     if args.curriculum:
-        run_curriculum(cfg, stages=[1, 2, 3])
+        if args.extended:
+            run_curriculum(cfg, stages=[1, 2, 3, 4], use_extended=True)
+        else:
+            run_curriculum(cfg, stages=[1, 2, 3], use_extended=False)
     else:
         train_one_stage(cfg)
