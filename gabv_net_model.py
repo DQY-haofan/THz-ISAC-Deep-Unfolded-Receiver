@@ -710,14 +710,15 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         # === Step 8: Acceptance Test ===
         # Use Bussgang-linearized residual for consistent comparison
-        # Note: x_est and y_obs are now pilots only (truncated by caller)
+        # Note: We use pilot-only data (first N symbols) for acceptance test
         y_pred_old = phys_enc.forward_operator(x_est, theta)[:, :N]
         y_pred_new = phys_enc.forward_operator(x_est, theta_clamped)[:, :N]
 
         # Bussgang-linearized residual (consistent with score computation)
-        y_tilde_old = y_obs / (alpha + 1e-6)
-        resid_old = torch.mean(torch.abs(y_tilde_old - y_pred_old)**2, dim=1, keepdim=True)
-        resid_new = torch.mean(torch.abs(y_tilde_old - y_pred_new)**2, dim=1, keepdim=True)
+        # Use y_obs_pilot (already defined above as y_obs[:, :N])
+        y_tilde_for_accept = y_obs_pilot / (alpha + 1e-6)
+        resid_old = torch.mean(torch.abs(y_tilde_for_accept - y_pred_old)**2, dim=1, keepdim=True)
+        resid_new = torch.mean(torch.abs(y_tilde_for_accept - y_pred_new)**2, dim=1, keepdim=True)
 
         # Accept if new residual is better (with small tolerance)
         accept = (resid_new < resid_old * (1 + self.acceptance_relaxation)).float()
