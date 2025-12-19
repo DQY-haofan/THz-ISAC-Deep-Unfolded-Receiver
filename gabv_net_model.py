@@ -502,9 +502,9 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         # BCRLB-based scaling for converting step sizes to physical units
         # With unit-normalized score, step_size × bcrlb_scale gives physical delta
-        # We want delta ~ 0.1 samples for tau, ~10 m/s for v, ~1 m/s² for a
+        # INCREASED tau step size to allow meaningful updates per layer
         self.register_buffer('bcrlb_scale', torch.tensor([
-            0.1 / cfg.fs,  # 0.1 samples = 1e-11 s for 10GHz
+            0.5 / cfg.fs,  # 0.5 samples = 5e-11 s for 10GHz (INCREASED from 0.1)
             10.0,          # 10 m/s
             1.0,           # 1 m/s²
         ]))
@@ -516,9 +516,9 @@ class ScoreBasedThetaUpdater(nn.Module):
         self.register_buffer('theta_max', torch.tensor([tau_bound, 1e4, 100.0]))
 
         # Max delta per iteration (for stability)
-        # Tied to physical resolution: ~0.1 sample for tau
+        # INCREASED tau limit to allow faster convergence
         self.register_buffer('max_delta', torch.tensor([
-            0.1 / cfg.fs,   # 0.1 sample period (10ps for 10GHz)
+            0.2 / cfg.fs,   # 0.2 sample period (INCREASED from 0.1)
             100.0,          # 100 m/s per iteration
             10.0,           # 10 m/s² per iteration
         ]))
@@ -688,8 +688,12 @@ class ScoreBasedThetaUpdater(nn.Module):
         step_sizes = step_sizes * self.bcrlb_scale.unsqueeze(0)
 
         # === Step 5: Compute Delta ===
-        # delta_theta = -μ × score (negative because we want to minimize residual)
-        delta_theta = -step_sizes * score
+        # Gradient descent on L = ||y_tilde - y_pred(θ)||²:
+        #   ∂L/∂θ = -2 Re(<∂y_pred/∂θ, residual>)
+        #   Δθ = -∂L/∂θ = +2 Re(<∂y_pred/∂θ, residual>) ∝ +score
+        #
+        # So: delta_theta = +μ × score (POSITIVE sign for gradient descent!)
+        delta_theta = step_sizes * score  # FIXED: was negative, should be positive
 
         # Clamp delta to physical limits
         delta_theta = torch.clamp(delta_theta, -self.max_delta, self.max_delta)
