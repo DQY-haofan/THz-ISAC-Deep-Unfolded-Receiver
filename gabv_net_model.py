@@ -417,6 +417,9 @@ class RiemannianPNTracker(nn.Module):
 class PilotNavigator(nn.Module):
     """
     Computes adaptive gates based on pilots and meta features.
+
+    Important: g_theta must be initialized to a reasonable value (not ~0)
+    otherwise theta update will be ineffective from the start.
     """
 
     def __init__(self, cfg: GABVConfig):
@@ -426,12 +429,18 @@ class PilotNavigator(nn.Module):
             nn.Linear(cfg.meta_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 4),  # [g_data, g_prior, g_pn, g_theta]
-            nn.Sigmoid(),
         )
+
+        # Initialize bias of last layer so that Sigmoid outputs ~0.5 initially
+        # Sigmoid(0) = 0.5, so we want bias ≈ 0
+        # But for g_theta (index 3), we want it higher initially, so bias > 0
+        with torch.no_grad():
+            self.gate_net[-1].bias.data = torch.tensor([0.0, 0.0, 0.0, 1.0])  # g_theta starts at Sigmoid(1) ≈ 0.73
 
     def forward(self, meta: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute gates from meta features."""
-        gates = self.gate_net(meta.float())
+        logits = self.gate_net(meta.float())
+        gates = torch.sigmoid(logits)
 
         return {
             'g_data': gates[:, 0:1],
@@ -556,7 +565,7 @@ class ScoreBasedThetaUpdater(nn.Module):
 
     def forward(self,
                 theta: torch.Tensor,
-                residual: torch.Tensor,
+                residual: torch.Tensor,  # NOTE: This is ignored, we compute our own
                 x_est: torch.Tensor,
                 g_theta: torch.Tensor,
                 phys_enc: PhysicsEncoder,
@@ -567,13 +576,16 @@ class ScoreBasedThetaUpdater(nn.Module):
         """
         Update theta using score-based descent with BCRLB-aware scaling.
 
+        CRITICAL: We compute residual in OBSERVATION domain (quantized)
+        to ensure score direction is correct.
+
         Args:
             theta: Current estimate [B, 3]
-            residual: [B, N] residual (y - H(θ)×x̂)
+            residual: [B, N] (IGNORED - we compute our own)
             x_est: [B, N] symbol estimate
             g_theta: [B, 1] gate from pilot navigator
             phys_enc: Physics encoder for Jacobian
-            y_obs: [B, N] observed signal for acceptance test
+            y_obs: [B, N] observed signal (quantized)
             g_theta_sched: Scheduling factor (0→1 during warmup)
             snr_db: SNR in dB for BCRLB scaling
 
@@ -587,11 +599,17 @@ class ScoreBasedThetaUpdater(nn.Module):
         # === Step 1: Compute Jacobian ===
         dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
 
-        # === Step 2: Compute Score (Gauss-Newton direction) ===
-        score = self.compute_score(residual, dy_dtheta)  # [B, 3]
+        # === Step 2: Compute OBSERVATION DOMAIN residual (CRITICAL!) ===
+        # The score formula requires r = y - H(θ)x̂ in observation domain
+        y_pred = phys_enc.forward_operator(x_est, theta)
+        y_pred_q = quantize_1bit_torch(y_pred)
+        obs_residual = y_obs - y_pred_q  # Quantization-consistent residual
 
-        # === Step 3: Build Features ===
-        residual_power = torch.mean(torch.abs(residual)**2, dim=1, keepdim=True)
+        # === Step 3: Compute Score (Gauss-Newton direction) ===
+        score = self.compute_score(obs_residual, dy_dtheta)  # [B, 3]
+
+        # === Step 4: Build Features ===
+        residual_power = torch.mean(torch.abs(obs_residual)**2, dim=1, keepdim=True)
         log_power = torch.log10(residual_power + 1e-10)
 
         score_magnitude = torch.abs(score)  # [B, 3]
@@ -634,11 +652,15 @@ class ScoreBasedThetaUpdater(nn.Module):
         delta_theta = torch.clamp(delta_theta, -self.max_delta, self.max_delta)
 
         # === Step 6: Apply Gate and Scheduling ===
+        # Simplified gate: just use g_theta and scheduling
+        # Removed confidence_gate which may be blocking updates when x_est is noisy
         effective_gate = g_theta * g_theta_sched
-        confidence_gate = torch.sigmoid((confidence - self.confidence_threshold) * 10)
-        combined_gate = effective_gate * confidence_gate
 
-        theta_candidate = theta + combined_gate * delta_theta
+        # Minimum gate to ensure some update happens
+        min_gate = 0.1  # At least 10% of the update
+        effective_gate = torch.maximum(effective_gate, torch.tensor(min_gate, device=device))
+
+        theta_candidate = theta + effective_gate * delta_theta
 
         # === Step 7: Clamp to Bounds ===
         theta_clamped = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
@@ -673,7 +695,7 @@ class ScoreBasedThetaUpdater(nn.Module):
             'score': score.detach(),
             'step_sizes': step_sizes.detach(),
             'delta_theta': delta_theta.detach(),
-            'effective_gate': combined_gate.mean().item(),
+            'effective_gate': effective_gate.mean().item(),
             'accept_rate': accept.mean().item(),
             'soft_accept': soft_accept.mean().item(),
             'delta_tau': delta_theta[:, 0].abs().mean().item(),

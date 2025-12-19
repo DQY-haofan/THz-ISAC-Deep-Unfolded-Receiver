@@ -1,174 +1,220 @@
 #!/usr/bin/env python3
 """
-debug_model.py - Debug GA-BV-Net model flow
+debug_theta_updater.py - Diagnose why theta update is not working
 
-This script tests each component to find where BER becomes 0.5
+Key observations from evaluation:
+- g_theta = 0.005-0.07 (almost zero!)
+- RMSE_τ ≈ init (no improvement)
+- Curve C ≈ Curve B (theta update has no effect)
+
+This script will check each component of theta updater.
 """
 
+import torch
 import numpy as np
-import sys
+import math
 
-# Check torch
-try:
-    import torch
-
-    HAS_TORCH = True
-except ImportError:
-    print("PyTorch not available!")
-    HAS_TORCH = False
-    sys.exit(1)
-
+# Local imports
+from gabv_net_model import GABVNet, GABVConfig, create_gabv_model, PhysicsEncoder, quantize_1bit_torch
 from thz_isac_world import SimConfig, simulate_batch
 
 
-def compute_ber(x_hat, x_true):
-    """Compute QPSK BER correctly."""
-    if isinstance(x_hat, torch.Tensor):
-        x_hat = x_hat.detach().numpy()
-    if isinstance(x_true, torch.Tensor):
-        x_true = x_true.detach().numpy()
+def main():
+    print("=" * 70)
+    print("THETA UPDATER DIAGNOSTIC")
+    print("=" * 70)
 
-    # I bits
-    ber_I = np.mean((np.real(x_hat) > 0) != (np.real(x_true) > 0))
-    # Q bits
-    ber_Q = np.mean((np.imag(x_hat) > 0) != (np.imag(x_true) > 0))
-    return (ber_I + ber_Q) / 2
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+
+    # Create model
+    cfg = GABVConfig(enable_theta_update=True)
+    model = create_gabv_model(cfg).to(device)
+    model.eval()
+
+    # Generate test data
+    sim_cfg = SimConfig(snr_db=20.0)
+    data = simulate_batch(sim_cfg, batch_size=4, seed=42)
+
+    y_q = torch.from_numpy(data['y_q']).to(device)
+    x_true = torch.from_numpy(data['x_true']).to(device)
+    theta_true = torch.from_numpy(data['theta_true']).float().to(device)
+
+    # Add theta noise (0.5 samples)
+    Ts = 1e-10
+    noise_std = torch.tensor([0.5 * Ts, 50.0, 5.0], device=device)
+    theta_init = theta_true + torch.randn_like(theta_true) * noise_std
+
+    print(f"\n[Data]")
+    print(f"  theta_true[0]: tau={theta_true[0, 0] / Ts:.3f} samples, v={theta_true[0, 1]:.1f} m/s")
+    print(f"  theta_init[0]: tau={theta_init[0, 0] / Ts:.3f} samples, v={theta_init[0, 1]:.1f} m/s")
+    print(f"  theta_error[0]: tau={abs(theta_init[0, 0] - theta_true[0, 0]) / Ts:.3f} samples")
+
+    # === Check 1: Meta features ===
+    print(f"\n[Check 1: Meta Features]")
+    snr_db = sim_cfg.snr_db
+    snr_db_norm = (snr_db - 15) / 15
+    gamma_eff = data['meta'].get('gamma_eff', 1.0)
+    gamma_eff_db = 10 * np.log10(max(gamma_eff, 1e-6))
+    gamma_eff_db_norm = (gamma_eff_db - 10) / 20
+    chi = data['meta'].get('chi', 1.0)
+
+    meta_np = np.array([
+        snr_db_norm,  # -0.33 to 0.67 for SNR -5 to 25
+        gamma_eff_db_norm,  # normalized gamma_eff
+        chi,  # Bussgang factor
+        0.0,  # sigma_eta_norm
+        np.log10(100e3) / np.log10(1e6),  # pn_linewidth_norm
+        0.0,  # ibo_db_norm
+    ], dtype=np.float32)
+    meta = torch.from_numpy(np.tile(meta_np, (4, 1))).to(device)
+
+    print(f"  meta[0]: {meta[0].cpu().numpy()}")
+    print(f"  snr_db_norm: {snr_db_norm:.3f}")
+
+    # === Check 2: Gate Network Output ===
+    print(f"\n[Check 2: Gate Network (PilotNavigator)]")
+    gates = model.pilot(meta)
+    print(f"  g_data:  {gates['g_data'].mean().item():.4f}")
+    print(f"  g_prior: {gates['g_prior'].mean().item():.4f}")
+    print(f"  g_pn:    {gates['g_pn'].mean().item():.4f}")
+    print(f"  g_theta: {gates['g_theta'].mean().item():.4f}")
+
+    if gates['g_theta'].mean().item() < 0.1:
+        print(f"  ⚠️ WARNING: g_theta too small! Theta update will be ineffective.")
+        print(f"     This is likely the ROOT CAUSE of the problem.")
+
+    # === Check 3: Theta Updater Internals ===
+    print(f"\n[Check 3: Theta Updater Internals]")
+
+    # Run forward pass to get x_est
+    with torch.no_grad():
+        z = model.phys_enc.adjoint_operator(y_q, theta_init)
+        z_derotated, phi_est = model.pn_tracker(z, meta, x_true[:, :64])
+
+        # Get x_est from one VAMP layer
+        gamma = torch.ones(4, 1, device=device)
+        z_vamp, x_est = model.solver_layers[0](z_derotated, gamma, model.phys_enc, theta_init)
+
+        # Compute residual manually
+        y_pred = model.phys_enc.forward_operator(x_est, theta_init)
+        y_pred_q = quantize_1bit_torch(y_pred)
+        residual = y_q - y_pred_q
+
+        print(f"  x_est amplitude: {torch.abs(x_est).mean().item():.6f}")
+        print(f"  residual power: {torch.mean(torch.abs(residual) ** 2).item():.6f}")
+
+        # Compute Jacobian
+        dy_dtheta = model.phys_enc.compute_channel_jacobian(theta_init, x_est)
+        dy_dtau, dy_dv, dy_da = dy_dtheta
+
+        print(f"  |dy/dtau|: {torch.abs(dy_dtau).mean().item():.6e}")
+        print(f"  |dy/dv|:   {torch.abs(dy_dv).mean().item():.6e}")
+        print(f"  |dy/da|:   {torch.abs(dy_da).mean().item():.6e}")
+
+        # Compute score
+        eps = 1e-8
+        inner_tau = torch.real(torch.sum(torch.conj(dy_dtau) * residual, dim=1, keepdim=True))
+        norm_tau = torch.sum(torch.abs(dy_dtau) ** 2, dim=1, keepdim=True) + eps
+        score_tau = inner_tau / norm_tau
+
+        inner_v = torch.real(torch.sum(torch.conj(dy_dv) * residual, dim=1, keepdim=True))
+        norm_v = torch.sum(torch.abs(dy_dv) ** 2, dim=1, keepdim=True) + eps
+        score_v = inner_v / norm_v
+
+        print(f"  score_tau: {score_tau.mean().item():.6e}")
+        print(f"  score_v:   {score_v.mean().item():.6e}")
+
+        # Compute step sizes from network
+        residual_power = torch.mean(torch.abs(residual) ** 2, dim=1, keepdim=True)
+        log_power = torch.log10(residual_power + 1e-10)
+        score_magnitude = torch.abs(torch.cat([score_tau, score_v, score_v], dim=1))
+
+        x_est_amplitude = torch.mean(torch.abs(x_est), dim=1, keepdim=True).clamp(min=1e-6)
+        x_est_normalized = x_est / x_est_amplitude
+        confidence = 1.0 - torch.mean(
+            torch.abs(torch.abs(x_est_normalized.real) - 1 / math.sqrt(2)) ** 2 +
+            torch.abs(torch.abs(x_est_normalized.imag) - 1 / math.sqrt(2)) ** 2,
+            dim=1, keepdim=True
+        )
+        confidence = torch.clamp(confidence, 0, 1)
+
+        snr_norm = torch.tensor([[(snr_db - 15) / 15]], device=device).expand(4, 1)
+
+        feat = torch.cat([
+            log_power, score_magnitude, gates['g_theta'], confidence, snr_norm
+        ], dim=1).float()
+
+        print(f"  feat[0]: {feat[0].cpu().numpy()}")
+        print(f"  confidence: {confidence.mean().item():.4f}")
+
+        step_sizes = model.theta_updater.step_net(feat)
+        print(f"  step_sizes (raw): {step_sizes[0].cpu().numpy()}")
+
+        step_sizes_scaled = step_sizes * model.theta_updater.bcrlb_scale.unsqueeze(0)
+        print(f"  step_sizes (scaled): {step_sizes_scaled[0].cpu().numpy()}")
+
+        # Compute delta
+        score = torch.cat([score_tau, score_v, score_v], dim=1)
+        delta_theta = -step_sizes_scaled * score
+        print(
+            f"  delta_theta (raw): tau={delta_theta[0, 0].item() / Ts:.6f} samples, v={delta_theta[0, 1].item():.6f} m/s")
+
+        # Apply clamp
+        delta_theta_clamped = torch.clamp(delta_theta, -model.theta_updater.max_delta, model.theta_updater.max_delta)
+        print(
+            f"  delta_theta (clamped): tau={delta_theta_clamped[0, 0].item() / Ts:.6f} samples, v={delta_theta_clamped[0, 1].item():.6f} m/s")
+
+        # Apply gate
+        effective_gate = gates['g_theta'] * 1.0  # g_theta_sched = 1.0
+        confidence_gate = torch.sigmoid((confidence - 0.3) * 10)
+        combined_gate = effective_gate * confidence_gate
+        print(f"  combined_gate: {combined_gate.mean().item():.4f}")
+
+        delta_theta_gated = combined_gate * delta_theta_clamped
+        print(
+            f"  delta_theta (gated): tau={delta_theta_gated[0, 0].item() / Ts:.6f} samples, v={delta_theta_gated[0, 1].item():.6f} m/s")
+
+        # Final update
+        theta_new = theta_init + delta_theta_gated
+        print(f"\n  theta_init[0]:  tau={theta_init[0, 0].item() / Ts:.6f} samples")
+        print(f"  theta_new[0]:   tau={theta_new[0, 0].item() / Ts:.6f} samples")
+        print(f"  theta_true[0]:  tau={theta_true[0, 0].item() / Ts:.6f} samples")
+
+        improvement = abs(theta_init[0, 0] - theta_true[0, 0]) - abs(theta_new[0, 0] - theta_true[0, 0])
+        print(f"  improvement: {improvement.item() / Ts:.6f} samples ({'better' if improvement > 0 else 'WORSE'})")
+
+    # === Summary ===
+    print(f"\n" + "=" * 70)
+    print("DIAGNOSIS SUMMARY")
+    print("=" * 70)
+
+    issues = []
+
+    if gates['g_theta'].mean().item() < 0.2:
+        issues.append("g_theta too small (gate almost closed)")
+
+    if confidence.mean().item() < 0.5:
+        issues.append("confidence too low (confidence gate reduces update)")
+
+    if abs(delta_theta_gated[0, 0].item()) < 1e-14:
+        issues.append("delta_theta_gated ≈ 0 (no update happening)")
+
+    if improvement < 0:
+        issues.append("theta update made things WORSE")
+
+    if not issues:
+        print("  No obvious issues found. May need deeper investigation.")
+    else:
+        print("  ISSUES FOUND:")
+        for i, issue in enumerate(issues, 1):
+            print(f"    {i}. {issue}")
+
+    print("\n[RECOMMENDED FIXES]")
+    print("  1. Initialize g_theta gate to higher value (e.g., 0.5 not ~0)")
+    print("  2. Remove or simplify the gate mechanism during initial training")
+    print("  3. Check if score direction is correct (should point toward theta_true)")
 
 
-# Test simulator output
-print("=" * 60)
-print("DEBUG: GA-BV-Net Model Flow")
-print("=" * 60)
-
-# Generate test data
-cfg = SimConfig(
-    snr_db=30.0,
-    enable_pa=False,
-    enable_pn=False,
-    enable_channel=True,
-    enable_quantization=False,  # No quantization for clarity
-    phi0_random=False,
-    coarse_acquisition_error_samples=0.0,
-)
-data = simulate_batch(cfg, batch_size=4, seed=42)
-
-# Convert to torch
-y = torch.from_numpy(data['y_raw']).to(torch.cfloat)
-x_true = torch.from_numpy(data['x_true']).to(torch.cfloat)
-theta_true = torch.from_numpy(data['theta_true']).float()
-
-print(f"\n[Data Info]")
-print(f"  y shape: {y.shape}")
-print(f"  x_true shape: {x_true.shape}")
-print(f"  theta_true[0]: {theta_true[0].tolist()}")
-print(
-    f"  theta_true format: [tau_res, v, a] = [{theta_true[0, 0]:.2e}s, {theta_true[0, 1]:.0f}m/s, {theta_true[0, 2]:.0f}m/s²]")
-
-# Create PhysicsEncoder
-from gabv_net_model import GABVConfig, PhysicsEncoder
-
-pcfg = GABVConfig()
-phys_enc = PhysicsEncoder(pcfg)
-
-print(f"\n[Test 1: PhysicsEncoder.adjoint_operator]")
-# If theta is exact, adjoint should recover x
-x_recovered = phys_enc.adjoint_operator(y, theta_true)
-
-ber_recovered = compute_ber(x_recovered, x_true)
-print(f"  BER after adjoint (exact theta): {ber_recovered:.4f}")
-
-if ber_recovered < 0.01:
-    print("  ✓ PhysicsEncoder.adjoint works correctly!")
-else:
-    print("  ✗ PhysicsEncoder.adjoint has a problem!")
-
-    # Debug: check Doppler phase
-    v = theta_true[:, 1:2]
-    a = theta_true[:, 2:3]
-    p_t = phys_enc.compute_doppler_phase(v, a)
-
-    # Manual derotation
-    y_derotated_manual = y * torch.conj(p_t)
-    ber_manual = compute_ber(y_derotated_manual, x_true)
-    print(f"  BER after manual Doppler removal: {ber_manual:.4f}")
-
-print(f"\n[Test 2: Forward then Adjoint]")
-# Forward: x -> y_pred
-# Then Adjoint: y_pred -> x_recovered
-y_pred = phys_enc.forward_operator(x_true, theta_true)
-x_roundtrip = phys_enc.adjoint_operator(y_pred, theta_true)
-
-roundtrip_error = torch.mean(torch.abs(x_true - x_roundtrip) ** 2).item()
-print(f"  Round-trip MSE: {roundtrip_error:.6f}")
-if roundtrip_error < 0.001:
-    print("  ✓ Forward-Adjoint is consistent!")
-else:
-    print("  ✗ Forward-Adjoint mismatch!")
-
-print(f"\n[Test 3: Model Forward Pass]")
-from gabv_net_model import GABVNet, GABVConfig
-
-model_cfg = GABVConfig(enable_theta_update=False)
-model = GABVNet(model_cfg)
-model.eval()
-
-# Prepare batch
-meta = torch.zeros(4, model_cfg.meta_dim)
-batch = {
-    'y_q': y,
-    'x_true': x_true,
-    'theta_init': theta_true,
-    'meta': meta,
-}
-
-with torch.no_grad():
-    outputs = model(batch)
-
-x_hat = outputs['x_hat']
-ber_model = compute_ber(x_hat, x_true)
-print(f"  BER from model: {ber_model:.4f}")
-
-if ber_model < 0.2:
-    print("  ✓ Model can estimate symbols!")
-else:
-    print("  ✗ Model fails to estimate symbols!")
-
-    # Debug: check intermediate values
-    print(f"\n  [Debugging model internals]")
-    print(f"  x_hat[0,:5]: {x_hat[0, :5].tolist()}")
-    print(f"  x_true[0,:5]: {x_true[0, :5].tolist()}")
-
-    # Check amplitude mismatch
-    x_hat_amp = torch.abs(x_hat).mean().item()
-    x_true_amp = torch.abs(x_true).mean().item()
-    print(f"  x_hat amplitude: {x_hat_amp:.6f}")
-    print(f"  x_true amplitude: {x_true_amp:.6f}")
-    print(f"  Amplitude ratio: {x_hat_amp / x_true_amp:.2f}")
-
-    # NEW: Test correct order of operations
-    print(f"\n  [Testing correct operation order]")
-    print(f"  CORRECT: adjoint FIRST, then PN tracker")
-
-    # Step 1: adjoint first (removes Doppler)
-    z_adj = phys_enc.adjoint_operator(y, theta_true)
-    ber_after_adj_only = compute_ber(z_adj, x_true)
-    print(f"  BER after adjoint only: {ber_after_adj_only:.4f}")
-
-    # Step 2: PN tracker on adjoint output
-    z_pn, phi = model.pn_tracker(z_adj, meta, x_true[:, :64])
-    ber_after_adj_pn = compute_ber(z_pn, x_true)
-    print(f"  BER after adjoint → PN: {ber_after_adj_pn:.4f}")
-
-    print(f"\n  WRONG: PN tracker first, then adjoint")
-    # Wrong order for comparison
-    y_pn_first, _ = model.pn_tracker(y, meta, x_true[:, :64])
-    ber_pn_first = compute_ber(y_pn_first, x_true)
-    print(f"  BER after PN only: {ber_pn_first:.4f}")
-
-    z_wrong = phys_enc.adjoint_operator(y_pn_first.detach(), theta_true)
-    ber_wrong_order = compute_ber(z_wrong, x_true)
-    print(f"  BER after PN → adjoint: {ber_wrong_order:.4f}")
-
-print("\n" + "=" * 60)
-print("DEBUG COMPLETE")
-print("=" * 60)
+if __name__ == "__main__":
+    main()
