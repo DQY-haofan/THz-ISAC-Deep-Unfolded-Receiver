@@ -65,7 +65,7 @@ class TrainConfig:
     theta_noise_warmup_steps: int = 500
 
     # g_theta scheduling warmup steps
-    g_theta_warmup_steps: int = 300
+    g_theta_warmup_steps: int = 100  # [FIX] Reduced from 300 for faster warmup
 
     # Output
     out_dir: str = "results/checkpoints"
@@ -574,14 +574,6 @@ def train_one_stage(
             theta_noise_std = torch.tensor(stage_cfg.theta_noise_std, device=device)
             theta_init = theta_true + warmup_factor * torch.randn_like(theta_true) * theta_noise_std
 
-        # [DEBUG] Print theta values for first few steps of Stage 2+
-        if step < 3 and stage_cfg.stage >= 2:
-            print(
-                f"\n[DEBUG Step {step}] theta_true[0]: R={theta_true[0, 0].item():.1f}m, v={theta_true[0, 1].item():.2f}m/s, a={theta_true[0, 2].item():.2f}m/s²")
-            print(
-                f"[DEBUG Step {step}] theta_init[0]: R={theta_init[0, 0].item():.1f}m, v={theta_init[0, 1].item():.2f}m/s, a={theta_init[0, 2].item():.2f}m/s²")
-            print(f"[DEBUG Step {step}] warmup_factor={warmup_factor:.3f}, noise_std={stage_cfg.theta_noise_std}")
-
         # [NEW] g_theta scheduling - ramp up gradually
         g_theta_sched = min(1.0, step / max(cfg.g_theta_warmup_steps, 1))
 
@@ -604,16 +596,6 @@ def train_one_stage(
         # Extract outputs
         x_hat = outputs['x_hat']
         theta_hat = outputs['theta_hat']
-
-        # [DEBUG] Print theta_hat for first few steps of Stage 2+
-        if step < 3 and stage_cfg.stage >= 2:
-            print(
-                f"[DEBUG Step {step}] theta_hat[0]: R={theta_hat[0, 0].item():.1f}m, v={theta_hat[0, 1].item():.2f}m/s, a={theta_hat[0, 2].item():.2f}m/s²")
-            # Check for NaN/Inf
-            if torch.isnan(theta_hat).any():
-                print(f"[DEBUG Step {step}] WARNING: theta_hat contains NaN!")
-            if torch.isinf(theta_hat).any():
-                print(f"[DEBUG Step {step}] WARNING: theta_hat contains Inf!")
 
         # === Compute losses with NORMALIZATION ===
 

@@ -1,10 +1,10 @@
 """
-gabv_net_model.py (Expert Review v6.2 - Critical Boundary Fix)
+gabv_net_model.py (Expert Review v6.3 - Production Ready)
 
 Description:
     PyTorch Implementation of Geometry-Aware Bussgang-VAMP Network (GA-BV-Net).
 
-    **CRITICAL FIXES APPLIED (Expert Review v6.2):**
+    **CRITICAL FIXES APPLIED (Expert Review v6.3):**
     - [FIX 1-8] All previous fixes preserved
     - [FIX 13] ThetaUpdater: Replaced unstable angle stats with physics-based score features
     - [FIX 14] ThetaUpdater: Outputs step sizes (μ) instead of raw delta_theta
@@ -18,7 +18,6 @@ Description:
               This caused theta_hat.R to clamp to 4.9e8 = 490,000,000 m!
     - [NEW] g_theta scheduling support from training loop
     - [NEW] Score-based Gauss-Newton direction features
-    - [DEBUG] Temporary debug outputs for verification (remove in production)
 
     Meta Feature Schema (FROZEN - must match train_gabv_net.py):
         meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
@@ -28,7 +27,7 @@ Description:
         meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
         meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
 
-Author: Expert Review Fixed v6.2 (Critical Boundary Fix)
+Author: Expert Review Fixed v6.3 (Production Ready)
 Date: 2025-12-19
 """
 
@@ -487,19 +486,10 @@ class ThetaUpdater(nn.Module):
         # Get channel Jacobians: ∂h/∂R, ∂h/∂v, ∂h/∂a
         dh_dR, dh_dv, dh_da = phys_enc.compute_channel_jacobian(theta)
 
-        # [DEBUG] Print Jacobian stats
-        if hasattr(self, '_debug_counter') and self._debug_counter < 3:
-            print(f"  [compute_score_features DEBUG]")
-            print(f"    dh_dR: mean_abs={dh_dR.abs().mean().item():.2f}, max_abs={dh_dR.abs().max().item():.2f}")
-
         # Compute ∂y_pred/∂θ = (∂h/∂θ) * x_est
         dy_dR = dh_dR * x_est  # [B, N]
         dy_dv = dh_dv * x_est  # [B, N]
         dy_da = dh_da * x_est  # [B, N]
-
-        # [DEBUG] Print dy stats
-        if hasattr(self, '_debug_counter') and self._debug_counter < 3:
-            print(f"    dy_dR: mean_abs={dy_dR.abs().mean().item():.2f}, max_abs={dy_dR.abs().max().item():.2f}")
 
         # Score: s_k = Re(⟨∂y/∂θ_k, r⟩) / ||∂y/∂θ_k||²
         def compute_score(dy_dtheta, r):
@@ -548,15 +538,6 @@ class ThetaUpdater(nn.Module):
         B = theta.shape[0]
         device = theta.device
 
-        # [DEBUG] Print input stats
-        if not hasattr(self, '_debug_counter'):
-            self._debug_counter = 0
-
-        if self._debug_counter < 5:
-            print(f"\n[ThetaUpdater DEBUG {self._debug_counter}] Input stats:")
-            print(f"  resid: mean={resid.abs().mean().item():.6f}, max={resid.abs().max().item():.6f}")
-            print(f"  x_est: mean={x_est.abs().mean().item():.6f}, max={x_est.abs().max().item():.6f}")
-
         # [FIX 16] Log-scale power feature for stability
         resid_power = torch.mean(resid.abs() ** 2, dim=1, keepdim=True)  # [B, 1]
         log_power = torch.log10(resid_power + 1e-9)  # Log scale for stability
@@ -582,28 +563,8 @@ class ThetaUpdater(nn.Module):
             confidence,                   # [B, 1] - symbol confidence
         ], dim=1).float()  # [B, 6], [FIX 17] Force float32 for nn.Linear compatibility
 
-        # [DEBUG] Print intermediate values for first batch element
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 0
-
-        if self._debug_counter < 5:
-            print(f"\n[ThetaUpdater DEBUG {self._debug_counter}]")
-            print(f"  theta_in[0]: R={theta[0, 0].item():.1f}, v={theta[0, 1].item():.2f}, a={theta[0, 2].item():.4f}")
-            print(f"  scores[0]: R={scores[0, 0].item():.6e}, v={scores[0, 1].item():.6e}, a={scores[0, 2].item():.6e}")
-            print(f"  score_magnitudes[0]: {score_magnitudes[0].tolist()}")
-            print(f"  log_power[0]: {log_power[0].item():.4f}")
-            print(f"  g_theta[0]: {g_theta[0].item():.4f}")
-            print(f"  confidence[0]: {confidence[0].item():.4f}")
-            print(f"  feat[0]: {feat[0].tolist()}")
-
         # [FIX 14] Predict step sizes (μ), not raw delta_theta
         step_sizes = self.step_net(feat)  # [B, 3], non-negative via Softplus
-
-        # [DEBUG] Continue debug output
-        if self._debug_counter < 5:
-            print(f"  step_sizes[0]: {step_sizes[0].tolist()}")
 
         # Scale by base step size
         step_sizes = step_sizes * torch.abs(self.base_step_scale)
@@ -618,11 +579,6 @@ class ThetaUpdater(nn.Module):
         delta_a = torch.clamp(delta_theta[:, 2:3], -self.max_delta_a, self.max_delta_a)
         delta_theta_clipped = torch.cat([delta_R, delta_v, delta_a], dim=1)
 
-        # [DEBUG] Continue debug output
-        if self._debug_counter < 5:
-            print(f"  delta_theta[0] (before clamp): R={delta_theta[0, 0].item():.6e}, v={delta_theta[0, 1].item():.6e}, a={delta_theta[0, 2].item():.6e}")
-            print(f"  delta_theta_clipped[0]: R={delta_R[0].item():.4f}, v={delta_v[0].item():.4f}, a={delta_a[0].item():.6f}")
-
         # Confidence gating
         confidence_gate = torch.sigmoid((confidence - self.confidence_threshold) * 10)
 
@@ -634,11 +590,6 @@ class ThetaUpdater(nn.Module):
 
         # Compute candidate theta
         theta_candidate = theta + effective_gate * delta_theta_clipped
-
-        # [DEBUG] Final debug output
-        if self._debug_counter < 5:
-            print(f"  effective_gate[0]: {effective_gate[0].item():.4f}")
-            print(f"  theta_candidate[0]: R={theta_candidate[0, 0].item():.1f}, v={theta_candidate[0, 1].item():.2f}, a={theta_candidate[0, 2].item():.4f}")
 
         # [FIX 15] Acceptance criterion with CONSISTENT residual domain
         accept_rate = 1.0
@@ -817,10 +768,6 @@ class GABVNet(nn.Module):
             }
 
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # [DEBUG] Print theta before update
-                if k == self.cfg.theta_update_start_layer:
-                    print(f"\n[GABVNet DEBUG] Layer {k}, theta BEFORE update[0]: R={theta[0, 0].item():.1f}")
-
                 # Compute channel and residual
                 h_diag = self.phys_enc.compute_channel_diag(theta)
                 resid = z_denoised - h_diag * x_est
@@ -833,10 +780,6 @@ class GABVNet(nn.Module):
                     z_denoised=z_denoised,  # Pass for acceptance criterion
                     g_theta_sched=g_theta_sched,  # Pass scheduling factor
                 )
-
-                # [DEBUG] Print theta after update
-                if k == self.cfg.theta_update_start_layer:
-                    print(f"[GABVNet DEBUG] Layer {k}, theta AFTER update[0]: R={theta[0, 0].item():.1f}")
 
             layer_outputs.append({
                 'x_est': x_est.clone(),
