@@ -737,26 +737,18 @@ class ScoreBasedThetaUpdater(nn.Module):
         theta_clamped = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
 
         # === Step 8: Acceptance Test ===
-        # Use Bussgang-linearized residual for consistent comparison
-        # Note: We use pilot-only data (first N symbols) for acceptance test
-        y_pred_old = phys_enc.forward_operator(x_est, theta)[:, :N]
-        y_pred_new = phys_enc.forward_operator(x_est, theta_clamped)[:, :N]
+        # TEMPORARILY DISABLED: Bussgang residual doesn't align well with actual improvement
+        # The residual_improvement is often negative even when theta is improving
+        # TODO: Fix Bussgang-domain acceptance or use different metric
 
-        # Bussgang-linearized residual (consistent with score computation)
-        # Use y_obs_pilot (already defined above as y_obs[:, :N])
-        y_tilde_for_accept = y_obs_pilot / (alpha + 1e-6)
-        resid_old = torch.mean(torch.abs(y_tilde_for_accept - y_pred_old)**2, dim=1, keepdim=True)
-        resid_new = torch.mean(torch.abs(y_tilde_for_accept - y_pred_new)**2, dim=1, keepdim=True)
+        # For now, just accept all updates (soft_accept = 1.0)
+        # This allows us to verify the update direction is correct
+        accept = torch.ones(B, 1, device=device)
+        soft_accept = torch.ones(B, 1, device=device)
+        improvement = torch.zeros(B, 1, device=device)  # Placeholder
 
-        # Accept if new residual is better (with small tolerance)
-        accept = (resid_new < resid_old * (1 + self.acceptance_relaxation)).float()
-
-        # Soft acceptance: blend based on improvement ratio
-        improvement = (resid_old - resid_new) / (resid_old + 1e-10)
-        soft_accept = torch.sigmoid(improvement * 20)  # Soft version
-
-        # Final theta: use soft acceptance for smoother gradients
-        theta_final = soft_accept * theta_clamped + (1 - soft_accept) * theta
+        # Final theta: use the updated value directly
+        theta_final = theta_clamped
 
         # === Diagnostics ===
         info = {
