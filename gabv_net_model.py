@@ -589,53 +589,53 @@ class ScoreBasedThetaUpdater(nn.Module):
                 y_obs: torch.Tensor,
                 g_theta_sched: float = 1.0,
                 snr_db: float = 20.0,
+                pilot_len: int = None,  # NEW: only use first pilot_len symbols for residual
                 ) -> Tuple[torch.Tensor, Dict]:
         """
         Update theta using score-based descent with BCRLB-aware scaling.
 
         P0-2 FIX: Use Bussgang-linearized residual instead of quantized residual.
-
-        Problem with quantized residual:
-        - y_q - Q(y_pred) has very noisy gradient direction under 1-bit
-        - The network learns to shut down g_theta because updates are random
-
-        Solution: Bussgang linearization
-        - y_q ≈ α*y + e (linear approximation)
-        - Use residual: y_tilde - y_pred where y_tilde = y_q / α
-        - This gives statistically consistent gradient direction
+        P0-3 FIX: Only use pilots (first pilot_len symbols) for residual/score.
 
         Args:
             theta: Current estimate [B, 3]
             residual: [B, N] (IGNORED - we compute our own)
-            x_est: [B, N] symbol estimate (now pilots only!)
+            x_est: [B, N] symbol estimate (FULL length for Jacobian)
             g_theta: [B, 1] gate from pilot navigator
             phys_enc: Physics encoder for Jacobian
-            y_obs: [B, N] observed signal (quantized, now pilots only!)
+            y_obs: [B, N] observed signal (quantized, FULL length)
             g_theta_sched: Scheduling factor (0→1 during warmup)
             snr_db: SNR in dB for BCRLB scaling
+            pilot_len: Only use first pilot_len symbols for residual (P0-3 fix)
 
         Returns:
             theta_new: Updated theta [B, 3]
             info: Dictionary with diagnostics
         """
         B = theta.shape[0]
-        N = x_est.shape[1]  # Now this is pilot length, not full frame
+        N_full = x_est.shape[1]  # Full frame length (e.g., 1024)
         device = theta.device
 
-        # === Step 1: Compute Jacobian (on pilots only) ===
+        # Default: use all symbols (backward compatible)
+        if pilot_len is None:
+            pilot_len = N_full
+        N = pilot_len  # Effective length for residual computation
+
+        # === Step 1: Compute Jacobian on FULL frame (required by physics) ===
         dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
-        # Truncate Jacobians to pilot length
+        # Truncate Jacobians to pilot length for residual computation
         dy_dtau, dy_dv, dy_da = dy_dtheta
         dy_dtau = dy_dtau[:, :N]
         dy_dv = dy_dv[:, :N]
         dy_da = dy_da[:, :N]
         dy_dtheta = (dy_dtau, dy_dv, dy_da)
 
-        # === Step 2: Compute BUSSGANG-LINEARIZED residual (P0-2 FIX!) ===
+        # === Step 2: Compute BUSSGANG-LINEARIZED residual on PILOTS only (P0-2/3 FIX!) ===
         # Instead of: obs_residual = y_q - Q(y_pred) (noisy direction)
         # Use: residual_lin = y_tilde - y_pred (stable direction)
-        y_pred = phys_enc.forward_operator(x_est, theta)
-        y_pred = y_pred[:, :N]  # Truncate to pilot length
+        y_pred_full = phys_enc.forward_operator(x_est, theta)
+        y_pred = y_pred_full[:, :N]  # Truncate to pilot length
+        y_obs_pilot = y_obs[:, :N]   # Truncate observation to pilot length
 
         # Bussgang coefficient: α = sqrt(2/π) / σ where σ² = E[|y|²]
         # Use y_pred variance as proxy for true signal variance
@@ -643,7 +643,7 @@ class ScoreBasedThetaUpdater(nn.Module):
         alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
 
         # Equivalent linear observation: y_tilde = y_q / α
-        y_tilde = y_obs / (alpha + 1e-6)
+        y_tilde = y_obs_pilot / (alpha + 1e-6)
 
         # Linear residual (same domain as y_pred, not quantized)
         residual_lin = y_tilde - y_pred
@@ -951,7 +951,7 @@ class GABVNet(nn.Module):
         # === Step 5: Iterative Refinement ===
         layer_outputs = []
 
-        # Pilot length for theta update (P0-3 fix: use pilots only)
+        # Pilot length for theta update (P0-3 fix: use pilots only for residual)
         pilot_len = self.pn_tracker.n_pilot
 
         for k, layer in enumerate(self.solver_layers):
@@ -961,17 +961,13 @@ class GABVNet(nn.Module):
             # Theta update (if enabled)
             theta_info = {}
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # P0-3 FIX: Use ONLY PILOTS for theta update
-                # Using full x_est introduces symbol errors that bias theta updates
-                # The network learns to shut down g_theta to avoid this bias
-                x_for_theta = x_est[:, :pilot_len]
-                y_for_theta = y_q[:, :pilot_len]
-
-                # Update theta using pilots only
+                # P0-3 FIX: Pass full x_est but tell theta_updater to use only pilots
+                # The Jacobian needs full-length input, but residual uses pilots only
                 theta, theta_info = self.theta_updater(
-                    theta, None, x_for_theta,  # residual=None, computed internally
+                    theta, None, x_est,  # Full x_est for Jacobian computation
                     gates['g_theta'], self.phys_enc,
-                    y_for_theta, g_theta_sched, snr_db
+                    y_q, g_theta_sched, snr_db,
+                    pilot_len=pilot_len  # Tell it to use only first pilot_len symbols for residual
                 )
 
                 # P0-1 FIX: Sync z to new theta!
