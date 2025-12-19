@@ -108,6 +108,13 @@ def main():
             if 'bussgang_alpha' in theta_info:
                 print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A')}")
 
+    # Check phi_est
+    if 'phi_est' in outputs:
+        phi_est = outputs['phi_est']
+        print(f"\n[Phase Estimate]")
+        print(
+            f"  phi_est[0] mean: {phi_est[0].mean().item():.4f} rad ({phi_est[0].mean().item() * 180 / 3.14159:.1f}°)")
+
     # === Summary ===
     print(f"\n" + "=" * 70)
     print("DIAGNOSIS SUMMARY")

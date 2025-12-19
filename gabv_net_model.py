@@ -589,13 +589,24 @@ class ScoreBasedThetaUpdater(nn.Module):
                 y_obs: torch.Tensor,
                 g_theta_sched: float = 1.0,
                 snr_db: float = 20.0,
-                pilot_len: int = None,  # NEW: only use first pilot_len symbols for residual
+                pilot_len: int = None,  # Only use first pilot_len symbols for residual
+                phi_est: torch.Tensor = None,  # NEW: Phase estimate for domain alignment
                 ) -> Tuple[torch.Tensor, Dict]:
         """
         Update theta using score-based descent with BCRLB-aware scaling.
 
-        P0-2 FIX: Use Bussgang-linearized residual instead of quantized residual.
-        P0-3 FIX: Only use pilots (first pilot_len symbols) for residual/score.
+        CRITICAL FIX (Expert 1): phi_est alignment
+
+        Problem: y_obs contains phi0 (constant phase offset), but:
+        - x_est has phi0 removed (by PN tracker)
+        - y_pred = H(θ) × x_est doesn't have phi0
+        - residual = y_tilde - y_pred contains phi0 mismatch!
+        - Jacobian doesn't know about phi0
+        → Score direction is WRONG because tau tries to "explain" phi0
+
+        Solution: Derotate y_obs by phi_est before computing residual
+        - y_obs_aligned = y_obs × exp(-j × φ̂)
+        - Now residual and Jacobian are in the same domain
 
         Args:
             theta: Current estimate [B, 3]
@@ -606,7 +617,8 @@ class ScoreBasedThetaUpdater(nn.Module):
             y_obs: [B, N] observed signal (quantized, FULL length)
             g_theta_sched: Scheduling factor (0→1 during warmup)
             snr_db: SNR in dB for BCRLB scaling
-            pilot_len: Only use first pilot_len symbols for residual (P0-3 fix)
+            pilot_len: Only use first pilot_len symbols for residual
+            phi_est: [B, N] or [B, 1] phase estimate from PN tracker
 
         Returns:
             theta_new: Updated theta [B, 3]
@@ -621,6 +633,21 @@ class ScoreBasedThetaUpdater(nn.Module):
             pilot_len = N_full
         N = pilot_len  # Effective length for residual computation
 
+        # === CRITICAL FIX: Align phase domains ===
+        # Derotate y_obs by phi_est so it matches the domain of y_pred
+        if phi_est is not None:
+            # phi_est might be [B, N] (per-sample) or [B, 1] (constant)
+            # For theta update, we only care about the constant phase offset
+            if phi_est.dim() == 2 and phi_est.shape[1] > 1:
+                # Use the mean phase from pilot region
+                phi_const = phi_est[:, :N].mean(dim=1, keepdim=True)
+            else:
+                phi_const = phi_est
+            # Derotate observation
+            y_obs_aligned = y_obs * torch.exp(-1j * phi_const)
+        else:
+            y_obs_aligned = y_obs
+
         # === Step 1: Compute Jacobian on FULL frame (required by physics) ===
         dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
         # Truncate Jacobians to pilot length for residual computation
@@ -630,22 +657,19 @@ class ScoreBasedThetaUpdater(nn.Module):
         dy_da = dy_da[:, :N]
         dy_dtheta = (dy_dtau, dy_dv, dy_da)
 
-        # === Step 2: Compute BUSSGANG-LINEARIZED residual on PILOTS only (P0-2/3 FIX!) ===
-        # Instead of: obs_residual = y_q - Q(y_pred) (noisy direction)
-        # Use: residual_lin = y_tilde - y_pred (stable direction)
+        # === Step 2: Compute BUSSGANG-LINEARIZED residual on PILOTS only ===
         y_pred_full = phys_enc.forward_operator(x_est, theta)
         y_pred = y_pred_full[:, :N]  # Truncate to pilot length
-        y_obs_pilot = y_obs[:, :N]   # Truncate observation to pilot length
+        y_obs_pilot = y_obs_aligned[:, :N]  # Use phase-aligned observation!
 
         # Bussgang coefficient: α = sqrt(2/π) / σ where σ² = E[|y|²]
-        # Use y_pred variance as proxy for true signal variance
         var = torch.mean(torch.abs(y_pred)**2, dim=1, keepdim=True).clamp(min=1e-6)
         alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
 
         # Equivalent linear observation: y_tilde = y_q / α
         y_tilde = y_obs_pilot / (alpha + 1e-6)
 
-        # Linear residual (same domain as y_pred, not quantized)
+        # Linear residual (same domain as y_pred, phase-aligned!)
         residual_lin = y_tilde - y_pred
 
         # === Step 3: Compute Score (Gauss-Newton direction) ===
@@ -966,27 +990,22 @@ class GABVNet(nn.Module):
             # Theta update (if enabled)
             theta_info = {}
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # P0-3 FIX: Pass full x_est but tell theta_updater to use only pilots
-                # The Jacobian needs full-length input, but residual uses pilots only
+                # CRITICAL FIX (Expert 1): Pass phi_est to align phase domains!
+                # Without this, residual contains phi0 but Jacobian doesn't know about it,
+                # causing tau to "explain" phase offset → wrong direction!
                 theta, theta_info = self.theta_updater(
                     theta, None, x_est,  # Full x_est for Jacobian computation
                     gates['g_theta'], self.phys_enc,
                     y_q, g_theta_sched, snr_db,
-                    pilot_len=pilot_len  # Tell it to use only first pilot_len symbols for residual
+                    pilot_len=pilot_len,  # Use only first pilot_len symbols for residual
+                    phi_est=phi_est,      # Pass phase estimate for domain alignment
                 )
 
                 # P0-1 FIX: Sync z to new theta!
                 # Without this, theta update benefits don't propagate to subsequent layers
-                # The network learns to shut down updates since they don't improve comm loss
                 z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
                 z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
-
-                # CRITICAL: Sync the solver state z to the new z_derotated
-                # Option 1: Hard sync (use this first to verify theta learning works)
                 z = z_derotated
-                # Option 2: Soft sync (uncomment if hard sync is too aggressive)
-                # beta = 0.5
-                # z = (1 - beta) * z + beta * z_derotated
 
             layer_outputs.append({
                 'x_est': x_est.detach(),
