@@ -507,7 +507,7 @@ def plot_identifiability_cliff(results: Dict, out_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate GA-BV-Net (Wideband Delay Model)")
-    parser.add_argument('--ckpt', type=str, required=True, help='Checkpoint path')
+    parser.add_argument('--ckpt', type=str, default=None, help='Checkpoint path (supports glob patterns)')
     parser.add_argument('--n_mc', type=int, default=10, help='Monte Carlo trials')
     parser.add_argument('--out_dir', type=str, default='results/evaluation', help='Output directory')
 
@@ -531,8 +531,42 @@ def main():
         print("\n⚠️  WARNING: Simulator and PhysicsEncoder are NOT consistent!")
         print("    This MUST be fixed before training will converge.")
 
+    # === Resolve Checkpoint Path ===
+    import glob
+
+    ckpt_path = args.ckpt
+    if ckpt_path is None:
+        # Auto-find latest checkpoint
+        patterns = [
+            'results/checkpoints/Stage3_*/final.pth',
+            'results/checkpoints/Stage2_*/final.pth',
+            'results/checkpoints/Stage1_*/final.pth',
+        ]
+        for pattern in patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                # Sort by modification time, get newest
+                matches.sort(key=os.path.getmtime, reverse=True)
+                ckpt_path = matches[0]
+                print(f"[Auto] Found checkpoint: {ckpt_path}")
+                break
+    elif '*' in ckpt_path:
+        # Glob pattern provided
+        matches = glob.glob(ckpt_path)
+        if matches:
+            matches.sort(key=os.path.getmtime, reverse=True)
+            ckpt_path = matches[0]
+            print(f"[Glob] Resolved to: {ckpt_path}")
+        else:
+            print(f"[Error] No files match pattern: {ckpt_path}")
+            ckpt_path = None
+
+    if ckpt_path is None:
+        print("[Error] No checkpoint found. Run training first.")
+        return
+
     # === Load Model ===
-    model = load_model(args.ckpt, device)
+    model = load_model(ckpt_path, device)
     if model is None:
         print("Failed to load model. Exiting.")
         return

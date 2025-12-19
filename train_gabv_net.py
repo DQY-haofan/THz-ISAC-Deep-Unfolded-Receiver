@@ -147,7 +147,7 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
 
     Curriculum:
         Stage 0: Ultra-simple debugging (no hardware impairments)
-        Stage 1: Learn communication (exact theta)
+        Stage 1: Learn communication (high SNR first, then expand)
         Stage 2: Learn fine tracking (< 0.5 sample noise)
         Stage 3: Push to limit (~1 sample noise)
     """
@@ -157,30 +157,30 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             stage=0,
             name="Stage0_Debug",
             description="Debug mode: no impairments, v=0, a=0",
-            n_steps=base_steps // 2,
+            n_steps=base_steps // 4,  # Shorter, just for verification
             theta_noise_samples=(0.0, 0.0, 0.0),
             enable_theta_update=False,
             loss_weight_comm=1.0,
             loss_weight_sens=0.0,
             loss_weight_prior=0.0,
-            snr_range=(20, 30),
+            snr_range=(20, 30),  # High SNR only
             enable_pn=False,  # No phase noise!
             freeze_comm=False,
             freeze_pn=True,
         ),
 
-        # Stage 1: Communication Only
+        # Stage 1: Communication Only - HIGH SNR FIRST
         StageConfig(
             stage=1,
             name="Stage1_CommOnly",
-            description="Communication only, exact theta (learn denoising)",
+            description="Communication only, exact theta, HIGH SNR",
             n_steps=base_steps,
             theta_noise_samples=(0.0, 0.0, 0.0),  # Exact theta
             enable_theta_update=False,
             loss_weight_comm=1.0,
             loss_weight_sens=0.0,
             loss_weight_prior=0.0,
-            snr_range=(-5, 25),
+            snr_range=(10, 30),  # HIGH SNR - start easy!
             enable_pn=True,
             freeze_comm=False,
             freeze_pn=False,
@@ -197,7 +197,7 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             loss_weight_comm=1.0,
             loss_weight_sens=0.5,
             loss_weight_prior=0.1,
-            snr_range=(5, 25),
+            snr_range=(5, 25),  # Medium-high SNR
             enable_pn=True,
             lr_multiplier=0.5,
             freeze_comm=True,  # Freeze comm modules
@@ -215,7 +215,7 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             loss_weight_comm=1.0,
             loss_weight_sens=1.0,
             loss_weight_prior=0.2,
-            snr_range=(-5, 25),
+            snr_range=(0, 25),  # Wide range including moderate low SNR
             enable_pn=True,
             lr_multiplier=0.3,
             freeze_comm=True,
@@ -620,8 +620,16 @@ def train_one_stage(
 # Curriculum Training
 # =============================================================================
 
-def run_curriculum(cfg: TrainConfig, stages: List[int] = [1, 2, 3]):
-    """Run curriculum learning across multiple stages."""
+def run_curriculum(cfg: TrainConfig, stages: List[int] = [0, 1, 2, 3]):
+    """
+    Run curriculum learning across multiple stages.
+
+    Stage indices match the stage number in StageConfig:
+        Stage 0: Debug (optional, for verification)
+        Stage 1: CommOnly (learn communication)
+        Stage 2: FineTrak (learn theta tracking)
+        Stage 3: FullTrak (push to limits)
+    """
 
     print("\n" + "=" * 70)
     print("CURRICULUM LEARNING (Wideband Delay Model)")
@@ -631,12 +639,19 @@ def run_curriculum(cfg: TrainConfig, stages: List[int] = [1, 2, 3]):
 
     all_stages = get_curriculum_stages(cfg.n_steps)
 
+    # Build stage lookup by stage number
+    stage_lookup = {s.stage: s for s in all_stages}
+
     model = None
     prev_ckpt = None
     global_step = 0
 
     for stage_num in stages:
-        stage_cfg = all_stages[stage_num - 1]
+        if stage_num not in stage_lookup:
+            print(f"[Warning] Stage {stage_num} not found, skipping")
+            continue
+
+        stage_cfg = stage_lookup[stage_num]
 
         model, ckpt_path = train_one_stage(
             cfg=cfg,
@@ -649,13 +664,15 @@ def run_curriculum(cfg: TrainConfig, stages: List[int] = [1, 2, 3]):
         global_step += stage_cfg.n_steps
 
         print(f"\n{'=' * 60}")
-        print(f"Stage {stage_num} complete. Global step: {global_step}")
+        print(f"Stage {stage_num} ({stage_cfg.name}) complete. Global step: {global_step}")
         print(f"{'=' * 60}\n")
 
     print("\n" + "=" * 70)
     print("CURRICULUM TRAINING COMPLETE")
     print(f"Total steps: {global_step}")
     print("=" * 70)
+
+    return model, prev_ckpt
 
 
 # =============================================================================
@@ -693,7 +710,14 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if args.curriculum:
+        # Run all stages: 0 (debug), 1 (comm), 2 (fine), 3 (full)
+        # Skip stage 0 by default for faster training
         run_curriculum(cfg, stages=[1, 2, 3])
     else:
+        # Single stage training
         stages = get_curriculum_stages(cfg.n_steps)
-        train_one_stage(cfg, stages[args.stage - 1])
+        stage_lookup = {s.stage: s for s in stages}
+        if args.stage in stage_lookup:
+            train_one_stage(cfg, stage_lookup[args.stage])
+        else:
+            print(f"[Error] Stage {args.stage} not found. Available: {list(stage_lookup.keys())}")
