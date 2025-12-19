@@ -564,10 +564,14 @@ class ScoreBasedThetaUpdater(nn.Module):
         score_magnitude = torch.abs(score)  # [B, 3]
 
         # Symbol confidence (how close to constellation points)
-        # For QPSK: ideal symbols have |real| = |imag| = 1/sqrt(2)
+        # For QPSK: ideal normalized symbols have |real| = |imag| = 1/sqrt(2)
+        # We need to normalize first, then check
+        x_est_amplitude = torch.mean(torch.abs(x_est), dim=1, keepdim=True).clamp(min=1e-6)
+        x_est_normalized = x_est / x_est_amplitude
+
         confidence = 1.0 - torch.mean(
-            torch.abs(torch.abs(x_est.real) - 1/math.sqrt(2))**2 +
-            torch.abs(torch.abs(x_est.imag) - 1/math.sqrt(2))**2,
+            torch.abs(torch.abs(x_est_normalized.real) - 1/math.sqrt(2))**2 +
+            torch.abs(torch.abs(x_est_normalized.imag) - 1/math.sqrt(2))**2,
             dim=1, keepdim=True
         )
         confidence = torch.clamp(confidence, 0, 1)
@@ -708,7 +712,8 @@ class BussgangVAMPLayer(nn.Module):
         x_qpsk = torch.exp(1j * phase_quantized)  # Unit amplitude QPSK
 
         # Scale back to original amplitude
-        x_qpsk_scaled = x_qpsk * z_amplitude / math.sqrt(2)  # /√2 for QPSK normalization
+        # FIX: No /sqrt(2)! Both x_qpsk and z_normalized are unit amplitude.
+        x_qpsk_scaled = x_qpsk * z_amplitude
         x_est = x_normalized * z_amplitude  # Keep denoised estimate at correct scale
 
         # Soft decision: interpolate between quantized and input
