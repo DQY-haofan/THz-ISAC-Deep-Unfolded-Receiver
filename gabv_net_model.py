@@ -502,11 +502,11 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         # BCRLB-based scaling for converting step sizes to physical units
         # With unit-normalized score, step_size × bcrlb_scale gives physical delta
-        # INCREASED tau step size to allow meaningful updates per layer
+        # REDUCED to prevent overshoot: 8 layers × 0.05 samples = 0.4 samples max total
         self.register_buffer('bcrlb_scale', torch.tensor([
-            0.5 / cfg.fs,  # 0.5 samples = 5e-11 s for 10GHz (INCREASED from 0.1)
-            10.0,          # 10 m/s
-            1.0,           # 1 m/s²
+            0.05 / cfg.fs,  # 0.05 samples per layer (REDUCED from 0.5!)
+            5.0,            # 5 m/s (reduced from 10)
+            0.5,            # 0.5 m/s² (reduced from 1)
         ]))
 
         # Physical bounds for theta = [tau, v, a]
@@ -516,11 +516,11 @@ class ScoreBasedThetaUpdater(nn.Module):
         self.register_buffer('theta_max', torch.tensor([tau_bound, 1e4, 100.0]))
 
         # Max delta per iteration (for stability)
-        # INCREASED tau limit to allow faster convergence
+        # Conservative limits to prevent overshoot
         self.register_buffer('max_delta', torch.tensor([
-            0.2 / cfg.fs,   # 0.2 sample period (INCREASED from 0.1)
-            100.0,          # 100 m/s per iteration
-            10.0,           # 10 m/s² per iteration
+            0.05 / cfg.fs,  # 0.05 sample period max (REDUCED from 0.2)
+            50.0,           # 50 m/s per iteration (reduced from 100)
+            5.0,            # 5 m/s² per iteration (reduced from 10)
         ]))
 
         # Confidence threshold for gating
