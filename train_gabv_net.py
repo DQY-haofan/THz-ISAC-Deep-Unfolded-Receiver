@@ -36,6 +36,7 @@ from gabv_net_model import GABVNet, GABVConfig, create_gabv_model
 # Optional: matplotlib for training curves
 try:
     import matplotlib.pyplot as plt
+
     HAS_PLT = True
 except ImportError:
     HAS_PLT = False
@@ -80,7 +81,7 @@ class TrainConfig:
 THETA_SCALE = torch.tensor([1000.0, 10.0, 1.0])  # [1km, 10m/s, 1m/s²]
 
 # Prior variance for MAP-style regularization (squared of noise std)
-THETA_PRIOR_VAR = torch.tensor([100.0**2, 10.0**2, 0.5**2])  # Stage3 noise level
+THETA_PRIOR_VAR = torch.tensor([100.0 ** 2, 10.0 ** 2, 0.5 ** 2])  # Stage3 noise level
 
 
 @dataclass
@@ -319,7 +320,7 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             enable_pn=True,
             lr_multiplier=1.0,  # Normal LR for theta
             freeze_comm_modules=True,  # Freeze phys_enc, solver, refiner
-            freeze_pn_tracker=True,    # Freeze PN tracker too
+            freeze_pn_tracker=True,  # Freeze PN tracker too
         ),
         # Stage 2b: Unfreeze PN tracker
         StageConfig(
@@ -336,7 +337,7 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             enable_pn=True,
             lr_multiplier=0.5,
             freeze_comm_modules=True,  # Keep solver frozen
-            freeze_pn_tracker=False,   # Unfreeze PN tracker
+            freeze_pn_tracker=False,  # Unfreeze PN tracker
         ),
         # Stage 3: Full noise, full fine-tuning
         StageConfig(
@@ -451,10 +452,10 @@ def apply_freeze_schedule(model: GABVNet, stage_cfg: StageConfig):
 # =============================================================================
 
 def train_one_stage(
-    cfg: TrainConfig,
-    stage_cfg: Optional[StageConfig] = None,
-    model: Optional[GABVNet] = None,
-    prev_ckpt: Optional[str] = None,
+        cfg: TrainConfig,
+        stage_cfg: Optional[StageConfig] = None,
+        model: Optional[GABVNet] = None,
+        prev_ckpt: Optional[str] = None,
 ) -> Tuple[GABVNet, str]:
     """
     Train one stage of curriculum learning.
@@ -573,6 +574,14 @@ def train_one_stage(
             theta_noise_std = torch.tensor(stage_cfg.theta_noise_std, device=device)
             theta_init = theta_true + warmup_factor * torch.randn_like(theta_true) * theta_noise_std
 
+        # [DEBUG] Print theta values for first few steps of Stage 2+
+        if step < 3 and stage_cfg.stage >= 2:
+            print(
+                f"\n[DEBUG Step {step}] theta_true[0]: R={theta_true[0, 0].item():.1f}m, v={theta_true[0, 1].item():.2f}m/s, a={theta_true[0, 2].item():.2f}m/s²")
+            print(
+                f"[DEBUG Step {step}] theta_init[0]: R={theta_init[0, 0].item():.1f}m, v={theta_init[0, 1].item():.2f}m/s, a={theta_init[0, 2].item():.2f}m/s²")
+            print(f"[DEBUG Step {step}] warmup_factor={warmup_factor:.3f}, noise_std={stage_cfg.theta_noise_std}")
+
         # [NEW] g_theta scheduling - ramp up gradually
         g_theta_sched = min(1.0, step / max(cfg.g_theta_warmup_steps, 1))
 
@@ -595,6 +604,16 @@ def train_one_stage(
         # Extract outputs
         x_hat = outputs['x_hat']
         theta_hat = outputs['theta_hat']
+
+        # [DEBUG] Print theta_hat for first few steps of Stage 2+
+        if step < 3 and stage_cfg.stage >= 2:
+            print(
+                f"[DEBUG Step {step}] theta_hat[0]: R={theta_hat[0, 0].item():.1f}m, v={theta_hat[0, 1].item():.2f}m/s, a={theta_hat[0, 2].item():.2f}m/s²")
+            # Check for NaN/Inf
+            if torch.isnan(theta_hat).any():
+                print(f"[DEBUG Step {step}] WARNING: theta_hat contains NaN!")
+            if torch.isinf(theta_hat).any():
+                print(f"[DEBUG Step {step}] WARNING: theta_hat contains Inf!")
 
         # === Compute losses with NORMALIZATION ===
 
@@ -694,7 +713,7 @@ def train_one_stage(
                   for _ in range(1000)]
     unique_gamma = len(set([f'{g:.6f}' for g in gamma_effs]))
     print(f"\n[MC Diversity Check] Unique gamma_eff values: {unique_gamma}/1000 "
-          f"({unique_gamma/10:.1f}%) {'✓' if unique_gamma > 900 else '✗'}")
+          f"({unique_gamma / 10:.1f}%) {'✓' if unique_gamma > 900 else '✗'}")
 
     # === Save checkpoint ===
     timestamp = int(time.time())
