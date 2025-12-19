@@ -442,7 +442,7 @@ def load_gabv_model(ckpt_path: str, device: str) -> Optional[GABVNet]:
         return None
 
     try:
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         cfg = GABVConfig(n_layers=checkpoint['config'].get('n_layers', 8))
 
         # [FIX 6] Check fs in checkpoint
