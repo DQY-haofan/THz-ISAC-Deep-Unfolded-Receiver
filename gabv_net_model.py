@@ -687,25 +687,33 @@ class BussgangVAMPLayer(nn.Module):
         """
         B, N = z.shape
 
+        # Estimate symbol amplitude from input (for power normalization compatibility)
+        z_amplitude = torch.mean(torch.abs(z), dim=1, keepdim=True).clamp(min=1e-6)
+
+        # Normalize to unit amplitude for processing
+        z_normalized = z / z_amplitude
+
         # Stack real/imag for denoiser
-        z_ri = torch.stack([z.real, z.imag], dim=-1)  # [B, N, 2]
+        z_ri = torch.stack([z_normalized.real, z_normalized.imag], dim=-1)  # [B, N, 2]
 
         # Apply denoiser with residual connection
         delta = self.denoiser(z_ri.float())  # [B, N, 2]
         x_ri = z_ri + delta  # Residual: starts as identity
-        x_est = x_ri[..., 0] + 1j * x_ri[..., 1]  # [B, N]
+        x_normalized = x_ri[..., 0] + 1j * x_ri[..., 1]  # [B, N]
 
-        # QPSK projection: snap to nearest constellation point
-        # This helps with symbol recovery
-        phase = torch.angle(x_est)
+        # QPSK projection: snap to nearest constellation point (unit amplitude)
+        phase = torch.angle(x_normalized)
         # QPSK phases: π/4, 3π/4, -3π/4, -π/4
-        # Quantize to nearest
         phase_quantized = torch.round(phase / (math.pi / 2)) * (math.pi / 2) + math.pi / 4
-        x_qpsk = torch.exp(1j * phase_quantized) / math.sqrt(2)
+        x_qpsk = torch.exp(1j * phase_quantized)  # Unit amplitude QPSK
 
-        # Soft decision: interpolate between raw and quantized
+        # Scale back to original amplitude
+        x_qpsk_scaled = x_qpsk * z_amplitude / math.sqrt(2)  # /√2 for QPSK normalization
+        x_est = x_normalized * z_amplitude  # Keep denoised estimate at correct scale
+
+        # Soft decision: interpolate between quantized and input
         damping = torch.sigmoid(self.damping)
-        z_new = damping * x_qpsk + (1 - damping) * z
+        z_new = damping * x_qpsk_scaled + (1 - damping) * z
 
         return z_new, x_est
 
@@ -839,10 +847,17 @@ class GABVNet(nn.Module):
         if self.bypass_refiner:
             x_hat = x_est
         else:
-            x_ri = torch.stack([x_est.real, x_est.imag], dim=-1)
+            # Estimate amplitude to preserve power normalization
+            x_amplitude = torch.mean(torch.abs(x_est), dim=1, keepdim=True).clamp(min=1e-6)
+            x_normalized = x_est / x_amplitude
+
+            # Apply refiner to normalized symbols
+            x_ri = torch.stack([x_normalized.real, x_normalized.imag], dim=-1)
             x_delta = self.refiner(x_ri.float())  # Refinement delta
-            # Residual connection: x_hat = x_est + delta
-            x_hat = x_est + (x_delta[..., 0] + 1j * x_delta[..., 1])
+
+            # Add delta and rescale
+            x_refined_norm = x_normalized + (x_delta[..., 0] + 1j * x_delta[..., 1])
+            x_hat = x_refined_norm * x_amplitude
 
         return {
             'x_hat': x_hat,

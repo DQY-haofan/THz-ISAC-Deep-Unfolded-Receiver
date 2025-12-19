@@ -20,6 +20,21 @@ except ImportError:
 
 from thz_isac_world import SimConfig, simulate_batch
 
+
+def compute_ber(x_hat, x_true):
+    """Compute QPSK BER correctly."""
+    if isinstance(x_hat, torch.Tensor):
+        x_hat = x_hat.detach().numpy()
+    if isinstance(x_true, torch.Tensor):
+        x_true = x_true.detach().numpy()
+
+    # I bits
+    ber_I = np.mean((np.real(x_hat) > 0) != (np.real(x_true) > 0))
+    # Q bits
+    ber_Q = np.mean((np.imag(x_hat) > 0) != (np.imag(x_true) > 0))
+    return (ber_I + ber_Q) / 2
+
+
 # Test simulator output
 print("=" * 60)
 print("DEBUG: GA-BV-Net Model Flow")
@@ -58,9 +73,8 @@ phys_enc = PhysicsEncoder(pcfg)
 print(f"\n[Test 1: PhysicsEncoder.adjoint_operator]")
 # If theta is exact, adjoint should recover x
 x_recovered = phys_enc.adjoint_operator(y, theta_true)
-x_recovered_np = x_recovered.detach().numpy()
 
-ber_recovered = np.mean((np.angle(x_true.numpy()) > 0) != (np.angle(x_recovered_np) > 0))
+ber_recovered = compute_ber(x_recovered, x_true)
 print(f"  BER after adjoint (exact theta): {ber_recovered:.4f}")
 
 if ber_recovered < 0.01:
@@ -75,8 +89,7 @@ else:
 
     # Manual derotation
     y_derotated_manual = y * torch.conj(p_t)
-    ber_manual = np.mean((np.angle(x_true.numpy()) > 0) !=
-                         (np.angle(y_derotated_manual.numpy()) > 0))
+    ber_manual = compute_ber(y_derotated_manual, x_true)
     print(f"  BER after manual Doppler removal: {ber_manual:.4f}")
 
 print(f"\n[Test 2: Forward then Adjoint]")
@@ -112,8 +125,7 @@ with torch.no_grad():
     outputs = model(batch)
 
 x_hat = outputs['x_hat']
-ber_model = np.mean((np.angle(x_true.numpy()) > 0) !=
-                    (np.angle(x_hat.numpy()) > 0))
+ber_model = compute_ber(x_hat, x_true)
 print(f"  BER from model: {ber_model:.4f}")
 
 if ber_model < 0.2:
@@ -128,15 +140,13 @@ else:
 
     # Check if PN tracker is the problem
     y_derotated, phi_est = model.pn_tracker(y, meta, x_true[:, :64])
-    ber_after_pn = np.mean((np.angle(x_true.numpy()) > 0) !=
-                           (np.angle(y_derotated.numpy()) > 0))
+    ber_after_pn = compute_ber(y_derotated, x_true)
     print(f"  BER after PN tracker only: {ber_after_pn:.4f}")
-    print(f"  phi_est mean: {phi_est.mean().item():.4f}")
+    print(f"  phi_est mean: {phi_est.detach().mean().item():.4f}")
 
     # Check after adjoint
-    z = phys_enc.adjoint_operator(y_derotated, theta_true)
-    ber_after_adj = np.mean((np.angle(x_true.numpy()) > 0) !=
-                            (np.angle(z.numpy()) > 0))
+    z = phys_enc.adjoint_operator(y_derotated.detach(), theta_true)
+    ber_after_adj = compute_ber(z, x_true)
     print(f"  BER after adjoint (post-PN): {ber_after_adj:.4f}")
 
 print("\n" + "=" * 60)

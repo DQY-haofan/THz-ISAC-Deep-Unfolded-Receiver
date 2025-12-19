@@ -537,10 +537,17 @@ def train_one_stage(
 
         # === Metrics ===
         with torch.no_grad():
-            # BER
-            x_true_bits = (torch.angle(x_true) > 0).float()
-            x_hat_bits = (torch.angle(x_hat) > 0).float()
-            ber = torch.mean((x_true_bits != x_hat_bits).float()).item()
+            # QPSK BER: compare I and Q bits separately
+            # I bit = sign(real), Q bit = sign(imag)
+            x_true_I = (x_true.real > 0).float()
+            x_true_Q = (x_true.imag > 0).float()
+            x_hat_I = (x_hat.real > 0).float()
+            x_hat_Q = (x_hat.imag > 0).float()
+
+            # BER = average of I and Q bit errors
+            ber_I = torch.mean((x_true_I != x_hat_I).float()).item()
+            ber_Q = torch.mean((x_true_Q != x_hat_Q).float()).item()
+            ber = (ber_I + ber_Q) / 2
 
             # G_theta
             g_theta_mean = outputs['gates']['g_theta'].mean().item()

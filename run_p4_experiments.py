@@ -198,10 +198,26 @@ def construct_meta_features(meta_dict: Dict, batch_size: int) -> torch.Tensor:
 # =============================================================================
 
 def compute_ber(x_hat: np.ndarray, x_true: np.ndarray) -> float:
-    """Compute BER for QPSK."""
-    bits_hat = (np.angle(x_hat) > 0).astype(float)
-    bits_true = (np.angle(x_true) > 0).astype(float)
-    return np.mean(bits_hat != bits_true)
+    """
+    Compute BER for QPSK.
+
+    QPSK has 2 bits per symbol:
+    - I bit = sign(real)
+    - Q bit = sign(imag)
+
+    BER = average of I and Q bit error rates
+    """
+    # I bits
+    bits_I_hat = (np.real(x_hat) > 0).astype(float)
+    bits_I_true = (np.real(x_true) > 0).astype(float)
+    ber_I = np.mean(bits_I_hat != bits_I_true)
+
+    # Q bits
+    bits_Q_hat = (np.imag(x_hat) > 0).astype(float)
+    bits_Q_true = (np.imag(x_true) > 0).astype(float)
+    ber_Q = np.mean(bits_Q_hat != bits_Q_true)
+
+    return (ber_I + ber_Q) / 2
 
 
 def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[float, float, float]:
