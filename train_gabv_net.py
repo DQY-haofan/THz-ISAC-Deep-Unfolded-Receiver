@@ -577,10 +577,13 @@ def train_one_stage(
             # G_theta
             g_theta_mean = outputs['gates']['g_theta'].mean().item()
 
-            # Accept rate
+            # Accept rate and residual improvement (Expert's "strong diagnostic")
             accept_rate = 1.0
+            resid_improve = 0.0
             if outputs['layers'] and 'theta_info' in outputs['layers'][-1]:
-                accept_rate = outputs['layers'][-1]['theta_info'].get('accept_rate', 1.0)
+                theta_info = outputs['layers'][-1]['theta_info']
+                accept_rate = theta_info.get('accept_rate', 1.0)
+                resid_improve = theta_info.get('residual_improvement', 0.0)
 
         metrics = {
             'step': step,
@@ -593,6 +596,7 @@ def train_one_stage(
             'RMSE_a': sens_metrics['rmse_a'],
             'g_theta': g_theta_mean,
             'accept_rate': accept_rate,
+            'resid_improve': resid_improve,  # Expert's key diagnostic
         }
         metrics_history.append(metrics)
 
@@ -602,14 +606,15 @@ def train_one_stage(
             'BER': f"{ber:.4f}",
             'RMSE_τ': f"{sens_metrics['rmse_tau_samples']:.2f}samp",
             'g_θ': f"{g_theta_mean:.3f}",
-            'acc': f"{accept_rate:.2f}",
+            'Δr': f"{resid_improve:.3f}",  # New: residual improvement
         })
 
         # Periodic logging
         if (step + 1) % 200 == 0:
             print(f"\n  [Step {step + 1}] loss={loss.item():.4f}, BER={ber:.4f}, "
                   f"RMSE_τ={sens_metrics['rmse_tau_samples']:.2f} samples, "
-                  f"g_theta={g_theta_mean:.3f}, accept={accept_rate:.2f}")
+                  f"g_theta={g_theta_mean:.3f}, accept={accept_rate:.2f}, "
+                  f"resid_improve={resid_improve:.4f}")
 
     # === Save Checkpoint ===
     timestamp = int(time.time())

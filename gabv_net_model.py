@@ -593,16 +593,24 @@ class ScoreBasedThetaUpdater(nn.Module):
         """
         Update theta using score-based descent with BCRLB-aware scaling.
 
-        CRITICAL: We compute residual in OBSERVATION domain (quantized)
-        to ensure score direction is correct.
+        P0-2 FIX: Use Bussgang-linearized residual instead of quantized residual.
+
+        Problem with quantized residual:
+        - y_q - Q(y_pred) has very noisy gradient direction under 1-bit
+        - The network learns to shut down g_theta because updates are random
+
+        Solution: Bussgang linearization
+        - y_q ≈ α*y + e (linear approximation)
+        - Use residual: y_tilde - y_pred where y_tilde = y_q / α
+        - This gives statistically consistent gradient direction
 
         Args:
             theta: Current estimate [B, 3]
             residual: [B, N] (IGNORED - we compute our own)
-            x_est: [B, N] symbol estimate
+            x_est: [B, N] symbol estimate (now pilots only!)
             g_theta: [B, 1] gate from pilot navigator
             phys_enc: Physics encoder for Jacobian
-            y_obs: [B, N] observed signal (quantized)
+            y_obs: [B, N] observed signal (quantized, now pilots only!)
             g_theta_sched: Scheduling factor (0→1 during warmup)
             snr_db: SNR in dB for BCRLB scaling
 
@@ -611,22 +619,40 @@ class ScoreBasedThetaUpdater(nn.Module):
             info: Dictionary with diagnostics
         """
         B = theta.shape[0]
+        N = x_est.shape[1]  # Now this is pilot length, not full frame
         device = theta.device
 
-        # === Step 1: Compute Jacobian ===
+        # === Step 1: Compute Jacobian (on pilots only) ===
         dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
+        # Truncate Jacobians to pilot length
+        dy_dtau, dy_dv, dy_da = dy_dtheta
+        dy_dtau = dy_dtau[:, :N]
+        dy_dv = dy_dv[:, :N]
+        dy_da = dy_da[:, :N]
+        dy_dtheta = (dy_dtau, dy_dv, dy_da)
 
-        # === Step 2: Compute OBSERVATION DOMAIN residual (CRITICAL!) ===
-        # The score formula requires r = y - H(θ)x̂ in observation domain
+        # === Step 2: Compute BUSSGANG-LINEARIZED residual (P0-2 FIX!) ===
+        # Instead of: obs_residual = y_q - Q(y_pred) (noisy direction)
+        # Use: residual_lin = y_tilde - y_pred (stable direction)
         y_pred = phys_enc.forward_operator(x_est, theta)
-        y_pred_q = quantize_1bit_torch(y_pred)
-        obs_residual = y_obs - y_pred_q  # Quantization-consistent residual
+        y_pred = y_pred[:, :N]  # Truncate to pilot length
+
+        # Bussgang coefficient: α = sqrt(2/π) / σ where σ² = E[|y|²]
+        # Use y_pred variance as proxy for true signal variance
+        var = torch.mean(torch.abs(y_pred)**2, dim=1, keepdim=True).clamp(min=1e-6)
+        alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
+
+        # Equivalent linear observation: y_tilde = y_q / α
+        y_tilde = y_obs / (alpha + 1e-6)
+
+        # Linear residual (same domain as y_pred, not quantized)
+        residual_lin = y_tilde - y_pred
 
         # === Step 3: Compute Score (Gauss-Newton direction) ===
-        score = self.compute_score(obs_residual, dy_dtheta)  # [B, 3]
+        score = self.compute_score(residual_lin, dy_dtheta)  # [B, 3]
 
         # === Step 4: Build Features ===
-        residual_power = torch.mean(torch.abs(obs_residual)**2, dim=1, keepdim=True)
+        residual_power = torch.mean(torch.abs(residual_lin)**2, dim=1, keepdim=True)
         log_power = torch.log10(residual_power + 1e-10)
 
         score_magnitude = torch.abs(score)  # [B, 3]
@@ -683,19 +709,15 @@ class ScoreBasedThetaUpdater(nn.Module):
         theta_clamped = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
 
         # === Step 8: Acceptance Test ===
-        # CRITICAL FIX (Expert advice): Use quantization-consistent residual!
-        # The observation y_obs is 1-bit quantized, so we must compare with Q(y_pred)
-        # Otherwise: acceptance unreliable, score direction wrong, μ → 0 or explodes
-        y_pred_old = phys_enc.forward_operator(x_est, theta)
-        y_pred_new = phys_enc.forward_operator(x_est, theta_clamped)
+        # Use Bussgang-linearized residual for consistent comparison
+        # Note: x_est and y_obs are now pilots only (truncated by caller)
+        y_pred_old = phys_enc.forward_operator(x_est, theta)[:, :N]
+        y_pred_new = phys_enc.forward_operator(x_est, theta_clamped)[:, :N]
 
-        # Apply 1-bit quantization to predictions for consistent comparison
-        y_pred_old_q = quantize_1bit_torch(y_pred_old)
-        y_pred_new_q = quantize_1bit_torch(y_pred_new)
-
-        # Residual in quantized domain (same domain as y_obs)
-        resid_old = torch.mean(torch.abs(y_obs - y_pred_old_q)**2, dim=1, keepdim=True)
-        resid_new = torch.mean(torch.abs(y_obs - y_pred_new_q)**2, dim=1, keepdim=True)
+        # Bussgang-linearized residual (consistent with score computation)
+        y_tilde_old = y_obs / (alpha + 1e-6)
+        resid_old = torch.mean(torch.abs(y_tilde_old - y_pred_old)**2, dim=1, keepdim=True)
+        resid_new = torch.mean(torch.abs(y_tilde_old - y_pred_new)**2, dim=1, keepdim=True)
 
         # Accept if new residual is better (with small tolerance)
         accept = (resid_new < resid_old * (1 + self.acceptance_relaxation)).float()
@@ -720,6 +742,7 @@ class ScoreBasedThetaUpdater(nn.Module):
             'delta_a': delta_theta[:, 2].abs().mean().item(),
             'confidence': confidence.mean().item(),
             'residual_improvement': improvement.mean().item(),
+            'bussgang_alpha': alpha.mean().item(),  # New diagnostic
         }
 
         return theta_final, info
@@ -928,6 +951,9 @@ class GABVNet(nn.Module):
         # === Step 5: Iterative Refinement ===
         layer_outputs = []
 
+        # Pilot length for theta update (P0-3 fix: use pilots only)
+        pilot_len = self.pn_tracker.n_pilot
+
         for k, layer in enumerate(self.solver_layers):
             # VAMP iteration
             z, x_est = layer(z, gamma, self.phys_enc, theta)
@@ -935,23 +961,31 @@ class GABVNet(nn.Module):
             # Theta update (if enabled)
             theta_info = {}
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # Re-compute Doppler-removed signal with current theta
-                z_with_current_theta = self.phys_enc.adjoint_operator(y_q, theta)
+                # P0-3 FIX: Use ONLY PILOTS for theta update
+                # Using full x_est introduces symbol errors that bias theta updates
+                # The network learns to shut down g_theta to avoid this bias
+                x_for_theta = x_est[:, :pilot_len]
+                y_for_theta = y_q[:, :pilot_len]
 
-                # Compute residual in Doppler-corrected space
-                # x_est should match z_with_current_theta after PN correction
-                residual = z_derotated - x_est
-
-                # Update theta (with SNR for BCRLB scaling)
+                # Update theta using pilots only
                 theta, theta_info = self.theta_updater(
-                    theta, residual, x_est,
+                    theta, None, x_for_theta,  # residual=None, computed internally
                     gates['g_theta'], self.phys_enc,
-                    y_q, g_theta_sched, snr_db
+                    y_for_theta, g_theta_sched, snr_db
                 )
 
-                # Update z_derotated with new theta for consistency
+                # P0-1 FIX: Sync z to new theta!
+                # Without this, theta update benefits don't propagate to subsequent layers
+                # The network learns to shut down updates since they don't improve comm loss
                 z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
                 z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
+
+                # CRITICAL: Sync the solver state z to the new z_derotated
+                # Option 1: Hard sync (use this first to verify theta learning works)
+                z = z_derotated
+                # Option 2: Soft sync (uncomment if hard sync is too aggressive)
+                # beta = 0.5
+                # z = (1 - beta) * z + beta * z_derotated
 
             layer_outputs.append({
                 'x_est': x_est.detach(),

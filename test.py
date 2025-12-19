@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-debug_theta_updater.py - Diagnose why theta update is not working
+debug_theta_updater.py - Diagnose theta updater with P0-1/2/3 fixes
 
-Key observations from evaluation:
-- g_theta = 0.005-0.07 (almost zero!)
-- RMSE_τ ≈ init (no improvement)
-- Curve C ≈ Curve B (theta update has no effect)
+Expert fixes applied:
+- P0-1: Sync z to new theta after update
+- P0-2: Use Bussgang-linearized residual instead of quantized
+- P0-3: Use pilots only for theta update
 
-This script will check each component of theta updater.
+Key metrics to watch:
+- residual_improvement > 0: theta update is helping
+- RMSE_τ < init: theta is being tracked
 """
 
 import torch
@@ -15,13 +17,13 @@ import numpy as np
 import math
 
 # Local imports
-from gabv_net_model import GABVNet, GABVConfig, create_gabv_model, PhysicsEncoder, quantize_1bit_torch
+from gabv_net_model import GABVNet, GABVConfig, create_gabv_model, PhysicsEncoder
 from thz_isac_world import SimConfig, simulate_batch
 
 
 def main():
     print("=" * 70)
-    print("THETA UPDATER DIAGNOSTIC")
+    print("THETA UPDATER DIAGNOSTIC (P0-1/2/3 Fixes)")
     print("=" * 70)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -50,8 +52,10 @@ def main():
     print(f"  theta_init[0]: tau={theta_init[0, 0] / Ts:.3f} samples, v={theta_init[0, 1]:.1f} m/s")
     print(f"  theta_error[0]: tau={abs(theta_init[0, 0] - theta_true[0, 0]) / Ts:.3f} samples")
 
-    # === Check 1: Meta features ===
-    print(f"\n[Check 1: Meta Features]")
+    # === Check: Full Model Forward Pass ===
+    print(f"\n[Full Model Forward Pass]")
+
+    # Construct meta features
     snr_db = sim_cfg.snr_db
     snr_db_norm = (snr_db - 15) / 15
     gamma_eff = data['meta'].get('gamma_eff', 1.0)
@@ -60,164 +64,68 @@ def main():
     chi = data['meta'].get('chi', 1.0)
 
     meta_np = np.array([
-        snr_db_norm,  # -0.33 to 0.67 for SNR -5 to 25
-        gamma_eff_db_norm,  # normalized gamma_eff
-        chi,  # Bussgang factor
-        0.0,  # sigma_eta_norm
-        np.log10(100e3) / np.log10(1e6),  # pn_linewidth_norm
-        0.0,  # ibo_db_norm
+        snr_db_norm, gamma_eff_db_norm, chi, 0.0,
+        np.log10(100e3) / np.log10(1e6), 0.0,
     ], dtype=np.float32)
     meta = torch.from_numpy(np.tile(meta_np, (4, 1))).to(device)
 
-    print(f"  meta[0]: {meta[0].cpu().numpy()}")
-    print(f"  snr_db_norm: {snr_db_norm:.3f}")
+    batch = {
+        'y_q': y_q,
+        'x_true': x_true,
+        'theta_init': theta_init.clone(),
+        'meta': meta,
+        'snr_db': snr_db,
+    }
 
-    # === Check 2: Gate Network Output ===
-    print(f"\n[Check 2: Gate Network (PilotNavigator)]")
-    gates = model.pilot(meta)
-    print(f"  g_data:  {gates['g_data'].mean().item():.4f}")
-    print(f"  g_prior: {gates['g_prior'].mean().item():.4f}")
-    print(f"  g_pn:    {gates['g_pn'].mean().item():.4f}")
-    print(f"  g_theta: {gates['g_theta'].mean().item():.4f}")
-
-    if gates['g_theta'].mean().item() < 0.1:
-        print(f"  ⚠️ WARNING: g_theta too small! Theta update will be ineffective.")
-        print(f"     This is likely the ROOT CAUSE of the problem.")
-
-    # === Check 3: Theta Updater Internals ===
-    print(f"\n[Check 3: Theta Updater Internals]")
-
-    # Run forward pass to get x_est
     with torch.no_grad():
-        z = model.phys_enc.adjoint_operator(y_q, theta_init)
-        z_derotated, phi_est = model.pn_tracker(z, meta, x_true[:, :64])
+        outputs = model(batch, g_theta_sched=1.0)
 
-        # Get x_est from one VAMP layer
-        gamma = torch.ones(4, 1, device=device)
-        z_vamp, x_est = model.solver_layers[0](z_derotated, gamma, model.phys_enc, theta_init)
+    theta_hat = outputs['theta_hat']
 
-        # Compute residual manually
-        y_pred = model.phys_enc.forward_operator(x_est, theta_init)
-        y_pred_q = quantize_1bit_torch(y_pred)
-        residual = y_q - y_pred_q
+    print(f"  theta_init[0]:  tau={theta_init[0, 0] / Ts:.4f} samples")
+    print(f"  theta_hat[0]:   tau={theta_hat[0, 0] / Ts:.4f} samples")
+    print(f"  theta_true[0]:  tau={theta_true[0, 0] / Ts:.4f} samples")
 
-        print(f"  x_est amplitude: {torch.abs(x_est).mean().item():.6f}")
-        print(f"  residual power: {torch.mean(torch.abs(residual) ** 2).item():.6f}")
+    init_error = abs(theta_init[0, 0] - theta_true[0, 0]) / Ts
+    final_error = abs(theta_hat[0, 0] - theta_true[0, 0]) / Ts
+    improvement = init_error - final_error
 
-        # Compute Jacobian
-        dy_dtheta = model.phys_enc.compute_channel_jacobian(theta_init, x_est)
-        dy_dtau, dy_dv, dy_da = dy_dtheta
+    print(f"\n  init_error:  {init_error:.4f} samples")
+    print(f"  final_error: {final_error:.4f} samples")
+    print(f"  improvement: {improvement:.4f} samples")
 
-        # Compute score using UNIT-NORMALIZED Jacobians (new method)
-        eps = 1e-10
-
-        dy_dtau_norm = torch.sqrt(torch.sum(torch.abs(dy_dtau) ** 2, dim=1, keepdim=True) + eps)
-        dy_dtau_hat = dy_dtau / dy_dtau_norm
-        score_tau = torch.real(torch.sum(torch.conj(dy_dtau_hat) * residual, dim=1, keepdim=True))
-
-        dy_dv_norm = torch.sqrt(torch.sum(torch.abs(dy_dv) ** 2, dim=1, keepdim=True) + eps)
-        dy_dv_hat = dy_dv / dy_dv_norm
-        score_v = torch.real(torch.sum(torch.conj(dy_dv_hat) * residual, dim=1, keepdim=True))
-
-        dy_da_norm = torch.sqrt(torch.sum(torch.abs(dy_da) ** 2, dim=1, keepdim=True) + eps)
-        dy_da_hat = dy_da / dy_da_norm
-        score_a = torch.real(torch.sum(torch.conj(dy_da_hat) * residual, dim=1, keepdim=True))
-
-        print(f"  |dy/dtau|: {dy_dtau_norm.mean().item():.6e}")
-        print(f"  |dy/dv|:   {dy_dv_norm.mean().item():.6e}")
-        print(f"  score_tau (unit-norm): {score_tau.mean().item():.6f}")
-        print(f"  score_v (unit-norm):   {score_v.mean().item():.6f}")
-        print(f"  score_a (unit-norm):   {score_a.mean().item():.6f}")
-
-        # Compute step sizes from network
-        residual_power = torch.mean(torch.abs(residual) ** 2, dim=1, keepdim=True)
-        log_power = torch.log10(residual_power + 1e-10)
-        score_magnitude = torch.abs(torch.cat([score_tau, score_v, score_a], dim=1))
-
-        x_est_amplitude = torch.mean(torch.abs(x_est), dim=1, keepdim=True).clamp(min=1e-6)
-        x_est_normalized = x_est / x_est_amplitude
-        confidence = 1.0 - torch.mean(
-            torch.abs(torch.abs(x_est_normalized.real) - 1 / math.sqrt(2)) ** 2 +
-            torch.abs(torch.abs(x_est_normalized.imag) - 1 / math.sqrt(2)) ** 2,
-            dim=1, keepdim=True
-        )
-        confidence = torch.clamp(confidence, 0, 1)
-
-        snr_norm = torch.tensor([[(snr_db - 15) / 15]], device=device).expand(4, 1)
-
-        feat = torch.cat([
-            log_power, score_magnitude, gates['g_theta'], confidence, snr_norm
-        ], dim=1).float()
-
-        print(f"  feat[0]: {feat[0].cpu().numpy()}")
-        print(f"  confidence: {confidence.mean().item():.4f}")
-
-        step_sizes = model.theta_updater.step_net(feat)
-        print(f"  step_sizes (raw): {step_sizes[0].cpu().numpy()}")
-
-        step_sizes_scaled = step_sizes * model.theta_updater.bcrlb_scale.unsqueeze(0)
-        print(f"  step_sizes (scaled): {step_sizes_scaled[0].cpu().numpy()}")
-
-        # Compute delta
-        score = torch.cat([score_tau, score_v, score_v], dim=1)
-        delta_theta = -step_sizes_scaled * score
-        print(
-            f"  delta_theta (raw): tau={delta_theta[0, 0].item() / Ts:.6f} samples, v={delta_theta[0, 1].item():.6f} m/s")
-
-        # Apply clamp
-        delta_theta_clamped = torch.clamp(delta_theta, -model.theta_updater.max_delta, model.theta_updater.max_delta)
-        print(
-            f"  delta_theta (clamped): tau={delta_theta_clamped[0, 0].item() / Ts:.6f} samples, v={delta_theta_clamped[0, 1].item():.6f} m/s")
-
-        # Apply gate (simplified - matches new model)
-        effective_gate = gates['g_theta'] * 1.0  # g_theta_sched = 1.0
-        min_gate = 0.1
-        effective_gate = torch.maximum(effective_gate, torch.tensor(min_gate, device=device))
-        print(f"  effective_gate: {effective_gate.mean().item():.4f}")
-
-        delta_theta_gated = effective_gate * delta_theta_clamped
-        print(
-            f"  delta_theta (gated): tau={delta_theta_gated[0, 0].item() / Ts:.6f} samples, v={delta_theta_gated[0, 1].item():.6f} m/s")
-
-        # Final update
-        theta_new = theta_init + delta_theta_gated
-        print(f"\n  theta_init[0]:  tau={theta_init[0, 0].item() / Ts:.6f} samples")
-        print(f"  theta_new[0]:   tau={theta_new[0, 0].item() / Ts:.6f} samples")
-        print(f"  theta_true[0]:  tau={theta_true[0, 0].item() / Ts:.6f} samples")
-
-        improvement = abs(theta_init[0, 0] - theta_true[0, 0]) - abs(theta_new[0, 0] - theta_true[0, 0])
-        print(f"  improvement: {improvement.item() / Ts:.6f} samples ({'better' if improvement > 0 else 'WORSE'})")
+    # Check layer diagnostics
+    if outputs['layers']:
+        last_layer = outputs['layers'][-1]
+        if 'theta_info' in last_layer and last_layer['theta_info']:
+            theta_info = last_layer['theta_info']
+            print(f"\n[Theta Update Diagnostics]")
+            print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A')}")
+            print(f"  accept_rate: {theta_info.get('accept_rate', 'N/A')}")
+            print(f"  soft_accept: {theta_info.get('soft_accept', 'N/A')}")
+            print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A')}")
+            print(f"  delta_tau: {theta_info.get('delta_tau', 'N/A')}")
+            if 'bussgang_alpha' in theta_info:
+                print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A')}")
 
     # === Summary ===
     print(f"\n" + "=" * 70)
     print("DIAGNOSIS SUMMARY")
     print("=" * 70)
 
-    issues = []
-
-    if gates['g_theta'].mean().item() < 0.2:
-        issues.append("g_theta too small (gate almost closed)")
-
-    if confidence.mean().item() < 0.5:
-        issues.append("confidence too low (confidence gate reduces update)")
-
-    if abs(delta_theta_gated[0, 0].item()) < 1e-14:
-        issues.append("delta_theta_gated ≈ 0 (no update happening)")
-
-    if improvement < 0:
-        issues.append("theta update made things WORSE")
-
-    if not issues:
-        print("  No obvious issues found. May need deeper investigation.")
+    if improvement > 0.01:
+        print(f"  ✓ Theta update is IMPROVING tau estimation by {improvement:.4f} samples")
+    elif improvement > -0.01:
+        print(f"  ? Theta update has MINIMAL effect ({improvement:.4f} samples)")
     else:
-        print("  ISSUES FOUND:")
-        for i, issue in enumerate(issues, 1):
-            print(f"    {i}. {issue}")
+        print(f"  ✗ Theta update is MAKING THINGS WORSE by {-improvement:.4f} samples")
 
-    print("\n[RECOMMENDED FIXES]")
-    print("  1. Initialize g_theta gate to higher value (e.g., 0.5 not ~0)")
-    print("  2. Remove or simplify the gate mechanism during initial training")
-    print("  3. Check if score direction is correct (should point toward theta_true)")
+    # Check gates
+    g_theta = outputs['gates']['g_theta'].mean().item()
+    if g_theta > 0.3:
+        print(f"  ✓ g_theta = {g_theta:.3f} (healthy)")
+    else:
+        print(f"  ⚠ g_theta = {g_theta:.3f} (may be too low)")
 
 
 if __name__ == "__main__":
