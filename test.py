@@ -100,13 +100,33 @@ def main():
         if 'theta_info' in last_layer and last_layer['theta_info']:
             theta_info = last_layer['theta_info']
             print(f"\n[Theta Update Diagnostics]")
-            print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A')}")
+            print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A'):.4f}")
             print(f"  accept_rate: {theta_info.get('accept_rate', 'N/A')}")
-            print(f"  soft_accept: {theta_info.get('soft_accept', 'N/A')}")
-            print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A')}")
-            print(f"  delta_tau: {theta_info.get('delta_tau', 'N/A')}")
+            print(f"  soft_accept: {theta_info.get('soft_accept', 'N/A'):.4f}")
+            print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A'):.6f}")
+
+            # Delta tau in samples
+            delta_tau_s = theta_info.get('delta_tau', 0)
+            print(f"  delta_tau: {delta_tau_s:.4e} s = {delta_tau_s / Ts:.4f} samples")
+
+            # Score info
+            if 'score' in theta_info:
+                score = theta_info['score']
+                print(f"  score[tau]: {score[0, 0].item():.4f}")
+
+            # Step sizes info
+            if 'step_sizes' in theta_info:
+                step_sizes = theta_info['step_sizes']
+                print(f"  step_sizes[tau]: {step_sizes[0, 0].item():.4f}")
+
+            # BCRLB scale
+            print(
+                f"  bcrlb_scale[tau]: {model.theta_updater.bcrlb_scale[0].item():.4e} s = {model.theta_updater.bcrlb_scale[0].item() / Ts:.4f} samples")
+            print(
+                f"  max_delta[tau]: {model.theta_updater.max_delta[0].item():.4e} s = {model.theta_updater.max_delta[0].item() / Ts:.4f} samples")
+
             if 'bussgang_alpha' in theta_info:
-                print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A')}")
+                print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A'):.4f}")
 
     # Check phi_est
     if 'phi_est' in outputs:

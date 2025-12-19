@@ -178,10 +178,12 @@ def test_with_phase_offset():
     x = (torch.sign(torch.randn(1, N)) + 1j * torch.sign(torch.randn(1, N))) / math.sqrt(2)
     X = torch.fft.fft(x)
 
-    def forward(tau, phi0=0.0):
+    def forward(tau, phi0=None):
         H_D = torch.exp(-1j * 2 * math.pi * f_grid * tau)
         y = torch.fft.ifft(X * H_D, dim=1)
-        return y * torch.exp(1j * phi0)  # Apply constant phase
+        if phi0 is not None:
+            return y * torch.exp(1j * phi0)  # Apply constant phase
+        return y
 
     def jacobian(tau):
         H_D = torch.exp(-1j * 2 * math.pi * f_grid * tau)
@@ -190,18 +192,18 @@ def test_with_phase_offset():
         return dy  # Note: No phi0 in Jacobian!
 
     tau_true = 0.0
-    tau_init = -0.5 * Ts
-    phi0 = 0.5  # Random phase offset
+    tau_init = -0.5 * Ts  # -0.5 samples
+    phi0 = torch.tensor(0.5)  # Random phase offset (as tensor)
 
     print(f"\n[Scenario with phi0]")
     print(f"  tau_init = {tau_init / Ts:.3f} samples")
-    print(f"  phi0 = {phi0:.3f} rad ({phi0 * 180 / math.pi:.1f}°)")
+    print(f"  phi0 = {phi0.item():.3f} rad ({phi0.item() * 180 / math.pi:.1f}°)")
 
     # Observation includes phi0
     y_obs = forward(tau_true, phi0)
 
     # Prediction does NOT include phi0 (common bug!)
-    y_pred_wrong = forward(tau_init, phi0=0.0)
+    y_pred_wrong = forward(tau_init, phi0=None)  # No phi0
 
     # Prediction WITH phi0 (correct)
     y_pred_correct = forward(tau_init, phi0)
