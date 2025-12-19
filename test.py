@@ -138,16 +138,36 @@ else:
     print(f"  x_hat[0,:5]: {x_hat[0, :5].tolist()}")
     print(f"  x_true[0,:5]: {x_true[0, :5].tolist()}")
 
-    # Check if PN tracker is the problem
-    y_derotated, phi_est = model.pn_tracker(y, meta, x_true[:, :64])
-    ber_after_pn = compute_ber(y_derotated, x_true)
-    print(f"  BER after PN tracker only: {ber_after_pn:.4f}")
-    print(f"  phi_est mean: {phi_est.detach().mean().item():.4f}")
+    # Check amplitude mismatch
+    x_hat_amp = torch.abs(x_hat).mean().item()
+    x_true_amp = torch.abs(x_true).mean().item()
+    print(f"  x_hat amplitude: {x_hat_amp:.6f}")
+    print(f"  x_true amplitude: {x_true_amp:.6f}")
+    print(f"  Amplitude ratio: {x_hat_amp / x_true_amp:.2f}")
 
-    # Check after adjoint
-    z = phys_enc.adjoint_operator(y_derotated.detach(), theta_true)
-    ber_after_adj = compute_ber(z, x_true)
-    print(f"  BER after adjoint (post-PN): {ber_after_adj:.4f}")
+    # NEW: Test correct order of operations
+    print(f"\n  [Testing correct operation order]")
+    print(f"  CORRECT: adjoint FIRST, then PN tracker")
+
+    # Step 1: adjoint first (removes Doppler)
+    z_adj = phys_enc.adjoint_operator(y, theta_true)
+    ber_after_adj_only = compute_ber(z_adj, x_true)
+    print(f"  BER after adjoint only: {ber_after_adj_only:.4f}")
+
+    # Step 2: PN tracker on adjoint output
+    z_pn, phi = model.pn_tracker(z_adj, meta, x_true[:, :64])
+    ber_after_adj_pn = compute_ber(z_pn, x_true)
+    print(f"  BER after adjoint → PN: {ber_after_adj_pn:.4f}")
+
+    print(f"\n  WRONG: PN tracker first, then adjoint")
+    # Wrong order for comparison
+    y_pn_first, _ = model.pn_tracker(y, meta, x_true[:, :64])
+    ber_pn_first = compute_ber(y_pn_first, x_true)
+    print(f"  BER after PN only: {ber_pn_first:.4f}")
+
+    z_wrong = phys_enc.adjoint_operator(y_pn_first.detach(), theta_true)
+    ber_wrong_order = compute_ber(z_wrong, x_true)
+    print(f"  BER after PN → adjoint: {ber_wrong_order:.4f}")
 
 print("\n" + "=" * 60)
 print("DEBUG COMPLETE")

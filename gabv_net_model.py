@@ -773,6 +773,23 @@ class GABVNet(nn.Module):
         """
         Forward pass.
 
+        CRITICAL FIX: Correct order of operations!
+        ==================================================
+
+        Old order (WRONG):
+            y_q → PN_tracker → adjoint → VAMP → refine
+
+            Problem: Doppler phase is TIME-VARYING!
+            PN tracker estimates constant phase from pilots, but Doppler
+            causes different phase at different time indices.
+            Result: BER = 0.5
+
+        New order (CORRECT):
+            y_q → adjoint (remove Doppler) → PN_tracker → VAMP → refine
+
+            The adjoint removes time-varying Doppler first.
+            Then PN tracker only handles the constant nuisance phase φ₀.
+
         Args:
             batch: Dictionary with:
                 - y_q: Quantized received signal [B, N]
@@ -802,20 +819,26 @@ class GABVNet(nn.Module):
         # Get pilots if available
         x_pilot = batch.get('x_true', None)
         if x_pilot is not None:
-            x_pilot = x_pilot[:, :self.pn_tracker.n_pilot]
+            x_pilot_slice = x_pilot[:, :self.pn_tracker.n_pilot]
+        else:
+            x_pilot_slice = None
 
-        # === Step 1: PN Tracking (removes nuisance phase) ===
-        y_derotated, phi_est = self.pn_tracker(y_q, meta, x_pilot)
+        # === Step 1: Apply adjoint FIRST to remove Doppler ===
+        # This is CRITICAL: Doppler phase is time-varying, must remove first!
+        z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
 
-        # === Step 2: Compute Gates ===
+        # === Step 2: PN Tracking on Doppler-corrected signal ===
+        # Now we only need to estimate/remove the constant phase offset φ₀
+        z_derotated, phi_est = self.pn_tracker(z_doppler_removed, meta, x_pilot_slice)
+
+        # === Step 3: Compute Gates ===
         gates = self.pilot(meta)
 
-        # === Step 3: Initialize ===
-        # Use adjoint as initial estimate
-        z = self.phys_enc.adjoint_operator(y_derotated, theta)
+        # === Step 4: Initialize VAMP ===
+        z = z_derotated
         gamma = torch.ones(B, 1, device=device)
 
-        # === Step 4: Iterative Refinement ===
+        # === Step 5: Iterative Refinement ===
         layer_outputs = []
 
         for k, layer in enumerate(self.solver_layers):
@@ -825,16 +848,23 @@ class GABVNet(nn.Module):
             # Theta update (if enabled)
             theta_info = {}
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # Compute residual
-                y_pred = self.phys_enc.forward_operator(x_est, theta)
-                residual = y_derotated - y_pred
+                # Re-compute Doppler-removed signal with current theta
+                z_with_current_theta = self.phys_enc.adjoint_operator(y_q, theta)
+
+                # Compute residual in Doppler-corrected space
+                # x_est should match z_with_current_theta after PN correction
+                residual = z_derotated - x_est
 
                 # Update theta (with SNR for BCRLB scaling)
                 theta, theta_info = self.theta_updater(
                     theta, residual, x_est,
                     gates['g_theta'], self.phys_enc,
-                    y_derotated, g_theta_sched, snr_db
+                    y_q, g_theta_sched, snr_db
                 )
+
+                # Update z_derotated with new theta for consistency
+                z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
+                z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
 
             layer_outputs.append({
                 'x_est': x_est.detach(),
@@ -843,7 +873,7 @@ class GABVNet(nn.Module):
                 'theta_info': theta_info,
             })
 
-        # === Step 5: Final Refinement with Residual ===
+        # === Step 6: Final Refinement with Residual ===
         if self.bypass_refiner:
             x_hat = x_est
         else:
