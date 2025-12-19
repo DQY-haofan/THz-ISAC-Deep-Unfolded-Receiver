@@ -235,7 +235,8 @@ def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[f
 def evaluate_snr_sweep(model: GABVNet, device: str,
                        snr_range: np.ndarray,
                        n_mc: int = 10,
-                       theta_noise_samples: float = 0.5) -> Dict:
+                       theta_noise_samples: float = 0.5,
+                       enable_theta_update: bool = True) -> Dict:
     """
     Evaluate model across SNR range.
 
@@ -245,10 +246,15 @@ def evaluate_snr_sweep(model: GABVNet, device: str,
         snr_range: Array of SNR values [dB]
         n_mc: Monte Carlo trials per SNR
         theta_noise_samples: Initial theta noise in samples
+        enable_theta_update: Whether to enable theta update in model
 
     Returns:
         Dictionary with BER, RMSE vs SNR
     """
+    # Temporarily modify model's theta update setting
+    original_enable_theta_update = model.cfg.enable_theta_update
+    model.cfg.enable_theta_update = enable_theta_update
+
     results = {
         'snr_db': [],
         'ber': [],
@@ -334,6 +340,9 @@ def evaluate_snr_sweep(model: GABVNet, device: str,
         results['rmse_tau_init_samples'].append(np.mean(rmse_tau_inits))
         results['accept_rate'].append(np.mean(accept_rates))
         results['g_theta'].append(np.mean(g_thetas))
+
+    # Restore original setting
+    model.cfg.enable_theta_update = original_enable_theta_update
 
     return results
 
@@ -459,6 +468,79 @@ def plot_snr_sweep(results: Dict, out_dir: Path):
     plt.close()
 
 
+def plot_snr_sweep_abc(results_A: Dict, results_B: Dict, results_C: Dict, out_dir: Path):
+    """
+    Plot A/B/C curves for sanity check (Expert recommendation).
+
+    - Curve A: Pure communication (theta exact)
+    - Curve B: Theta mismatch, no update
+    - Curve C: Theta mismatch, with update
+    """
+    if not HAS_PLT:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # BER comparison
+    ax = axes[0]
+    ax.semilogy(results_A['snr_db'], results_A['ber'], 'g-o', label='A: Comm Only (θ exact)', linewidth=2)
+    ax.semilogy(results_B['snr_db'], results_B['ber'], 'r-s', label='B: θ Error, No Update', linewidth=2)
+    ax.semilogy(results_C['snr_db'], results_C['ber'], 'b-^', label='C: θ Error, With Update', linewidth=2)
+    ax.axhline(y=0.5, color='gray', linestyle=':', label='Random Guess')
+    ax.set_xlabel('SNR [dB]', fontsize=12)
+    ax.set_ylabel('BER', fontsize=12)
+    ax.set_title('BER vs SNR: A/B/C Curves', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right')
+    ax.set_ylim([1e-4, 1])
+
+    # Analysis text box
+    ax = axes[1]
+    ax.axis('off')
+
+    # Compute analysis
+    a_decreases = results_A['ber'][0] > results_A['ber'][-1]
+    b_worse_than_a = np.mean(results_B['ber']) > np.mean(results_A['ber'])
+    c_better_than_b = np.mean(results_C['ber']) < np.mean(results_B['ber'])
+
+    analysis_text = """
+    SANITY CHECK ANALYSIS (Expert Recommendation)
+    ================================================
+
+    Curve A (θ exact): Tests pure communication ability
+      → BER should decrease with SNR
+      → Result: {}
+
+    Curve B (θ error, no update): Tests θ mismatch impact  
+      → BER should be worse than A (θ error hurts)
+      → Result: {}
+
+    Curve C (θ error, with update): Tests θ updater
+      → BER should be better than B (update helps)
+      → Result: {}
+
+    DIAGNOSIS:
+    {}
+    """.format(
+        "✓ PASS - Communication works" if a_decreases else "✗ FAIL - Communication broken",
+        "✓ PASS - θ error hurts" if b_worse_than_a else "? CHECK - Unexpected",
+        "✓ PASS - θ update helps" if c_better_than_b else "✗ FAIL - θ update not helping",
+        "Communication OK, θ updater OK" if (a_decreases and c_better_than_b) else
+        "Fix θ updater residual domain" if (a_decreases and not c_better_than_b) else
+        "Fix communication module first"
+    )
+
+    ax.text(0.05, 0.95, analysis_text, transform=ax.transAxes, fontsize=11,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+    plt.savefig(out_dir / 'snr_sweep_abc.png', dpi=150)
+    plt.close()
+
+    print(f"[Plot] Saved A/B/C curves to {out_dir / 'snr_sweep_abc.png'}")
+
+
 def plot_identifiability_cliff(results: Dict, out_dir: Path):
     """Plot identifiability cliff."""
     if not HAS_PLT:
@@ -571,21 +653,69 @@ def main():
         print("Failed to load model. Exiting.")
         return
 
-    # === SNR Sweep ===
+    # === SNR Sweep: Three Curves (Expert recommendation) ===
+    # Curve A: Pure communication (theta_noise=0, exact theta)
+    # Curve B: Theta init error only (theta_noise=0.5, no theta update)
+    # Curve C: Full tracking (theta_noise=0.5, with theta update)
     print("\n" + "=" * 60)
-    print("SNR SWEEP")
+    print("SNR SWEEP (A/B/C Curves)")
     print("=" * 60)
 
-    snr_range = np.arange(-5, 26, 2)
-    snr_results = evaluate_snr_sweep(model, device, snr_range, n_mc=args.n_mc)
+    snr_range = np.arange(-5, 26, 3)  # Coarser for faster evaluation
 
-    print("\nResults:")
+    # Curve A: Pure communication ability (should decrease with SNR)
+    print("\n[Curve A] Pure Communication (theta_noise=0, exact theta)")
+    results_A = evaluate_snr_sweep(model, device, snr_range, n_mc=args.n_mc,
+                                   theta_noise_samples=0.0, enable_theta_update=False)
+    print("  SNR(dB):", [f"{s:.0f}" for s in results_A['snr_db']])
+    print("  BER:    ", [f"{b:.4f}" for b in results_A['ber']])
+
+    # Curve B: Theta mismatch only (shows impact of theta error)
+    print("\n[Curve B] Theta Mismatch (theta_noise=0.5, NO theta update)")
+    results_B = evaluate_snr_sweep(model, device, snr_range, n_mc=args.n_mc,
+                                   theta_noise_samples=0.5, enable_theta_update=False)
+    print("  SNR(dB):", [f"{s:.0f}" for s in results_B['snr_db']])
+    print("  BER:    ", [f"{b:.4f}" for b in results_B['ber']])
+
+    # Curve C: Full tracking (shows theta updater effectiveness)
+    print("\n[Curve C] Full Tracking (theta_noise=0.5, WITH theta update)")
+    results_C = evaluate_snr_sweep(model, device, snr_range, n_mc=args.n_mc,
+                                   theta_noise_samples=0.5, enable_theta_update=True)
+    print("  SNR(dB):", [f"{s:.0f}" for s in results_C['snr_db']])
+    print("  BER:    ", [f"{b:.4f}" for b in results_C['ber']])
+
+    # Analysis
+    print("\n" + "-" * 60)
+    print("ANALYSIS:")
+    print("-" * 60)
+    if results_A['ber'][0] > results_A['ber'][-1]:
+        print("  ✓ Curve A: BER decreases with SNR (communication works)")
+    else:
+        print("  ✗ Curve A: BER NOT decreasing with SNR (communication broken)")
+
+    if np.mean(results_B['ber']) > np.mean(results_A['ber']):
+        print("  ✓ Curve B > Curve A: Theta mismatch hurts performance")
+    else:
+        print("  ? Curve B ≤ Curve A: Unexpected (check theta noise)")
+
+    if np.mean(results_C['ber']) < np.mean(results_B['ber']):
+        print("  ✓ Curve C < Curve B: Theta update HELPS")
+    else:
+        print("  ✗ Curve C ≥ Curve B: Theta update NOT helping (FIX THIS)")
+
+    # Use full sweep for detailed results
+    snr_range_full = np.arange(-5, 26, 2)
+    snr_results = evaluate_snr_sweep(model, device, snr_range_full, n_mc=args.n_mc,
+                                     theta_noise_samples=0.5, enable_theta_update=True)
+
+    print("\nDetailed Results (Curve C):")
     for i, snr in enumerate(snr_results['snr_db']):
         print(f"  SNR={snr:3.0f}dB: BER={snr_results['ber'][i]:.4f}, "
               f"RMSE_τ={snr_results['rmse_tau_samples'][i]:.3f} samples "
               f"(init={snr_results['rmse_tau_init_samples'][i]:.3f})")
 
-    plot_snr_sweep(snr_results, out_dir)
+    # Plot all three curves
+    plot_snr_sweep_abc(results_A, results_B, results_C, out_dir)
 
     # === Identifiability Cliff ===
     print("\n" + "=" * 60)

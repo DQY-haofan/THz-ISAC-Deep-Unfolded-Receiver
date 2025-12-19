@@ -460,7 +460,21 @@ def train_one_stage(
             sim_cfg.a_rel = 0.0
             sim_cfg.phi0_random = False  # No random phase
             sim_cfg.coarse_acquisition_error_samples = 0.0
-        # Normal randomization
+        # Stage 1: Fixed hardware (Expert advice: randomization too wide causes BER variance)
+        # Train with fixed hardware first, then generalize later
+        elif stage_cfg.stage == 1:
+            sim_cfg.enable_pa = True
+            sim_cfg.enable_pn = stage_cfg.enable_pn
+            sim_cfg.pn_linewidth = 100e3  # Fixed: 100 kHz (middle of range)
+            sim_cfg.ibo_dB = 3.0  # Fixed: 3 dB (middle of range)
+        # Stage 2+: Gradually introduce hardware randomization
+        elif stage_cfg.stage == 2 and cfg.randomize_hardware:
+            # Narrow randomization for Stage 2
+            sim_cfg.enable_pa = True
+            sim_cfg.enable_pn = stage_cfg.enable_pn
+            sim_cfg.pn_linewidth = np.random.uniform(50e3, 200e3)  # Narrow range
+            sim_cfg.ibo_dB = np.random.uniform(2, 4)  # Narrow range
+        # Stage 3+: Full randomization
         elif cfg.randomize_hardware:
             sim_cfg.enable_pa = np.random.random() > 0.3
             sim_cfg.enable_pn = stage_cfg.enable_pn and (np.random.random() > 0.3)
@@ -518,6 +532,17 @@ def train_one_stage(
                     data['meta'].get('gamma_eff', 1.0)
                 )
                 bcrlb_diag = torch.from_numpy(bcrlb_np).float().to(device)
+
+                # CRITICAL: Clamp BCRLB to prevent division by tiny numbers (Expert advice)
+                # When SNR is high or gamma_eff is large, BCRLB can be very small
+                # leading to loss explosion (observed 1e9)
+                # Min values based on physical resolution:
+                #   tau: (0.01 sample)^2 = (1e-12 s)^2 = 1e-24 s² → use 1e-22
+                #   v: (0.1 m/s)^2 = 0.01 → use 1e-2
+                #   a: (0.01 m/s²)^2 = 0.0001 → use 1e-4
+                bcrlb_min = torch.tensor([1e-22, 1e-2, 1e-4], device=device)
+                bcrlb_diag = torch.clamp(bcrlb_diag, min=bcrlb_min)
+
             except Exception:
                 bcrlb_diag = None  # Fall back to simple loss
 

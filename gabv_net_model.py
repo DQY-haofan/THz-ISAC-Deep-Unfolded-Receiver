@@ -82,6 +82,39 @@ class GABVConfig:
 
 
 # =============================================================================
+# 1-bit Quantization (PyTorch version for theta updater)
+# =============================================================================
+
+def quantize_1bit_torch(y: torch.Tensor) -> torch.Tensor:
+    """
+    1-bit quantization for complex signal (PyTorch version).
+
+    This is CRITICAL for theta updater consistency:
+    - The observation y_q is 1-bit quantized
+    - The residual must compare y_q with Q(y_pred), not y_pred directly
+    - Otherwise the score direction is wrong and acceptance is meaningless
+
+    Expert insight: Using analog residual r = y_q - H(θ)x̂ causes:
+    - Acceptance criterion to be unreliable
+    - Score direction to be wrong
+    - Step sizes μ to shrink to ~0 or explode
+
+    Args:
+        y: Complex tensor [B, N]
+
+    Returns:
+        y_q: Quantized complex tensor [B, N], values in {±1 ± 1j}/sqrt(2)
+    """
+    y_r = torch.sign(y.real)
+    y_i = torch.sign(y.imag)
+    # Handle zero (rare but possible)
+    y_r = torch.where(y_r == 0, torch.ones_like(y_r), y_r)
+    y_i = torch.where(y_i == 0, torch.ones_like(y_i), y_i)
+    y_q = (y_r + 1j * y_i) / math.sqrt(2)
+    return y_q
+
+
+# =============================================================================
 # Physics Encoder (Wideband Delay Model)
 # =============================================================================
 
@@ -611,12 +644,19 @@ class ScoreBasedThetaUpdater(nn.Module):
         theta_clamped = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
 
         # === Step 8: Acceptance Test ===
-        # Only accept if residual power decreases (with small relaxation)
+        # CRITICAL FIX (Expert advice): Use quantization-consistent residual!
+        # The observation y_obs is 1-bit quantized, so we must compare with Q(y_pred)
+        # Otherwise: acceptance unreliable, score direction wrong, μ → 0 or explodes
         y_pred_old = phys_enc.forward_operator(x_est, theta)
         y_pred_new = phys_enc.forward_operator(x_est, theta_clamped)
 
-        resid_old = torch.mean(torch.abs(y_obs - y_pred_old)**2, dim=1, keepdim=True)
-        resid_new = torch.mean(torch.abs(y_obs - y_pred_new)**2, dim=1, keepdim=True)
+        # Apply 1-bit quantization to predictions for consistent comparison
+        y_pred_old_q = quantize_1bit_torch(y_pred_old)
+        y_pred_new_q = quantize_1bit_torch(y_pred_new)
+
+        # Residual in quantized domain (same domain as y_obs)
+        resid_old = torch.mean(torch.abs(y_obs - y_pred_old_q)**2, dim=1, keepdim=True)
+        resid_new = torch.mean(torch.abs(y_obs - y_pred_new_q)**2, dim=1, keepdim=True)
 
         # Accept if new residual is better (with small tolerance)
         accept = (resid_new < resid_old * (1 + self.acceptance_relaxation)).float()
