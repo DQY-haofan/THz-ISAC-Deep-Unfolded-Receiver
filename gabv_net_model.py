@@ -705,14 +705,17 @@ class BussgangVAMPLayer(nn.Module):
         x_ri = z_ri + delta  # Residual: starts as identity
         x_normalized = x_ri[..., 0] + 1j * x_ri[..., 1]  # [B, N]
 
-        # QPSK projection: snap to nearest constellation point (unit amplitude)
-        phase = torch.angle(x_normalized)
-        # QPSK phases: π/4, 3π/4, -3π/4, -π/4
-        phase_quantized = torch.round(phase / (math.pi / 2)) * (math.pi / 2) + math.pi / 4
-        x_qpsk = torch.exp(1j * phase_quantized)  # Unit amplitude QPSK
+        # QPSK projection: use I/Q sign decision (CORRECT method!)
+        # QPSK constellation: (±1 ± 1j) / sqrt(2)
+        # Simply take sign of real and imag parts
+        I_sign = torch.sign(x_normalized.real)
+        Q_sign = torch.sign(x_normalized.imag)
+        # Handle exactly zero (rare, but possible)
+        I_sign = torch.where(I_sign == 0, torch.ones_like(I_sign), I_sign)
+        Q_sign = torch.where(Q_sign == 0, torch.ones_like(Q_sign), Q_sign)
+        x_qpsk = (I_sign + 1j * Q_sign) / math.sqrt(2)  # Unit power QPSK
 
         # Scale back to original amplitude
-        # FIX: No /sqrt(2)! Both x_qpsk and z_normalized are unit amplitude.
         x_qpsk_scaled = x_qpsk * z_amplitude
         x_est = x_normalized * z_amplitude  # Keep denoised estimate at correct scale
 
