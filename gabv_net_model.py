@@ -316,8 +316,9 @@ class RiemannianPNTracker(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Learnable phase bias for nuisance phase absorption
-        self.phase_bias = nn.Parameter(torch.tensor(-math.pi/2))
+        # Learnable phase bias - INITIALIZE TO ZERO!
+        # The network will learn the correct bias during training
+        self.phase_bias = nn.Parameter(torch.tensor(0.0))
 
         # Pilot-based phase estimation
         self.n_pilot = 64
@@ -329,9 +330,9 @@ class RiemannianPNTracker(nn.Module):
             nn.Linear(32, 2),  # [log_sigma, smoothness]
         )
 
-        # Time-varying phase predictor
+        # Time-varying phase predictor (not used in simple version)
         self.phase_net = nn.Sequential(
-            nn.Linear(4, 32),  # [real, imag, pilot_phase, meta_compressed]
+            nn.Linear(4, 32),
             nn.Tanh(),
             nn.Linear(32, 1),
         )
@@ -356,26 +357,21 @@ class RiemannianPNTracker(nn.Module):
         # Estimate nuisance constant phase from pilots
         if x_pilot is not None:
             y_pilot = y[:, :self.n_pilot]
-            # Phase = angle(y_pilot × conj(x_pilot))
-            pilot_phase = torch.angle(
-                torch.sum(y_pilot * torch.conj(x_pilot), dim=1, keepdim=True)
-            )
+            # Phase = angle(sum(y_pilot × conj(x_pilot)))
+            # This estimates the common phase offset
+            pilot_corr = torch.sum(y_pilot * torch.conj(x_pilot), dim=1, keepdim=True)
+            pilot_phase = torch.angle(pilot_corr)
         else:
             pilot_phase = torch.zeros(B, 1, device=device)
 
-        # Add learnable bias
+        # Add learnable bias (initialized to 0, will adapt during training)
         phi0_est = pilot_phase + self.phase_bias
 
-        # Predict PN statistics from meta
-        pn_stats = self.pn_stats_net(meta.float())
-        log_sigma = pn_stats[:, 0:1]
-        smoothness = torch.sigmoid(pn_stats[:, 1:2])
-
-        # Simple derotation: remove constant phase
-        # For time-varying PN, we use a simple exponential smoothing
+        # For now, use constant phase across all symbols
+        # (Future: add time-varying PN estimation)
         phi_est = phi0_est.expand(B, N)
 
-        # Derotate
+        # Derotate: y_derotated = y × exp(-j × φ_est)
         y_derotated = y * torch.exp(-1j * phi_est)
 
         return y_derotated, phi_est
@@ -659,12 +655,16 @@ class BussgangVAMPLayer(nn.Module):
         # Learnable damping
         self.damping = nn.Parameter(torch.tensor(0.5))
 
-        # Denoiser (simple MLP for now)
+        # Denoiser with residual connection
         self.denoiser = nn.Sequential(
             nn.Linear(2, 32),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(32, 2),
         )
+        # Initialize to zero for identity via residual
+        with torch.no_grad():
+            self.denoiser[-1].weight.zero_()
+            self.denoiser[-1].bias.zero_()
 
     def forward(self,
                 z: torch.Tensor,
@@ -690,13 +690,22 @@ class BussgangVAMPLayer(nn.Module):
         # Stack real/imag for denoiser
         z_ri = torch.stack([z.real, z.imag], dim=-1)  # [B, N, 2]
 
-        # Apply denoiser
-        x_ri = self.denoiser(z_ri.float())  # [B, N, 2]
+        # Apply denoiser with residual connection
+        delta = self.denoiser(z_ri.float())  # [B, N, 2]
+        x_ri = z_ri + delta  # Residual: starts as identity
         x_est = x_ri[..., 0] + 1j * x_ri[..., 1]  # [B, N]
 
-        # Damped update
+        # QPSK projection: snap to nearest constellation point
+        # This helps with symbol recovery
+        phase = torch.angle(x_est)
+        # QPSK phases: π/4, 3π/4, -3π/4, -π/4
+        # Quantize to nearest
+        phase_quantized = torch.round(phase / (math.pi / 2)) * (math.pi / 2) + math.pi / 4
+        x_qpsk = torch.exp(1j * phase_quantized) / math.sqrt(2)
+
+        # Soft decision: interpolate between raw and quantized
         damping = torch.sigmoid(self.damping)
-        z_new = damping * x_est + (1 - damping) * z
+        z_new = damping * x_qpsk + (1 - damping) * z
 
         return z_new, x_est
 
@@ -737,12 +746,20 @@ class GABVNet(nn.Module):
         # Theta updater (score-based)
         self.theta_updater = ScoreBasedThetaUpdater(cfg)
 
-        # Symbol refiner
+        # Symbol refiner with residual connection
+        # This ensures output is at least as good as input initially
         self.refiner = nn.Sequential(
             nn.Linear(2, 32),
-            nn.ReLU(),
+            nn.Tanh(),  # Tanh instead of ReLU for better gradients
             nn.Linear(32, 2),
         )
+        # Initialize to zero so refiner starts as identity (via residual)
+        with torch.no_grad():
+            self.refiner[-1].weight.zero_()
+            self.refiner[-1].bias.zero_()
+
+        # Flag to bypass refiner for debugging
+        self.bypass_refiner = False
 
     def forward(self, batch: Dict, g_theta_sched: float = 1.0) -> Dict:
         """
@@ -818,10 +835,14 @@ class GABVNet(nn.Module):
                 'theta_info': theta_info,
             })
 
-        # === Step 5: Final Refinement ===
-        x_ri = torch.stack([x_est.real, x_est.imag], dim=-1)
-        x_refined = self.refiner(x_ri.float())
-        x_hat = x_refined[..., 0] + 1j * x_refined[..., 1]
+        # === Step 5: Final Refinement with Residual ===
+        if self.bypass_refiner:
+            x_hat = x_est
+        else:
+            x_ri = torch.stack([x_est.real, x_est.imag], dim=-1)
+            x_delta = self.refiner(x_ri.float())  # Refinement delta
+            # Residual connection: x_hat = x_est + delta
+            x_hat = x_est + (x_delta[..., 0] + 1j * x_delta[..., 1])
 
         return {
             'x_hat': x_hat,

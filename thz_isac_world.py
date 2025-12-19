@@ -249,9 +249,24 @@ def apply_wideband_channel(
     rng: np.random.Generator
 ) -> Tuple[np.ndarray, Dict]:
     """
-    Apply wideband delay channel model.
+    Apply wideband delay channel model with REALISTIC acquisition.
 
-    y = exp(-j × φ₀) × D(τ) × x × p(t)
+    CRITICAL FIX: We assume coarse synchronization has already occurred.
+    The receiver knows the approximate delay τ_coarse from initial geometry.
+    We only apply the RESIDUAL delay τ_res = τ_true - τ_coarse.
+
+    In practice:
+    - τ_true = R / c (full propagation delay, could be millions of samples)
+    - τ_coarse = estimated delay from coarse acquisition
+    - τ_res = τ_true - τ_coarse (residual, typically < 1-2 samples)
+
+    We only model τ_res in the baseband signal because:
+    1. The receiver buffer is aligned via coarse sync
+    2. We're estimating the RESIDUAL error, not absolute delay
+    3. Full delay would shift signal completely out of buffer!
+
+    Signal model:
+        y = exp(-j × φ₀) × D(τ_res) × x × p(t) + noise
 
     Args:
         x: Input signal [batch, N]
@@ -263,57 +278,77 @@ def apply_wideband_channel(
         channel_info: Dictionary with channel parameters
     """
     if not config.enable_channel:
-        return x, {'tau': 0.0, 'tau_res': 0.0, 'phi0': 0.0, 'v': 0.0, 'a': 0.0}
+        batch_size = x.shape[0]
+        return x, {
+            'tau_true': 0.0,
+            'tau_coarse': 0.0,
+            'tau_res': 0.0,
+            'phi0': np.zeros(batch_size),
+            'v': 0.0,
+            'a': 0.0,
+            'p_t': np.ones(config.N, dtype=complex),
+        }
 
     batch_size = x.shape[0]
     N = x.shape[1]
     c = 3e8
 
-    # === True delay from range ===
-    tau_true = config.R / c  # True delay [s]
+    # === Residual delay modeling ===
+    # We DON'T apply the full delay τ = R/c (would be millions of samples!)
+    # Instead, we simulate that coarse acquisition has been done, and
+    # only apply a RESIDUAL delay τ_res.
 
-    # === Coarse acquisition (simulated) ===
-    # In practice, coarse acquisition finds τ within ±1 sample
-    # Here we add configurable acquisition error
-    tau_coarse_error = config.coarse_acquisition_error_samples * config.Ts
-    tau_coarse = tau_true + tau_coarse_error  # What coarse acquisition returns
+    # The residual comes from:
+    # 1. Coarse acquisition error (configurable, in samples)
+    # 2. Range change during frame (from velocity/acceleration)
 
-    # Residual delay (what we need to estimate)
-    # This is small (< 1 sample typically)
-    tau_res = tau_true - tau_coarse  # Should be ~0 if acquisition is good
+    # Base residual from acquisition error
+    tau_res_base = config.coarse_acquisition_error_samples * config.Ts
 
-    # For now, apply the FULL delay (tau_true) to the signal
-    # The model will need to estimate tau_res relative to tau_coarse
+    # Add random residual within ±0.5 samples for training diversity
+    if config.coarse_acquisition_error_samples > 0:
+        tau_res_random = rng.uniform(-0.5, 0.5) * config.Ts
+        tau_res = tau_res_base + tau_res_random
+    else:
+        tau_res = 0.0
 
-    # === Step 1: Apply wideband delay D(τ) ===
-    y = wideband_delay_operator(x, tau_true, config.fs)
+    # For physics consistency, we also compute what the "true" delay would be
+    tau_true = config.R / c
+    tau_coarse = tau_true - tau_res  # What coarse acquisition "found"
+
+    # === Step 1: Apply RESIDUAL wideband delay D(τ_res) ===
+    # This is small (< 1-2 samples), so signal stays aligned
+    if abs(tau_res) > 1e-15:
+        y = wideband_delay_operator(x, tau_res, config.fs)
+    else:
+        y = x.copy()
 
     # === Step 2: Apply Doppler/acceleration phase p(t) ===
     p_t = doppler_phase_operator(N, config.fs, config.fc, config.v_rel, config.a_rel)
     y = y * p_t[np.newaxis, :]
 
     # === Step 3: Apply nuisance constant phase φ₀ ===
-    # This includes the carrier phase exp(-j×2π×fc×τ) which is NOT identifiable
-    # In practice, this is absorbed by the PN tracker / pilot calibration
+    # This includes:
+    # - Carrier phase from propagation: exp(-j×2π×fc×τ_true) → nuisance
+    # - Initial LO phase offset → nuisance
+    # All absorbed by PN tracker / pilot calibration
     if config.phi0_random:
-        # Random initial phase for each batch
         phi0 = rng.uniform(0, 2*np.pi, size=(batch_size, 1))
     else:
-        # Deterministic phase (for debugging)
         phi0 = np.zeros((batch_size, 1))
 
-    # Apply constant phase rotation
     y = y * np.exp(-1j * phi0)
 
-    # === Channel info for output ===
+    # === Channel info ===
     channel_info = {
-        'tau_true': tau_true,           # True delay [s]
-        'tau_coarse': tau_coarse,       # Coarse acquisition estimate [s]
+        'tau_true': tau_true,           # Full propagation delay [s] (for reference)
+        'tau_coarse': tau_coarse,       # What coarse acquisition found [s]
         'tau_res': tau_res,             # Residual delay to estimate [s]
-        'phi0': phi0.flatten(),         # Nuisance phase [rad]
-        'v': config.v_rel,              # Velocity [m/s]
-        'a': config.a_rel,              # Acceleration [m/s²]
-        'p_t': p_t,                     # Doppler phase vector
+        'tau_res_samples': tau_res * config.fs,  # Residual in samples
+        'phi0': phi0.flatten(),
+        'v': config.v_rel,
+        'a': config.a_rel,
+        'p_t': p_t,
     }
 
     return y, channel_info
@@ -453,13 +488,13 @@ def simulate_batch(config: SimConfig, batch_size: int = 64,
         chi = (2.0/np.pi) / (1.0 + kappa * sinr_eff)
 
     # === Construct Ground Truth Theta ===
-    # NEW: theta = [tau_res, v, a] instead of [R, v, a]
-    # This is the identifiable parameterization!
+    # theta = [tau_res, v, a] - the RESIDUAL delay, not full delay!
+    # This is what the network should estimate
     tau_res = channel_info['tau_res']
     theta_val = np.array([tau_res, config.v_rel, config.a_rel])
     theta_true = np.tile(theta_val, (batch_size, 1))
 
-    # Also provide R-based theta for backward compatibility
+    # Also provide R-based theta for backward compatibility and logging
     theta_R_based = np.tile(
         np.array([config.R, config.v_rel, config.a_rel]),
         (batch_size, 1)
@@ -469,19 +504,20 @@ def simulate_batch(config: SimConfig, batch_size: int = 64,
         "x_true": x_true,
         "y_raw": y_analog,
         "y_q": y_q,
-        "theta_true": theta_true,           # [tau_res, v, a] - NEW!
-        "theta_R_based": theta_R_based,     # [R, v, a] - backward compat
+        "theta_true": theta_true,           # [tau_res, v, a] - estimand!
+        "theta_R_based": theta_R_based,     # [R, v, a] - for reference
         "meta": {
             # Bussgang parameters
             "B_gain": B_gain,
             "sigma_eta": sigma_eta,
 
-            # Channel info (NEW!)
+            # Channel info
             "channel_info": channel_info,
-            "tau_true": channel_info['tau_true'],
-            "tau_coarse": channel_info['tau_coarse'],
-            "tau_res": channel_info['tau_res'],
-            "phi0": channel_info['phi0'],
+            "tau_true": channel_info.get('tau_true', 0.0),
+            "tau_coarse": channel_info.get('tau_coarse', 0.0),
+            "tau_res": channel_info.get('tau_res', 0.0),
+            "tau_res_samples": channel_info.get('tau_res_samples', 0.0),
+            "phi0": channel_info.get('phi0', np.zeros(batch_size)),
 
             # SNR and Gamma_eff
             "snr_linear": 10**(config.snr_db/10),
@@ -501,7 +537,7 @@ def simulate_batch(config: SimConfig, batch_size: int = 64,
             "ibo_dB": config.ibo_dB,
             "pn_linewidth": config.pn_linewidth,
 
-            # NEW: Resolution info
+            # Resolution info
             "delay_resolution": config.delay_resolution,
             "range_resolution": config.range_resolution,
             "wavelength": config.wavelength,

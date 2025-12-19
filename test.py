@@ -1,245 +1,144 @@
 #!/usr/bin/env python3
 """
-quick_test.py - Quick Validation for Wideband Delay Model
+debug_model.py - Debug GA-BV-Net model flow
 
-Run this BEFORE training to verify:
-1. Simulator works correctly
-2. PhysicsEncoder matches simulator (if torch available)
-3. Key physical quantities are correct
-
-Usage:
-    python quick_test.py
+This script tests each component to find where BER becomes 0.5
 """
 
 import numpy as np
 import sys
 
+# Check torch
+try:
+    import torch
 
-# Test if dependencies exist
-def test_dependencies():
-    """Test that required dependencies exist."""
-    print("\n[TEST 0] Dependencies")
+    HAS_TORCH = True
+except ImportError:
+    print("PyTorch not available!")
+    HAS_TORCH = False
+    sys.exit(1)
 
-    try:
-        from thz_isac_world import SimConfig, simulate_batch
-        print("  ✓ thz_isac_world imported")
-    except ImportError as e:
-        print(f"  ✗ thz_isac_world: {e}")
-        return False
+from thz_isac_world import SimConfig, simulate_batch
 
-    try:
-        import torch
-        print("  ✓ PyTorch available")
-        has_torch = True
-    except ImportError:
-        print("  ! PyTorch not available (will skip model tests)")
-        has_torch = False
+# Test simulator output
+print("=" * 60)
+print("DEBUG: GA-BV-Net Model Flow")
+print("=" * 60)
 
-    return True
+# Generate test data
+cfg = SimConfig(
+    snr_db=30.0,
+    enable_pa=False,
+    enable_pn=False,
+    enable_channel=True,
+    enable_quantization=False,  # No quantization for clarity
+    phi0_random=False,
+    coarse_acquisition_error_samples=0.0,
+)
+data = simulate_batch(cfg, batch_size=4, seed=42)
 
+# Convert to torch
+y = torch.from_numpy(data['y_raw']).to(torch.cfloat)
+x_true = torch.from_numpy(data['x_true']).to(torch.cfloat)
+theta_true = torch.from_numpy(data['theta_true']).float()
 
-def test_wideband_delay():
-    """Test wideband delay operator."""
-    print("\n[TEST 1] Wideband Delay Operator")
+print(f"\n[Data Info]")
+print(f"  y shape: {y.shape}")
+print(f"  x_true shape: {x_true.shape}")
+print(f"  theta_true[0]: {theta_true[0].tolist()}")
+print(
+    f"  theta_true format: [tau_res, v, a] = [{theta_true[0, 0]:.2e}s, {theta_true[0, 1]:.0f}m/s, {theta_true[0, 2]:.0f}m/s²]")
 
-    from thz_isac_world import wideband_delay_operator
+# Create PhysicsEncoder
+from gabv_net_model import GABVConfig, PhysicsEncoder
 
-    N = 1024
-    fs = 10e9
+pcfg = GABVConfig()
+phys_enc = PhysicsEncoder(pcfg)
 
-    # Test signal
-    rng = np.random.default_rng(42)
-    x = rng.normal(0, 1, N) + 1j * rng.normal(0, 1, N)
+print(f"\n[Test 1: PhysicsEncoder.adjoint_operator]")
+# If theta is exact, adjoint should recover x
+x_recovered = phys_enc.adjoint_operator(y, theta_true)
+x_recovered_np = x_recovered.detach().numpy()
 
-    # Test 1: Zero delay
-    y_zero = wideband_delay_operator(x, 0.0, fs)
-    error_zero = np.max(np.abs(y_zero - x))
-    print(f"  Zero delay error: {error_zero:.2e} {'✓' if error_zero < 1e-10 else '✗'}")
+ber_recovered = np.mean((np.angle(x_true.numpy()) > 0) != (np.angle(x_recovered_np) > 0))
+print(f"  BER after adjoint (exact theta): {ber_recovered:.4f}")
 
-    # Test 2: 1-sample delay
-    tau_1s = 1.0 / fs
-    y_1s = wideband_delay_operator(x, tau_1s, fs)
-    expected = np.roll(x, 1)
-    error_1s = np.max(np.abs(y_1s - expected))
-    print(f"  1-sample delay error: {error_1s:.2e} {'✓' if error_1s < 1e-10 else '✗'}")
+if ber_recovered < 0.01:
+    print("  ✓ PhysicsEncoder.adjoint works correctly!")
+else:
+    print("  ✗ PhysicsEncoder.adjoint has a problem!")
 
-    return error_zero < 1e-10 and error_1s < 1e-10
+    # Debug: check Doppler phase
+    v = theta_true[:, 1:2]
+    a = theta_true[:, 2:3]
+    p_t = phys_enc.compute_doppler_phase(v, a)
 
+    # Manual derotation
+    y_derotated_manual = y * torch.conj(p_t)
+    ber_manual = np.mean((np.angle(x_true.numpy()) > 0) !=
+                         (np.angle(y_derotated_manual.numpy()) > 0))
+    print(f"  BER after manual Doppler removal: {ber_manual:.4f}")
 
-def test_simulation_chain():
-    """Test full simulation chain."""
-    print("\n[TEST 2] Full Simulation Chain")
+print(f"\n[Test 2: Forward then Adjoint]")
+# Forward: x -> y_pred
+# Then Adjoint: y_pred -> x_recovered
+y_pred = phys_enc.forward_operator(x_true, theta_true)
+x_roundtrip = phys_enc.adjoint_operator(y_pred, theta_true)
 
-    from thz_isac_world import SimConfig, simulate_batch
+roundtrip_error = torch.mean(torch.abs(x_true - x_roundtrip) ** 2).item()
+print(f"  Round-trip MSE: {roundtrip_error:.6f}")
+if roundtrip_error < 0.001:
+    print("  ✓ Forward-Adjoint is consistent!")
+else:
+    print("  ✗ Forward-Adjoint mismatch!")
 
-    cfg = SimConfig(snr_db=20.0)
-    data = simulate_batch(cfg, batch_size=16, seed=42)
+print(f"\n[Test 3: Model Forward Pass]")
+from gabv_net_model import GABVNet, GABVConfig
 
-    print(f"  x_true shape: {data['x_true'].shape}")
-    print(f"  y_q shape: {data['y_q'].shape}")
-    print(f"  theta_true shape: {data['theta_true'].shape}")
+model_cfg = GABVConfig(enable_theta_update=False)
+model = GABVNet(model_cfg)
+model.eval()
 
-    # Check theta is [tau_res, v, a] not [R, v, a]
-    theta = data['theta_true'][0]
-    print(f"  theta[0] = [tau_res={theta[0]:.2e}, v={theta[1]:.1f}, a={theta[2]:.1f}]")
+# Prepare batch
+meta = torch.zeros(4, model_cfg.meta_dim)
+batch = {
+    'y_q': y,
+    'x_true': x_true,
+    'theta_init': theta_true,
+    'meta': meta,
+}
 
-    # tau_res should be small (near 0 for perfect acquisition)
-    is_tau_small = abs(theta[0]) < 1e-6  # Should be ~0
-    print(f"  tau_res is small: {'✓' if is_tau_small else '✗'}")
+with torch.no_grad():
+    outputs = model(batch)
 
-    # Check meta contains resolution info
-    meta = data['meta']
-    print(f"  Range resolution: {meta['range_resolution'] * 100:.1f} cm")
-    print(f"  Wavelength: {meta['wavelength'] * 1000:.2f} mm")
-    print(f"  Gamma_eff: {meta['gamma_eff']:.2f}")
+x_hat = outputs['x_hat']
+ber_model = np.mean((np.angle(x_true.numpy()) > 0) !=
+                    (np.angle(x_hat.numpy()) > 0))
+print(f"  BER from model: {ber_model:.4f}")
 
-    return True
+if ber_model < 0.2:
+    print("  ✓ Model can estimate symbols!")
+else:
+    print("  ✗ Model fails to estimate symbols!")
 
+    # Debug: check intermediate values
+    print(f"\n  [Debugging model internals]")
+    print(f"  x_hat[0,:5]: {x_hat[0, :5].tolist()}")
+    print(f"  x_true[0,:5]: {x_true[0, :5].tolist()}")
 
-def test_physics_constants():
-    """Test physical constants are correct."""
-    print("\n[TEST 3] Physical Constants")
+    # Check if PN tracker is the problem
+    y_derotated, phi_est = model.pn_tracker(y, meta, x_true[:, :64])
+    ber_after_pn = np.mean((np.angle(x_true.numpy()) > 0) !=
+                           (np.angle(y_derotated.numpy()) > 0))
+    print(f"  BER after PN tracker only: {ber_after_pn:.4f}")
+    print(f"  phi_est mean: {phi_est.mean().item():.4f}")
 
-    c = 3e8
-    fc = 300e9
-    fs = 10e9
+    # Check after adjoint
+    z = phys_enc.adjoint_operator(y_derotated, theta_true)
+    ber_after_adj = np.mean((np.angle(x_true.numpy()) > 0) !=
+                            (np.angle(z.numpy()) > 0))
+    print(f"  BER after adjoint (post-PN): {ber_after_adj:.4f}")
 
-    wavelength = c / fc
-    delay_resolution = 1.0 / fs
-    range_resolution = c * delay_resolution
-
-    print(f"  Carrier frequency: {fc / 1e9:.0f} GHz")
-    print(f"  Bandwidth: {fs / 1e9:.0f} GHz")
-    print(f"  Wavelength: {wavelength * 1000:.2f} mm")
-    print(f"  Delay resolution: {delay_resolution * 1e12:.1f} ps")
-    print(f"  Range resolution: {range_resolution * 100:.1f} cm")
-
-    # Key insight: λ << range resolution
-    # Carrier phase cycles 30x per range resolution cell
-    cycles_per_cell = range_resolution / wavelength
-    print(f"  Carrier cycles per range cell: {cycles_per_cell:.0f}")
-    print(f"  → This is why carrier phase is NOT identifiable!")
-
-    return wavelength < 2e-3 and range_resolution > 0.01
-
-
-def test_doppler_phase():
-    """Test Doppler phase operator."""
-    print("\n[TEST 4] Doppler Phase Operator")
-
-    from thz_isac_world import doppler_phase_operator
-
-    N = 1024
-    fs = 10e9
-    fc = 300e9
-    v = 1000.0  # 1000 m/s
-    a = 0.0
-
-    p_t = doppler_phase_operator(N, fs, fc, v, a)
-
-    # Doppler frequency: fd = fc * v / c = 300e9 * 1000 / 3e8 = 1 MHz
-    fd_expected = fc * v / 3e8
-
-    # Phase rate: dφ/dt = 2π × fd
-    # Over one symbol (Ts = 100ps), phase change = 2π × fd × Ts
-    phase_per_symbol = 2 * np.pi * fd_expected / fs
-
-    # Check phase difference between consecutive samples
-    phase_diff = np.angle(p_t[1]) - np.angle(p_t[0])
-
-    print(f"  Expected Doppler: {fd_expected / 1e6:.2f} MHz")
-    print(f"  Expected phase/symbol: {np.degrees(phase_per_symbol):.4f}°")
-    print(f"  Measured phase/symbol: {np.degrees(phase_diff):.4f}°")
-
-    error = abs(phase_diff - (-phase_per_symbol))  # Negative because p_t = exp(-j*phase)
-    print(f"  Phase error: {np.degrees(error):.6f}° {'✓' if error < 0.001 else '✗'}")
-
-    return error < 0.01
-
-
-def test_identifiability():
-    """Test identifiability concepts."""
-    print("\n[TEST 5] Identifiability Analysis")
-
-    fc = 300e9
-    fs = 10e9
-    c = 3e8
-
-    wavelength = c / fc
-    range_resolution = c / fs
-
-    # For 10m range error:
-    delta_R = 10.0  # meters
-
-    # Carrier phase cycles
-    carrier_cycles = delta_R / wavelength
-    carrier_phase_deg = (carrier_cycles % 1) * 360
-
-    # Group delay samples
-    delta_tau = delta_R / c
-    delay_samples = delta_tau * fs
-
-    print(f"  For ΔR = 10m:")
-    print(f"    Carrier: {carrier_cycles:.0f} cycles → {carrier_phase_deg:.1f}° (mod 360°)")
-    print(f"    Group delay: {delay_samples:.1f} samples")
-    print(f"  → Carrier phase wraps {int(carrier_cycles)} times, losing information!")
-    print(f"  → Group delay is directly measurable")
-
-    # Basin of attraction
-    basin_samples = 1.5  # Typical
-    basin_range = basin_samples * range_resolution
-    print(f"\n  Basin of attraction:")
-    print(f"    ~{basin_samples} samples = ~{basin_range * 100:.1f} cm")
-    print(f"    Beyond this, gradient descent fails")
-
-    return True
-
-
-def main():
-    """Run all tests."""
-    print("=" * 60)
-    print("GA-BV-Net Wideband Delay Model - Quick Validation")
-    print("=" * 60)
-
-    if not test_dependencies():
-        print("\n❌ Missing dependencies. Please check installation.")
-        return 1
-
-    tests = [
-        ("Wideband Delay", test_wideband_delay),
-        ("Simulation Chain", test_simulation_chain),
-        ("Physics Constants", test_physics_constants),
-        ("Doppler Phase", test_doppler_phase),
-        ("Identifiability", test_identifiability),
-    ]
-
-    results = []
-    for name, test_fn in tests:
-        try:
-            result = test_fn()
-            results.append((name, result))
-        except Exception as e:
-            print(f"  ✗ Error: {e}")
-            results.append((name, False))
-
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-
-    all_pass = True
-    for name, passed in results:
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {name}: {status}")
-        if not passed:
-            all_pass = False
-
-    if all_pass:
-        print("\n✅ All tests passed! Ready for training.")
-    else:
-        print("\n⚠️  Some tests failed. Please review before training.")
-
-    return 0 if all_pass else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+print("\n" + "=" * 60)
+print("DEBUG COMPLETE")
+print("=" * 60)

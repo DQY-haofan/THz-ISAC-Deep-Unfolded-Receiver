@@ -146,11 +146,29 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
         Beyond that, we need coarse acquisition (not GA-BV-Net's job)
 
     Curriculum:
+        Stage 0: Ultra-simple debugging (no hardware impairments)
         Stage 1: Learn communication (exact theta)
         Stage 2: Learn fine tracking (< 0.5 sample noise)
         Stage 3: Push to limit (~1 sample noise)
     """
     return [
+        # Stage 0: Ultra-Debug (no impairments at all!)
+        StageConfig(
+            stage=0,
+            name="Stage0_Debug",
+            description="Debug mode: no impairments, v=0, a=0",
+            n_steps=base_steps // 2,
+            theta_noise_samples=(0.0, 0.0, 0.0),
+            enable_theta_update=False,
+            loss_weight_comm=1.0,
+            loss_weight_sens=0.0,
+            loss_weight_prior=0.0,
+            snr_range=(20, 30),
+            enable_pn=False,  # No phase noise!
+            freeze_comm=False,
+            freeze_pn=True,
+        ),
+
         # Stage 1: Communication Only
         StageConfig(
             stage=1,
@@ -433,8 +451,17 @@ def train_one_stage(
         snr_db = np.random.uniform(*stage_cfg.snr_range)
         sim_cfg.snr_db = snr_db
 
-        # Randomize hardware if enabled
-        if cfg.randomize_hardware:
+        # Stage 0: Ultra-debug mode - disable everything
+        if stage_cfg.stage == 0:
+            sim_cfg.enable_pa = False
+            sim_cfg.enable_pn = False
+            sim_cfg.enable_quantization = True  # Keep quantization to test it
+            sim_cfg.v_rel = 0.0  # No Doppler!
+            sim_cfg.a_rel = 0.0
+            sim_cfg.phi0_random = False  # No random phase
+            sim_cfg.coarse_acquisition_error_samples = 0.0
+        # Normal randomization
+        elif cfg.randomize_hardware:
             sim_cfg.enable_pa = np.random.random() > 0.3
             sim_cfg.enable_pn = stage_cfg.enable_pn and (np.random.random() > 0.3)
             sim_cfg.pn_linewidth = np.random.uniform(10e3, 1e6)

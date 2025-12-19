@@ -25,6 +25,7 @@ import torch
 
 try:
     import matplotlib.pyplot as plt
+
     HAS_PLT = True
 except ImportError:
     HAS_PLT = False
@@ -33,11 +34,11 @@ except ImportError:
 try:
     from gabv_net_model import GABVNet, GABVConfig, create_gabv_model, PhysicsEncoder
     from thz_isac_world import SimConfig, simulate_batch, wideband_delay_operator, doppler_phase_operator
+
     HAS_MODEL = True
 except ImportError as e:
     print(f"[Warning] Import error: {e}")
     HAS_MODEL = False
-
 
 # =============================================================================
 # Configuration
@@ -68,8 +69,8 @@ def test_simulator_physics_encoder_consistency(verbose: bool = True) -> Dict:
     # Test parameters
     B, N = 4, cfg.N
     tau = 1e-10  # 1 sample delay
-    v = 1000.0   # 1000 m/s
-    a = 10.0     # 10 m/s²
+    v = 1000.0  # 1000 m/s
+    a = 10.0  # 10 m/s²
 
     # Generate test signal
     rng = np.random.default_rng(42)
@@ -121,7 +122,7 @@ def test_adjoint_consistency(verbose: bool = True) -> Dict:
     x_rec = phys_enc.adjoint_operator(y, theta)
 
     # Should recover x (approximately for small delay)
-    error = torch.mean(torch.abs(x - x_rec)**2).item()
+    error = torch.mean(torch.abs(x - x_rec) ** 2).item()
     results['reconstruction_error'] = error
     results['pass'] = error < 0.1  # Allow some error for non-zero delay
 
@@ -205,9 +206,9 @@ def compute_ber(x_hat: np.ndarray, x_true: np.ndarray) -> float:
 
 def compute_rmse_theta(theta_hat: np.ndarray, theta_true: np.ndarray) -> Tuple[float, float, float]:
     """Compute RMSE for each theta component."""
-    rmse_tau = np.sqrt(np.mean((theta_hat[:, 0] - theta_true[:, 0])**2))
-    rmse_v = np.sqrt(np.mean((theta_hat[:, 1] - theta_true[:, 1])**2))
-    rmse_a = np.sqrt(np.mean((theta_hat[:, 2] - theta_true[:, 2])**2))
+    rmse_tau = np.sqrt(np.mean((theta_hat[:, 0] - theta_true[:, 0]) ** 2))
+    rmse_v = np.sqrt(np.mean((theta_hat[:, 1] - theta_true[:, 1]) ** 2))
+    rmse_a = np.sqrt(np.mean((theta_hat[:, 2] - theta_true[:, 2]) ** 2))
     return rmse_tau, rmse_v, rmse_a
 
 
@@ -257,8 +258,9 @@ def evaluate_snr_sweep(model: GABVNet, device: str,
         g_thetas = []
 
         for mc in range(n_mc):
-            # Generate data
-            data = simulate_batch(sim_cfg, batch_size=64, seed=1000*int(snr_db) + mc)
+            # Generate data with positive seed
+            seed_val = abs(int(snr_db * 1000)) + mc + 10000
+            data = simulate_batch(sim_cfg, batch_size=64, seed=seed_val)
 
             # Prepare tensors
             y_q = torch.from_numpy(data['y_q']).to(device)
