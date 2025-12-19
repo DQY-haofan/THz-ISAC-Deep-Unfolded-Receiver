@@ -494,12 +494,19 @@ class ScoreBasedThetaUpdater(nn.Module):
             nn.Softplus(),  # Ensure positive step sizes
         )
 
-        # BCRLB-based scaling (learnable, initialized to sqrt(BCRLB))
-        # These will be updated based on SNR during forward
+        # Initialize step_net to output ~1 initially
+        # Softplus(0) = ln(2) ≈ 0.69, so we want the final linear layer to output ~0.5
+        # This gives Softplus(0.5) ≈ 0.97, which is close to 1
+        with torch.no_grad():
+            self.step_net[-2].bias.data.fill_(0.5)  # Output ~1 from Softplus
+
+        # BCRLB-based scaling for converting step sizes to physical units
+        # With unit-normalized score, step_size × bcrlb_scale gives physical delta
+        # We want delta ~ 0.1 samples for tau, ~10 m/s for v, ~1 m/s² for a
         self.register_buffer('bcrlb_scale', torch.tensor([
-            1e-11,   # sqrt(BCRLB_tau) ~ 10ps
-            10.0,    # sqrt(BCRLB_v) ~ 10 m/s
-            1.0,     # sqrt(BCRLB_a) ~ 1 m/s²
+            0.1 / cfg.fs,  # 0.1 samples = 1e-11 s for 10GHz
+            10.0,          # 10 m/s
+            1.0,           # 1 m/s²
         ]))
 
         # Physical bounds for theta = [tau, v, a]
@@ -527,11 +534,20 @@ class ScoreBasedThetaUpdater(nn.Module):
                       dy_dtheta: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
                       ) -> torch.Tensor:
         """
-        Compute physics-based score (gradient direction).
+        Compute physics-based score using UNIT-NORMALIZED Jacobians.
 
-        score_k = Re(<∂y/∂θ_k, r>) / (||∂y/∂θ_k||² + ε)
+        Problem with original formula:
+            score_k = Re(<∂y/∂θ_k, r>) / ||∂y/∂θ_k||²
+            When ||∂y/∂τ|| ~ 10^10, score_tau ~ 10^-13 (useless!)
 
-        This is essentially a Gauss-Newton step direction.
+        Solution: Use unit-normalized Jacobian
+            J_hat_k = ∂y/∂θ_k / ||∂y/∂θ_k||
+            score_k = Re(<J_hat_k, r>)
+
+        This gives score in range [-||r||, ||r||], with clear physical meaning:
+        - Positive: increasing θ_k will reduce residual
+        - Negative: decreasing θ_k will reduce residual
+        - Magnitude: proportional to how much residual can be reduced
 
         Args:
             residual: [B, N] complex residual
@@ -542,22 +558,23 @@ class ScoreBasedThetaUpdater(nn.Module):
         """
         dy_dtau, dy_dv, dy_da = dy_dtheta
 
-        eps = 1e-8
+        eps = 1e-10
 
-        # Score for tau
-        inner_tau = torch.real(torch.sum(torch.conj(dy_dtau) * residual, dim=1, keepdim=True))
-        norm_tau = torch.sum(torch.abs(dy_dtau)**2, dim=1, keepdim=True) + eps
-        score_tau = inner_tau / norm_tau
+        # Normalize Jacobians to unit norm
+        dy_dtau_norm = torch.sqrt(torch.sum(torch.abs(dy_dtau)**2, dim=1, keepdim=True) + eps)
+        dy_dtau_hat = dy_dtau / dy_dtau_norm
 
-        # Score for v
-        inner_v = torch.real(torch.sum(torch.conj(dy_dv) * residual, dim=1, keepdim=True))
-        norm_v = torch.sum(torch.abs(dy_dv)**2, dim=1, keepdim=True) + eps
-        score_v = inner_v / norm_v
+        dy_dv_norm = torch.sqrt(torch.sum(torch.abs(dy_dv)**2, dim=1, keepdim=True) + eps)
+        dy_dv_hat = dy_dv / dy_dv_norm
 
-        # Score for a
-        inner_a = torch.real(torch.sum(torch.conj(dy_da) * residual, dim=1, keepdim=True))
-        norm_a = torch.sum(torch.abs(dy_da)**2, dim=1, keepdim=True) + eps
-        score_a = inner_a / norm_a
+        dy_da_norm = torch.sqrt(torch.sum(torch.abs(dy_da)**2, dim=1, keepdim=True) + eps)
+        dy_da_hat = dy_da / dy_da_norm
+
+        # Score = inner product with unit-normalized Jacobian
+        # This gives the projection of residual onto each gradient direction
+        score_tau = torch.real(torch.sum(torch.conj(dy_dtau_hat) * residual, dim=1, keepdim=True))
+        score_v = torch.real(torch.sum(torch.conj(dy_dv_hat) * residual, dim=1, keepdim=True))
+        score_a = torch.real(torch.sum(torch.conj(dy_da_hat) * residual, dim=1, keepdim=True))
 
         score = torch.cat([score_tau, score_v, score_a], dim=1)  # [B, 3]
 

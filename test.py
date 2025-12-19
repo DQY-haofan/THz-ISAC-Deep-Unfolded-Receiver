@@ -108,27 +108,31 @@ def main():
         dy_dtheta = model.phys_enc.compute_channel_jacobian(theta_init, x_est)
         dy_dtau, dy_dv, dy_da = dy_dtheta
 
-        print(f"  |dy/dtau|: {torch.abs(dy_dtau).mean().item():.6e}")
-        print(f"  |dy/dv|:   {torch.abs(dy_dv).mean().item():.6e}")
-        print(f"  |dy/da|:   {torch.abs(dy_da).mean().item():.6e}")
+        # Compute score using UNIT-NORMALIZED Jacobians (new method)
+        eps = 1e-10
 
-        # Compute score
-        eps = 1e-8
-        inner_tau = torch.real(torch.sum(torch.conj(dy_dtau) * residual, dim=1, keepdim=True))
-        norm_tau = torch.sum(torch.abs(dy_dtau) ** 2, dim=1, keepdim=True) + eps
-        score_tau = inner_tau / norm_tau
+        dy_dtau_norm = torch.sqrt(torch.sum(torch.abs(dy_dtau) ** 2, dim=1, keepdim=True) + eps)
+        dy_dtau_hat = dy_dtau / dy_dtau_norm
+        score_tau = torch.real(torch.sum(torch.conj(dy_dtau_hat) * residual, dim=1, keepdim=True))
 
-        inner_v = torch.real(torch.sum(torch.conj(dy_dv) * residual, dim=1, keepdim=True))
-        norm_v = torch.sum(torch.abs(dy_dv) ** 2, dim=1, keepdim=True) + eps
-        score_v = inner_v / norm_v
+        dy_dv_norm = torch.sqrt(torch.sum(torch.abs(dy_dv) ** 2, dim=1, keepdim=True) + eps)
+        dy_dv_hat = dy_dv / dy_dv_norm
+        score_v = torch.real(torch.sum(torch.conj(dy_dv_hat) * residual, dim=1, keepdim=True))
 
-        print(f"  score_tau: {score_tau.mean().item():.6e}")
-        print(f"  score_v:   {score_v.mean().item():.6e}")
+        dy_da_norm = torch.sqrt(torch.sum(torch.abs(dy_da) ** 2, dim=1, keepdim=True) + eps)
+        dy_da_hat = dy_da / dy_da_norm
+        score_a = torch.real(torch.sum(torch.conj(dy_da_hat) * residual, dim=1, keepdim=True))
+
+        print(f"  |dy/dtau|: {dy_dtau_norm.mean().item():.6e}")
+        print(f"  |dy/dv|:   {dy_dv_norm.mean().item():.6e}")
+        print(f"  score_tau (unit-norm): {score_tau.mean().item():.6f}")
+        print(f"  score_v (unit-norm):   {score_v.mean().item():.6f}")
+        print(f"  score_a (unit-norm):   {score_a.mean().item():.6f}")
 
         # Compute step sizes from network
         residual_power = torch.mean(torch.abs(residual) ** 2, dim=1, keepdim=True)
         log_power = torch.log10(residual_power + 1e-10)
-        score_magnitude = torch.abs(torch.cat([score_tau, score_v, score_v], dim=1))
+        score_magnitude = torch.abs(torch.cat([score_tau, score_v, score_a], dim=1))
 
         x_est_amplitude = torch.mean(torch.abs(x_est), dim=1, keepdim=True).clamp(min=1e-6)
         x_est_normalized = x_est / x_est_amplitude
@@ -165,13 +169,13 @@ def main():
         print(
             f"  delta_theta (clamped): tau={delta_theta_clamped[0, 0].item() / Ts:.6f} samples, v={delta_theta_clamped[0, 1].item():.6f} m/s")
 
-        # Apply gate
+        # Apply gate (simplified - matches new model)
         effective_gate = gates['g_theta'] * 1.0  # g_theta_sched = 1.0
-        confidence_gate = torch.sigmoid((confidence - 0.3) * 10)
-        combined_gate = effective_gate * confidence_gate
-        print(f"  combined_gate: {combined_gate.mean().item():.4f}")
+        min_gate = 0.1
+        effective_gate = torch.maximum(effective_gate, torch.tensor(min_gate, device=device))
+        print(f"  effective_gate: {effective_gate.mean().item():.4f}")
 
-        delta_theta_gated = combined_gate * delta_theta_clamped
+        delta_theta_gated = effective_gate * delta_theta_clamped
         print(
             f"  delta_theta (gated): tau={delta_theta_gated[0, 0].item() / Ts:.6f} samples, v={delta_theta_gated[0, 1].item():.6f} m/s")
 
