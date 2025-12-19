@@ -652,22 +652,37 @@ class ScoreBasedThetaUpdater(nn.Module):
         # === PATCH B: 3x3 Gauss-Newton to decouple (τ, v, a) ===
         # Build normal equations: G = J^H J, b = Re(J^H r)
 
+        # CRITICAL: Normalize Jacobian columns to avoid ill-conditioning
+        # The Jacobians have vastly different scales:
+        # - J_tau ~ 10^13 (because f_grid ~ 10^9 Hz)
+        # - J_v, J_a ~ 10^6 (because fc/c ~ 10^6)
+        # Without normalization, G has condition number ~ 10^14+
+
+        norm_tau = torch.sqrt(torch.sum(torch.abs(J_tau)**2, dim=1, keepdim=True)).clamp(min=1e-10)
+        norm_v = torch.sqrt(torch.sum(torch.abs(J_v)**2, dim=1, keepdim=True)).clamp(min=1e-10)
+        norm_a = torch.sqrt(torch.sum(torch.abs(J_a)**2, dim=1, keepdim=True)).clamp(min=1e-10)
+
+        # Normalized Jacobians (unit norm)
+        J_tau_n = J_tau / norm_tau
+        J_v_n = J_v / norm_v
+        J_a_n = J_a / norm_a
+
         def inner_product(a, b):
             """Complex inner product: <a, b> = sum(conj(a) * b)"""
             return torch.sum(torch.conj(a) * b, dim=1, keepdim=True)
 
-        # Gram matrix elements
-        G11 = torch.real(inner_product(J_tau, J_tau))
-        G12 = torch.real(inner_product(J_tau, J_v))
-        G13 = torch.real(inner_product(J_tau, J_a))
-        G22 = torch.real(inner_product(J_v, J_v))
-        G23 = torch.real(inner_product(J_v, J_a))
-        G33 = torch.real(inner_product(J_a, J_a))
+        # Gram matrix elements (now well-conditioned, ~O(1))
+        G11 = torch.real(inner_product(J_tau_n, J_tau_n))  # Should be ~1
+        G12 = torch.real(inner_product(J_tau_n, J_v_n))
+        G13 = torch.real(inner_product(J_tau_n, J_a_n))
+        G22 = torch.real(inner_product(J_v_n, J_v_n))      # Should be ~1
+        G23 = torch.real(inner_product(J_v_n, J_a_n))
+        G33 = torch.real(inner_product(J_a_n, J_a_n))      # Should be ~1
 
-        # Right-hand side
-        b1 = torch.real(inner_product(J_tau, r))
-        b2 = torch.real(inner_product(J_v, r))
-        b3 = torch.real(inner_product(J_a, r))
+        # Right-hand side (with normalized Jacobians)
+        b1 = torch.real(inner_product(J_tau_n, r))
+        b2 = torch.real(inner_product(J_v_n, r))
+        b3 = torch.real(inner_product(J_a_n, r))
 
         # Assemble [B, 3, 3] and [B, 3, 1]
         G = torch.zeros((B, 3, 3), device=device, dtype=torch.float32)
@@ -684,16 +699,28 @@ class ScoreBasedThetaUpdater(nn.Module):
         b = torch.stack([b1.squeeze(1), b2.squeeze(1), b3.squeeze(1)], dim=1).unsqueeze(-1)  # [B, 3, 1]
 
         # Damping for numerical stability (Levenberg-Marquardt style)
-        lam = 1e-3
+        lam = 0.01  # Increased from 1e-3 for better stability
         I = torch.eye(3, device=device).unsqueeze(0).expand(B, -1, -1)
         G_reg = G + lam * I
 
-        # Solve: delta_gn = inv(G_reg) @ b
+        # Solve: delta_normalized = inv(G_reg) @ b
         try:
-            delta_gn = torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3]
+            delta_normalized = torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3]
         except:
             # Fallback if solve fails
-            delta_gn = torch.zeros(B, 3, device=device)
+            delta_normalized = torch.zeros(B, 3, device=device)
+
+        # Convert back to physical units
+        # delta_physical = delta_normalized / norm (because J_n = J/norm)
+        scale_tau = 1.0 / norm_tau.squeeze(1)  # [B]
+        scale_v = 1.0 / norm_v.squeeze(1)
+        scale_a = 1.0 / norm_a.squeeze(1)
+
+        delta_gn = torch.stack([
+            delta_normalized[:, 0] * scale_tau,
+            delta_normalized[:, 1] * scale_v,
+            delta_normalized[:, 2] * scale_a,
+        ], dim=1)  # [B, 3] in physical units
 
         # === Apply fixed step size (bypass step_net for now) ===
         # Expert recommendation: use fixed mu until direction is verified
