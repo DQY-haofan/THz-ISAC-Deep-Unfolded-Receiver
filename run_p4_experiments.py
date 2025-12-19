@@ -321,10 +321,13 @@ def run_baselines_on_batch(y_q_np: np.ndarray, h_diag_np: np.ndarray,
 
 def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> float:
     """
-    Auto-calibrate phase_bias after loading checkpoint.
+    [Expert Review] Pilot-aided phase bias calibration.
 
-    The optimal phase_bias depends on the trained RNN weights,
-    so we search for the best value using a quick grid search.
+    Instead of using x_true (oracle), we use a correlation-based metric
+    that can be computed with known pilot symbols in a real system.
+
+    In practice, this would use a short preamble sequence.
+    For simulation, we use a small pilot block at the start of each frame.
 
     Args:
         model: Loaded GA-BV-Net model
@@ -335,7 +338,7 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
         best_bias_deg: Optimal phase bias in degrees
     """
     if verbose:
-        print("\n[Calibration] Searching optimal phase_bias...")
+        print("\n[Calibration] Pilot-aided phase_bias search...")
 
     # Setup test scenario (S3_pn_only at SNR=20dB)
     sim_cfg = SimConfig()
@@ -358,9 +361,30 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
     # Save original value
     original_bias = model.pn_tracker.phase_bias.item()
 
+    # Pilot-aided metric: Use only first N_pilot symbols as "known pilots"
+    N_pilot = 64  # Number of pilot symbols (can be as small as 1)
+    x_pilot = torch.from_numpy(x_true_np[:, :N_pilot]).cfloat().to(device)
+
+    def compute_pilot_metric(x_hat):
+        """
+        Compute pilot-based correlation metric.
+        This can be computed in a real system with known pilots.
+
+        Higher correlation = better phase alignment
+        """
+        x_hat_pilot = x_hat[:, :N_pilot]
+
+        # Normalized correlation (real part)
+        corr = torch.real(
+            torch.sum(x_hat_pilot * torch.conj(x_pilot)) /
+            (torch.sqrt(torch.sum(torch.abs(x_hat_pilot) ** 2) *
+                        torch.sum(torch.abs(x_pilot) ** 2)) + 1e-8)
+        )
+        return corr.item()
+
     # Grid search
     best_bias_deg = 0
-    best_ber = 1.0
+    best_metric = -1.0
 
     for bias_deg in range(-180, 181, 15):  # 15° steps
         model.pn_tracker.phase_bias.data = torch.tensor(
@@ -370,10 +394,10 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
         with torch.no_grad():
             outputs = model(batch)
 
-        ber = compute_ber_qpsk_bitwise(outputs['x_hat'].cpu().numpy(), x_true_np)
+        metric = compute_pilot_metric(outputs['x_hat'])
 
-        if ber < best_ber:
-            best_ber = ber
+        if metric > best_metric:
+            best_metric = metric
             best_bias_deg = bias_deg
 
     # Fine search around best value
@@ -385,10 +409,10 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
         with torch.no_grad():
             outputs = model(batch)
 
-        ber = compute_ber_qpsk_bitwise(outputs['x_hat'].cpu().numpy(), x_true_np)
+        metric = compute_pilot_metric(outputs['x_hat'])
 
-        if ber < best_ber:
-            best_ber = ber
+        if metric > best_metric:
+            best_metric = metric
             best_bias_deg = bias_deg
 
     # Apply best value
@@ -396,9 +420,15 @@ def calibrate_phase_bias(model: GABVNet, device: str, verbose: bool = True) -> f
         np.radians(best_bias_deg), device=device
     )
 
+    # Compute actual BER for reporting (this part is for logging only)
+    with torch.no_grad():
+        outputs = model(batch)
+    final_ber = compute_ber_qpsk_bitwise(outputs['x_hat'].cpu().numpy(), x_true_np)
+
     if verbose:
+        print(f"[Calibration] Method: Pilot-aided ({N_pilot} pilots)")
         print(f"[Calibration] Original: {np.degrees(original_bias):.1f}°")
-        print(f"[Calibration] Optimal:  {best_bias_deg}° (BER={best_ber:.4f})")
+        print(f"[Calibration] Optimal:  {best_bias_deg}° (correlation={best_metric:.4f}, BER={final_ber:.4f})")
 
     return best_bias_deg
 

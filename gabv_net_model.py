@@ -219,13 +219,19 @@ class PhysicsEncoder(nn.Module):
 
 class RiemannianPNTracker(nn.Module):
     """
-    [FIX 5 + FIX 12] Improved Phase Noise Tracker
+    [B-lite] Phase Noise Tracker with Wiener Prior Regularization
 
-    FIX 5: Explicit (cos, sin) output with normalization
-    FIX 12: Learnable phase bias correction for initial phase ambiguity
+    Key Features:
+    - Explicit (cos, sin) output for numerical stability
+    - [FIX 8] Normalized interpolation to preserve unit magnitude
+    - [FIX 12] Learnable phase_bias for phase ambiguity resolution
+    - [NEW B-lite] Wiener prior loss: penalizes large phase jumps
+
+    The Wiener prior enforces: φ[n] ≈ φ[n-1]
+    This aligns with BCRLB theory and improves phase tracking.
     """
 
-    def __init__(self, cfg: GABVConfig):
+    def __init__(self, cfg):
         super().__init__()
         self.rnn = nn.GRU(
             input_size=2,
@@ -235,49 +241,88 @@ class RiemannianPNTracker(nn.Module):
         )
         out_dim = cfg.hidden_dim_pn * 2 if cfg.use_bidirectional_pn else cfg.hidden_dim_pn
 
+        # Output (cos, sin) for stability
         self.head = nn.Sequential(
             nn.Linear(out_dim, cfg.hidden_dim_pn // 2),
             nn.ReLU(),
-            nn.Linear(cfg.hidden_dim_pn // 2, 2)
+            nn.Linear(cfg.hidden_dim_pn // 2, 2)  # (cos, sin)
         )
 
-        # [FIX 12] Learnable phase bias correction
-        # Initialize to 0, let training find the right value
-        self.phase_bias = nn.Parameter(torch.tensor(-1.5708))  # -π/2 ≈ -1.5708
+        # [FIX 12] Learnable phase bias for phase ambiguity
+        self.phase_bias = nn.Parameter(torch.tensor(-1.5708))  # Initialize to -90°
+
+        # [NEW B-lite] Wiener prior strength (learnable)
+        # Higher value = smoother phase trajectory = stronger regularization
+        self.wiener_prior_strength = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, y_q: torch.Tensor, g_PN: torch.Tensor,
-                x_est: Optional[torch.Tensor] = None) -> torch.Tensor:
+                x_est: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Estimate phase noise and return de-rotation factor.
+        Estimate phase noise and return de-rotation factor + Wiener prior loss.
+
+        Args:
+            y_q: Quantized observation [B, N]
+            g_PN: PN gate [B, 1]
+            x_est: Optional symbol estimate (used if reliable)
+
+        Returns:
+            derotator: exp(-jφ) de-rotation factor [B, N]
+            wiener_loss: Wiener prior regularization term (scalar)
         """
+        B, N = y_q.shape
+        device = y_q.device
+
+        # Use residual if x_est is reliable, else use y_q directly
         if x_est is not None and x_est.abs().mean() > 0.1:
+            # Normalize x_est to unit magnitude for phase extraction
             x_norm = x_est / (x_est.abs() + 1e-6)
             resid = y_q * torch.conj(x_norm)
             feats = torch.stack([resid.real, resid.imag], dim=-1)
         else:
-            feats = torch.stack([y_q.real, y_q.imag], dim=-1)
+            # Early layers: use y_q directly
+            feats = torch.stack([y_q.real, y_q.imag], dim=-1)  # [B, N, 2]
 
-        rnn_out, _ = self.rnn(feats)
+        rnn_out, _ = self.rnn(feats)  # [B, N, hidden*2]
 
-        cos_sin = self.head(rnn_out)
+        # Output (cos, sin)
+        cos_sin = self.head(rnn_out)  # [B, N, 2]
         cos_phi = cos_sin[..., 0]
         sin_phi = cos_sin[..., 1]
 
+        # Normalize to unit circle
         mag = torch.sqrt(cos_phi ** 2 + sin_phi ** 2 + 1e-8)
         cos_phi = cos_phi / mag
         sin_phi = sin_phi / mag
 
-        derotator = torch.complex(cos_phi, -sin_phi)
+        # Compute phase for Wiener prior loss
+        phi_hat = torch.atan2(sin_phi, cos_phi)  # [B, N]
 
-        # [FIX 12] Apply learnable phase bias correction (符号修正!)
+        # [NEW B-lite] Wiener prior loss: penalize large phase jumps
+        # L_wiener = E[(φ[n] - φ[n-1])^2] * strength
+        # This is the "prior FIM" structure from BCRLB theory
+        if N > 1:
+            phi_diff = phi_hat[:, 1:] - phi_hat[:, :-1]  # [B, N-1]
+            # Wrap phase difference to [-π, π] to handle wrapping
+            phi_diff = torch.atan2(torch.sin(phi_diff), torch.cos(phi_diff))
+            # Mean squared phase difference weighted by learnable strength
+            wiener_loss = torch.mean(phi_diff ** 2) * torch.abs(self.wiener_prior_strength)
+        else:
+            wiener_loss = torch.tensor(0.0, device=device)
+
+        # De-rotation factor: exp(-jφ) = cos(φ) - j*sin(φ)
+        derotator = torch.complex(cos_phi, -sin_phi)  # [B, N]
+
+        # [FIX 12] Apply learnable phase bias
         bias_correction = torch.exp(-1j * self.phase_bias)
         derotator = derotator * bias_correction
 
-        # [FIX 8] Normalize after interpolation
+        # Apply gate: g_PN=0 means no de-rotation
+        # [FIX 8] CRITICAL: Must normalize after linear interpolation!
+        # Linear interpolation of complex numbers doesn't preserve unit magnitude
         eff_derotator = (1 - g_PN) * torch.ones_like(derotator) + g_PN * derotator
-        eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)
+        eff_derotator = eff_derotator / (eff_derotator.abs() + 1e-8)  # Normalize!
 
-        return eff_derotator
+        return eff_derotator, wiener_loss
 
 class BussgangRefiner(nn.Module):
     def __init__(self, cfg: GABVConfig):
@@ -335,55 +380,67 @@ class UnrolledCGSolver(nn.Module):
 
 class ThetaUpdater(nn.Module):
     """
-    [FIX 4 & 9] Theta Update Module with Physical Constraints
+    [B-lite] Physics-Aware Theta Updater with Acceptance Criterion
 
-    [FIX 9] Added:
-    - Physical clipping: Limits per-layer update to physically plausible range
-    - Confidence gating: Only update when symbol estimate is reliable
-    - Prevents drift that caused BER ≈ 0.5
+    Key Features:
+    - [FIX 9] Physical clamping: max 20m per layer
+    - [FIX 9] Confidence gating: don't update when x_est is unreliable
+    - [NEW B-lite] Acceptance criterion: reject if residual doesn't decrease
     """
 
-    def __init__(self, cfg: GABVConfig):
+    def __init__(self, cfg):
         super().__init__()
-        # Network to estimate theta gradient from residual statistics
+        # Feature extraction network
         self.grad_net = nn.Sequential(
-            nn.Linear(6, 32),  # Input: residual stats + gate
+            nn.Linear(6, 32),
             nn.ReLU(),
-            nn.Linear(32, 16),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(16, 3),  # Output: Δθ
+            nn.Linear(32, 3)  # Output: delta for (R, v, a)
         )
 
-        # Learnable step sizes for R, v, a (different scales)
-        self.lr_param = nn.Parameter(torch.tensor([1e-2, 1e-3, 1e-4]))
+        # Learnable step size
+        self.lr_param = nn.Parameter(torch.tensor(0.1))
 
-        # Theta bounds for clamping
-        self.register_buffer('theta_min', torch.tensor([1e3, -1e4, -100.0]))
-        self.register_buffer('theta_max', torch.tensor([1e7, 1e4, 100.0]))
+        # Physical limits [FIX 9]
+        self.max_delta_R = 20.0  # meters per layer
+        self.max_delta_v = 5.0  # m/s per layer
+        self.max_delta_a = 1.0  # m/s^2 per layer
 
-        # [FIX 9] Physical limits for per-layer update
-        # Max velocity ~8km/s, block duration ~0.1ms → max displacement ~0.8m per block
-        # We allow 20m per layer to be safe (accounts for estimation error)
-        self.register_buffer('max_delta_R', torch.tensor(20.0))  # meters
-        self.register_buffer('max_delta_v', torch.tensor(5.0))  # m/s
-        self.register_buffer('max_delta_a', torch.tensor(1.0))  # m/s²
+        # Confidence threshold [FIX 9]
+        self.confidence_threshold = 0.5
 
-        # [FIX 9] Confidence threshold for gating
-        self.register_buffer('confidence_threshold', torch.tensor(0.005))
+        # Parameter bounds
+        self.register_buffer('theta_min', torch.tensor([4.9e8, -1e4, -100.0]))
+        self.register_buffer('theta_max', torch.tensor([5.1e8, 1e4, 100.0]))
 
-    def forward(self, theta: torch.Tensor, resid: torch.Tensor,
-                x_est: torch.Tensor, g_theta: torch.Tensor,
-                fim_inv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # [NEW B-lite] Enable acceptance criterion
+        self.use_acceptance_criterion = True
+
+    def forward(self, theta: torch.Tensor, resid: torch.Tensor, x_est: torch.Tensor,
+                g_theta: torch.Tensor, fim_inv: Optional[torch.Tensor] = None,
+                y_q: Optional[torch.Tensor] = None,
+                h_func: Optional[callable] = None) -> Tuple[torch.Tensor, Dict]:
         """
-        Update theta based on residual with physical constraints.
+        Update theta with physical constraints and acceptance criterion.
 
-        [FIX 9] Key additions:
-        1. Physical clipping: |ΔR| < 20m, |Δv| < 5m/s, |Δa| < 1m/s²
-        2. Confidence gating: Only update when |x_est| > threshold
+        Args:
+            theta: Current parameters [B, 3] (R, v, a)
+            resid: Residual signal [B, N]
+            x_est: Current symbol estimate [B, N]
+            g_theta: Update gate from PilotNavigator [B, 1]
+            fim_inv: Optional FIM inverse for natural gradient [B, 3]
+            y_q: Original observation (for acceptance criterion)
+            h_func: Function to compute h(theta) (for acceptance criterion)
+
+        Returns:
+            theta_new: Updated parameters [B, 3]
+            info: Debug information dict
         """
         B = theta.shape[0]
+        device = theta.device
 
-        # Compute residual statistics
+        # Compute residual statistics as features
         resid_power = torch.mean(resid.abs() ** 2, dim=1, keepdim=True)  # [B, 1]
         resid_phase_mean = torch.mean(torch.angle(resid + 1e-8), dim=1, keepdim=True)
         resid_phase_var = torch.var(torch.angle(resid + 1e-8), dim=1, keepdim=True)
@@ -392,7 +449,7 @@ class ThetaUpdater(nn.Module):
         cross_corr_real = torch.mean((resid * torch.conj(x_est)).real, dim=1, keepdim=True)
         cross_corr_imag = torch.mean((resid * torch.conj(x_est)).imag, dim=1, keepdim=True)
 
-        # Feature vector
+        # Feature vector [B, 6]
         feat = torch.cat([
             resid_power,
             resid_phase_mean,
@@ -400,51 +457,73 @@ class ThetaUpdater(nn.Module):
             cross_corr_real,
             cross_corr_imag,
             g_theta
-        ], dim=1)  # [B, 6]
+        ], dim=1)
 
-        # Estimate update direction
+        # Predict update direction
         delta_theta = self.grad_net(feat)  # [B, 3]
 
-        # Apply FIM scaling if available (natural gradient)
+        # Apply FIM scaling (natural gradient) if available
         if fim_inv is not None:
             delta_theta = delta_theta * fim_inv
 
-        # Apply gate and step size
-        lr = torch.abs(self.lr_param)  # Ensure positive
-        delta_theta_scaled = lr * delta_theta  # [B, 3]
+        # Apply step size
+        lr = torch.abs(self.lr_param)
+        delta_theta_scaled = lr * delta_theta
 
-        # ============================================================
-        # [FIX 9] Physical Clipping - Prevent unrealistic updates
-        # ============================================================
-        # Clamp each parameter independently
+        # [FIX 9] Physical clamping
         delta_R = torch.clamp(delta_theta_scaled[:, 0:1], -self.max_delta_R, self.max_delta_R)
         delta_v = torch.clamp(delta_theta_scaled[:, 1:2], -self.max_delta_v, self.max_delta_v)
         delta_a = torch.clamp(delta_theta_scaled[:, 2:3], -self.max_delta_a, self.max_delta_a)
         delta_theta_clipped = torch.cat([delta_R, delta_v, delta_a], dim=1)
 
-        # ============================================================
-        # [FIX 9] Confidence Gating - Only update when x_est is reliable
-        # ============================================================
-        # Use average symbol magnitude as confidence proxy
-        # QPSK symbols have magnitude ~1, noisy estimates are smaller
+        # [FIX 9] Confidence gating
         confidence = torch.mean(x_est.abs(), dim=1, keepdim=True)  # [B, 1]
-
-        # Soft gate: sigmoid centered at threshold
         confidence_gate = torch.sigmoid((confidence - self.confidence_threshold) * 10)
 
-        # ============================================================
-        # Final Update with both gates
-        # ============================================================
-        # g_theta: learned gate from network
-        # confidence_gate: physics-based confidence gate
+        # Combined gate
         effective_gate = g_theta * confidence_gate
 
-        theta_new = theta + effective_gate * delta_theta_clipped
+        # Compute candidate theta
+        theta_candidate = theta + effective_gate * delta_theta_clipped
+
+        # [NEW B-lite] Acceptance criterion
+        accept_rate = 1.0
+        if self.use_acceptance_criterion and y_q is not None and h_func is not None:
+            with torch.no_grad():
+                # Current residual norm
+                resid_norm_before = torch.mean(resid.abs() ** 2, dim=1)  # [B]
+
+                # Compute new channel and residual with candidate theta
+                h_new = h_func(theta_candidate)
+                y_reconstructed_new = h_new * x_est
+                resid_new = y_q - y_reconstructed_new
+                resid_norm_after = torch.mean(resid_new.abs() ** 2, dim=1)  # [B]
+
+                # Accept only if residual decreased
+                accept_mask = (resid_norm_after < resid_norm_before).float()  # [B]
+                accept_rate = accept_mask.mean().item()
+
+                # Apply acceptance: use candidate if accepted, else keep original
+                accept_mask = accept_mask.unsqueeze(-1)  # [B, 1]
+                theta_new = accept_mask * theta_candidate + (1 - accept_mask) * theta
+        else:
+            theta_new = theta_candidate
 
         # Final clamping to reasonable range
         theta_new = torch.clamp(theta_new, self.theta_min, self.theta_max)
 
-        return theta_new
+        # Debug info
+        info = {
+            'delta_R': delta_R.mean().item(),
+            'delta_v': delta_v.mean().item(),
+            'delta_a': delta_a.mean().item(),
+            'g_theta_effective': effective_gate.mean().item(),
+            'confidence': confidence.mean().item(),
+            'accept_rate': accept_rate,
+        }
+
+        return theta_new, info
+
 
 class FisherUpdater(nn.Module):
     """Legacy updater - kept for compatibility."""
@@ -471,22 +550,157 @@ class GABVNet(nn.Module):
         if cfg.share_weights:
             self.pilot = PilotNavigator(cfg)
             self.phys_enc = PhysicsEncoder(cfg)
-            self.pn_tracker = RiemannianPNTracker(cfg)
+            self.pn_tracker = RiemannianPNTracker(cfg)  # B-lite version
             self.refiner = BussgangRefiner(cfg)
             self.solver = UnrolledCGSolver(cfg)
-            self.theta_updater = ThetaUpdater(cfg)  # [FIX 4] New theta updater
+            self.theta_updater = ThetaUpdater(cfg)  # B-lite version
         else:
             raise NotImplementedError("Per-layer weights not yet implemented.")
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def gabvnet_forward_blite(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Forward pass of GA-BV-Net.
+        Forward pass of GA-BV-Net with B-lite enhancements.
 
-        [FIX 4] Now actually updates theta!
+        B-lite Features:
+        - Accumulates wiener_loss from PN tracker across layers
+        - ThetaUpdater with acceptance criterion
+        - Returns theta_info for debugging
+
+        Args:
+            batch: Dictionary containing:
+                - 'y_q': Quantized observation [B, N]
+                - 'meta': Meta features [B, 6]
+                - 'theta_init': Initial theta estimate [B, 3]
+
+        Returns:
+            Dictionary containing:
+                - 'x_hat': Symbol estimate [B, N]
+                - 'theta_hat': Final theta estimate [B, 3]
+                - 'phi_hat': Final de-rotation factor [B, N]
+                - 'layers': Per-layer outputs
+                - 'geom_cache': FIM information
+                - 'wiener_loss': Total Wiener prior loss (for training)
         """
         y_q = batch['y_q']
         meta = batch['meta']
-        theta = batch['theta_init'].clone()  # Will be updated!
+        theta = batch['theta_init'].clone()
+
+        B, N = y_q.shape
+        device = y_q.device
+
+        # Denormalize meta features
+        snr_db_norm = meta[:, 0:1]
+        gamma_eff_db_norm = meta[:, 1:2]
+
+        snr_db = snr_db_norm * self.cfg.snr_db_scale + self.cfg.snr_db_center \
+            if hasattr(self.cfg, 'snr_db_scale') else snr_db_norm * 15.0 + 15.0
+        gamma_eff_db = gamma_eff_db_norm * 20.0 + 10.0
+
+        snr_linear = 10.0 ** (snr_db / 10.0)
+        gamma_eff_linear = 10.0 ** (gamma_eff_db / 10.0)
+
+        # Initialize
+        x_est = torch.zeros_like(y_q)
+
+        layer_outputs = []
+        geom_cache = {'log_vols': [], 'fim_invs': []}
+
+        # [NEW B-lite] Accumulate Wiener prior loss across layers
+        total_wiener_loss = torch.tensor(0.0, device=device)
+
+        for k in range(self.cfg.n_layers):
+            # 1. Physics - get FIM info
+            fim_inv, log_vol = self.phys_enc.get_approx_fim_info(theta, gamma_eff_linear)
+            if self.cfg.enable_geom_loss:
+                geom_cache['log_vols'].append(log_vol)
+                geom_cache['fim_invs'].append(fim_inv)
+
+            # 2. Pilot - get gates
+            gates = self.pilot(meta, log_vol=log_vol)
+
+            # [FIX 10] Adjust g_PN based on pn_linewidth_norm in meta
+            pn_norm = meta[:, 4:5]  # pn_linewidth_norm is at index 4
+            gates['g_PN'] = gates['g_PN'] * (pn_norm > 0.1).float()
+
+            # 3. PN Tracking - [B-lite] Now returns wiener_loss
+            derotator, wiener_loss = self.pn_tracker(y_q, gates['g_PN'], x_est if k > 0 else None)
+            total_wiener_loss = total_wiener_loss + wiener_loss
+
+            y_corr = y_q * derotator
+
+            # 4. Refiner
+            z_denoised, onsager = self.refiner(y_corr, gates['g_NL'])
+
+            # 5. Solver
+            x_est = self.solver(z_denoised, x_est, self.phys_enc, theta, snr_linear)
+
+            # 6. Theta Update with acceptance criterion
+            theta_info = {}
+            if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
+                # Compute channel and residual
+                h_diag = self.phys_enc.compute_channel_diag(theta)
+                resid = z_denoised - h_diag * x_est
+
+                # Create h_func for acceptance criterion
+                def h_func(theta_new):
+                    return self.phys_enc.compute_channel_diag(theta_new)
+
+                # Update theta with acceptance criterion
+                theta, theta_info = self.theta_updater(
+                    theta, resid, x_est,
+                    gates['g_theta'], fim_inv,
+                    y_q=y_corr,  # Pass corrected observation
+                    h_func=h_func
+                )
+
+            layer_outputs.append({
+                'x_est': x_est.clone(),
+                'theta': theta.clone(),
+                'gates': gates,
+                'derotator': derotator,
+                'theta_info': theta_info,  # [NEW] For debugging
+                'wiener_loss_layer': wiener_loss.item() if torch.is_tensor(wiener_loss) else wiener_loss,
+            })
+
+        return {
+            'x_hat': x_est,
+            'theta_hat': theta,
+            'phi_hat': layer_outputs[-1]['derotator'],
+            'layers': layer_outputs,
+            'geom_cache': geom_cache,
+            'wiener_loss': total_wiener_loss,  # [NEW B-lite] For training loss
+        }
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass of GA-BV-Net with B-lite enhancements.
+
+        B-lite Features:
+        - Accumulates wiener_loss from PN tracker across layers
+        - ThetaUpdater returns debug info
+        - Full support for FIX 7-12
+
+        Args:
+            batch: Dictionary containing:
+                - 'y_q': Quantized observation [B, N]
+                - 'meta': Meta features [B, 6]
+                - 'theta_init': Initial theta estimate [B, 3]
+
+        Returns:
+            Dictionary containing:
+                - 'x_hat': Symbol estimate [B, N]
+                - 'theta_hat': Final theta estimate [B, 3]
+                - 'phi_hat': Final de-rotation factor [B, N]
+                - 'layers': Per-layer outputs (with theta_info)
+                - 'geom_cache': FIM information
+                - 'wiener_loss': Total Wiener prior loss (for training)
+        """
+        y_q = batch['y_q']
+        meta = batch['meta']
+        theta = batch['theta_init'].clone()
+
+        B, N = y_q.shape
+        device = y_q.device
 
         # Denormalize meta features
         snr_db_norm = meta[:, 0:1]
@@ -504,6 +718,9 @@ class GABVNet(nn.Module):
         layer_outputs = []
         geom_cache = {'log_vols': [], 'fim_invs': []}
 
+        # [B-lite] Accumulate Wiener prior loss across layers
+        total_wiener_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
         for k in range(self.cfg.n_layers):
             # 1. Physics - get FIM info
             fim_inv, log_vol = self.phys_enc.get_approx_fim_info(theta, gamma_eff_linear)
@@ -519,8 +736,17 @@ class GABVNet(nn.Module):
             pn_norm = meta[:, 4:5]  # pn_linewidth_norm is at index 4
             gates['g_PN'] = gates['g_PN'] * (pn_norm > 0.1).float()
 
-            # 3. PN Tracking - [FIX 5] improved tracker
-            derotator = self.pn_tracker(y_q, gates['g_PN'], x_est if k > 0 else None)
+            # 3. PN Tracking - [B-lite] Now returns (derotator, wiener_loss)
+            pn_output = self.pn_tracker(y_q, gates['g_PN'], x_est if k > 0 else None)
+
+            # Handle both old (single return) and new (tuple return) versions
+            if isinstance(pn_output, tuple):
+                derotator, wiener_loss = pn_output
+                total_wiener_loss = total_wiener_loss + wiener_loss
+            else:
+                derotator = pn_output
+                wiener_loss = torch.tensor(0.0, device=device)
+
             y_corr = y_q * derotator
 
             # 4. Refiner
@@ -529,23 +755,44 @@ class GABVNet(nn.Module):
             # 5. Solver
             x_est = self.solver(z_denoised, x_est, self.phys_enc, theta, snr_linear)
 
-            # 6. [FIX 4] Theta Update - ACTUALLY UPDATE!
+            # 6. [FIX 4] Theta Update
+            theta_info = {
+                'delta_R': 0.0,
+                'delta_v': 0.0,
+                'delta_a': 0.0,
+                'g_theta_effective': gates['g_theta'].mean().item(),
+                'accept_rate': 1.0,
+            }
+
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # Compute residual
+                # Compute channel and residual
                 h_diag = self.phys_enc.compute_channel_diag(theta)
                 resid = z_denoised - h_diag * x_est
 
-                # Update theta
-                theta = self.theta_updater(
-                    theta, resid, x_est,
-                    gates['g_theta'], fim_inv
-                )
+                # Update theta - handle different ThetaUpdater signatures
+                try:
+                    # New B-lite version returns (theta, info)
+                    theta_result = self.theta_updater(
+                        theta, resid, x_est,
+                        gates['g_theta'], fim_inv
+                    )
+                    if isinstance(theta_result, tuple):
+                        theta, theta_info = theta_result
+                    else:
+                        theta = theta_result
+                except TypeError:
+                    # Fallback for old version
+                    theta = self.theta_updater(
+                        theta, resid, x_est,
+                        gates['g_theta'], fim_inv
+                    )
 
             layer_outputs.append({
                 'x_est': x_est.clone(),
                 'theta': theta.clone(),
                 'gates': gates,
-                'derotator': derotator
+                'derotator': derotator,
+                'theta_info': theta_info,  # [B-lite] Debug info
             })
 
         return {
@@ -553,7 +800,8 @@ class GABVNet(nn.Module):
             'theta_hat': theta,
             'phi_hat': layer_outputs[-1]['derotator'],
             'layers': layer_outputs,
-            'geom_cache': geom_cache
+            'geom_cache': geom_cache,
+            'wiener_loss': total_wiener_loss,  # [B-lite] For training
         }
 
 
