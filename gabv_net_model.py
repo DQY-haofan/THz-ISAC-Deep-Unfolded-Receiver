@@ -589,181 +589,162 @@ class ScoreBasedThetaUpdater(nn.Module):
                 y_obs: torch.Tensor,
                 g_theta_sched: float = 1.0,
                 snr_db: float = 20.0,
-                pilot_len: int = None,  # Only use first pilot_len symbols for residual
-                phi_est: torch.Tensor = None,  # NEW: Phase estimate for domain alignment
+                pilot_len: int = None,
+                phi_est: torch.Tensor = None,
                 ) -> Tuple[torch.Tensor, Dict]:
         """
-        Update theta using score-based descent with BCRLB-aware scaling.
+        Update theta using 3x3 Gauss-Newton with proper phase handling.
 
-        CRITICAL FIX (Expert 1): phi_est alignment
+        EXPERT FIX (Patch A + B):
 
-        Problem: y_obs contains phi0 (constant phase offset), but:
-        - x_est has phi0 removed (by PN tracker)
-        - y_pred = H(θ) × x_est doesn't have phi0
-        - residual = y_tilde - y_pred contains phi0 mismatch!
-        - Jacobian doesn't know about phi0
-        → Score direction is WRONG because tau tries to "explain" phi0
+        Patch A: Do NOT rotate y_q!
+        - 1-bit quantization is done in fixed I/Q coordinates
+        - Rotating quantized signal breaks Bussgang statistics
+        - Instead, rotate y_pred and Jacobian to match y_q's domain
 
-        Solution: Derotate y_obs by phi_est before computing residual
-        - y_obs_aligned = y_obs × exp(-j × φ̂)
-        - Now residual and Jacobian are in the same domain
-
-        Args:
-            theta: Current estimate [B, 3]
-            residual: [B, N] (IGNORED - we compute our own)
-            x_est: [B, N] symbol estimate (FULL length for Jacobian)
-            g_theta: [B, 1] gate from pilot navigator
-            phys_enc: Physics encoder for Jacobian
-            y_obs: [B, N] observed signal (quantized, FULL length)
-            g_theta_sched: Scheduling factor (0→1 during warmup)
-            snr_db: SNR in dB for BCRLB scaling
-            pilot_len: Only use first pilot_len symbols for residual
-            phi_est: [B, N] or [B, 1] phase estimate from PN tracker
-
-        Returns:
-            theta_new: Updated theta [B, 3]
-            info: Dictionary with diagnostics
+        Patch B: Use 3x3 Gauss-Newton to decouple (τ, v, a)
+        - Single-parameter projection score is contaminated by Doppler mismatch
+        - GN automatically separates the contributions
         """
         B = theta.shape[0]
-        N_full = x_est.shape[1]  # Full frame length (e.g., 1024)
+        N_full = x_est.shape[1]
         device = theta.device
 
-        # Default: use all symbols (backward compatible)
         if pilot_len is None:
             pilot_len = N_full
-        N = pilot_len  # Effective length for residual computation
+        Np = pilot_len
 
-        # === CRITICAL FIX: Align phase domains ===
-        # Derotate y_obs by phi_est so it matches the domain of y_pred
+        # === Get phase estimate (constant) ===
         if phi_est is not None:
-            # phi_est might be [B, N] (per-sample) or [B, 1] (constant)
-            # For theta update, we only care about the constant phase offset
             if phi_est.dim() == 2 and phi_est.shape[1] > 1:
-                # Use the mean phase from pilot region
-                phi_const = phi_est[:, :N].mean(dim=1, keepdim=True)
+                phi_const = phi_est[:, :Np].mean(dim=1, keepdim=True)
             else:
                 phi_const = phi_est
-            # Derotate observation
-            y_obs_aligned = y_obs * torch.exp(-1j * phi_const)
         else:
-            y_obs_aligned = y_obs
+            phi_const = torch.zeros(B, 1, device=device)
 
-        # === Step 1: Compute Jacobian on FULL frame (required by physics) ===
-        dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
-        # Truncate Jacobians to pilot length for residual computation
-        dy_dtau, dy_dv, dy_da = dy_dtheta
-        dy_dtau = dy_dtau[:, :N]
-        dy_dv = dy_dv[:, :N]
-        dy_da = dy_da[:, :N]
-        dy_dtheta = (dy_dtau, dy_dv, dy_da)
+        phase = torch.exp(-1j * phi_const)  # [B, 1]
 
-        # === Step 2: Compute BUSSGANG-LINEARIZED residual on PILOTS only ===
+        # === PATCH A: Rotate prediction, NOT y_q ===
+        # y_pred with phase applied (to match y_q's domain)
         y_pred_full = phys_enc.forward_operator(x_est, theta)
-        y_pred = y_pred_full[:, :N]  # Truncate to pilot length
-        y_obs_pilot = y_obs_aligned[:, :N]  # Use phase-aligned observation!
+        y_pred = y_pred_full[:, :Np]
+        y_pred_phi = y_pred * phase  # Put phase onto prediction
 
-        # Bussgang coefficient: α = sqrt(2/π) / σ where σ² = E[|y|²]
-        var = torch.mean(torch.abs(y_pred)**2, dim=1, keepdim=True).clamp(min=1e-6)
+        # === Jacobians with phase applied ===
+        dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
+        J_tau, J_v, J_a = dy_dtheta
+        J_tau = J_tau[:, :Np] * phase
+        J_v = J_v[:, :Np] * phase
+        J_a = J_a[:, :Np] * phase
+
+        # === Bussgang linearization in matched domain ===
+        var = torch.mean(torch.abs(y_pred_phi)**2, dim=1, keepdim=True).clamp(min=1e-6)
         alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
 
-        # Equivalent linear observation: y_tilde = y_q / α
-        y_tilde = y_obs_pilot / (alpha + 1e-6)
+        # y_q remains UNTOUCHED (critical for 1-bit!)
+        y_q_pilot = y_obs[:, :Np]
+        y_tilde = y_q_pilot / (alpha + 1e-6)
 
-        # Linear residual (same domain as y_pred, phase-aligned!)
-        residual_lin = y_tilde - y_pred
+        # Residual in matched domain
+        r = y_tilde - y_pred_phi  # [B, Np]
 
-        # === Step 3: Compute Score (Gauss-Newton direction) ===
-        score = self.compute_score(residual_lin, dy_dtheta)  # [B, 3]
+        # === PATCH B: 3x3 Gauss-Newton to decouple (τ, v, a) ===
+        # Build normal equations: G = J^H J, b = Re(J^H r)
 
-        # === Step 4: Build Features ===
-        residual_power = torch.mean(torch.abs(residual_lin)**2, dim=1, keepdim=True)
-        log_power = torch.log10(residual_power + 1e-10)
+        def inner_product(a, b):
+            """Complex inner product: <a, b> = sum(conj(a) * b)"""
+            return torch.sum(torch.conj(a) * b, dim=1, keepdim=True)
 
-        score_magnitude = torch.abs(score)  # [B, 3]
+        # Gram matrix elements
+        G11 = torch.real(inner_product(J_tau, J_tau))
+        G12 = torch.real(inner_product(J_tau, J_v))
+        G13 = torch.real(inner_product(J_tau, J_a))
+        G22 = torch.real(inner_product(J_v, J_v))
+        G23 = torch.real(inner_product(J_v, J_a))
+        G33 = torch.real(inner_product(J_a, J_a))
 
-        # Symbol confidence (how close to constellation points)
-        # For QPSK: ideal normalized symbols have |real| = |imag| = 1/sqrt(2)
-        # We need to normalize first, then check
-        x_est_amplitude = torch.mean(torch.abs(x_est), dim=1, keepdim=True).clamp(min=1e-6)
-        x_est_normalized = x_est / x_est_amplitude
+        # Right-hand side
+        b1 = torch.real(inner_product(J_tau, r))
+        b2 = torch.real(inner_product(J_v, r))
+        b3 = torch.real(inner_product(J_a, r))
 
-        confidence = 1.0 - torch.mean(
-            torch.abs(torch.abs(x_est_normalized.real) - 1/math.sqrt(2))**2 +
-            torch.abs(torch.abs(x_est_normalized.imag) - 1/math.sqrt(2))**2,
-            dim=1, keepdim=True
-        )
-        confidence = torch.clamp(confidence, 0, 1)
+        # Assemble [B, 3, 3] and [B, 3, 1]
+        G = torch.zeros((B, 3, 3), device=device, dtype=torch.float32)
+        G[:, 0, 0] = G11.squeeze(1)
+        G[:, 0, 1] = G12.squeeze(1)
+        G[:, 0, 2] = G13.squeeze(1)
+        G[:, 1, 0] = G12.squeeze(1)  # Symmetric
+        G[:, 1, 1] = G22.squeeze(1)
+        G[:, 1, 2] = G23.squeeze(1)
+        G[:, 2, 0] = G13.squeeze(1)  # Symmetric
+        G[:, 2, 1] = G23.squeeze(1)  # Symmetric
+        G[:, 2, 2] = G33.squeeze(1)
 
-        # SNR normalization
-        snr_norm = torch.tensor([[(snr_db - 15) / 15]], device=device).expand(B, 1)
+        b = torch.stack([b1.squeeze(1), b2.squeeze(1), b3.squeeze(1)], dim=1).unsqueeze(-1)  # [B, 3, 1]
 
-        feat = torch.cat([
-            log_power,           # [B, 1]
-            score_magnitude,     # [B, 3]
-            g_theta,             # [B, 1]
-            confidence,          # [B, 1]
-            snr_norm,            # [B, 1]
-        ], dim=1).float()  # [B, 7]
+        # Damping for numerical stability (Levenberg-Marquardt style)
+        lam = 1e-3
+        I = torch.eye(3, device=device).unsqueeze(0).expand(B, -1, -1)
+        G_reg = G + lam * I
 
-        # === Step 4: Predict Step Sizes ===
-        step_sizes = self.step_net(feat)  # [B, 3]
+        # Solve: delta_gn = inv(G_reg) @ b
+        try:
+            delta_gn = torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3]
+        except:
+            # Fallback if solve fails
+            delta_gn = torch.zeros(B, 3, device=device)
 
-        # Scale step sizes by BCRLB (helps balance different units)
-        step_sizes = step_sizes * self.bcrlb_scale.unsqueeze(0)
+        # === Apply fixed step size (bypass step_net for now) ===
+        # Expert recommendation: use fixed mu until direction is verified
+        mu = 0.5  # Can tune 0.1 ~ 1.0
+        delta_theta = mu * delta_gn
 
-        # === Step 5: Compute Delta ===
-        # Gradient descent on L = ||y_tilde - y_pred(θ)||²:
-        #   ∂L/∂θ = -2 Re(<∂y_pred/∂θ, residual>)
-        #   Δθ = -∂L/∂θ = +2 Re(<∂y_pred/∂θ, residual>) ∝ +score
-        #
-        # So: delta_theta = +μ × score (POSITIVE sign for gradient descent!)
-        delta_theta = step_sizes * score  # FIXED: was negative, should be positive
-
-        # Clamp delta to physical limits
+        # Clamp to physical limits
         delta_theta = torch.clamp(delta_theta, -self.max_delta, self.max_delta)
 
-        # === Step 6: Apply Gate and Scheduling ===
-        # Simplified gate: just use g_theta and scheduling
-        # Removed confidence_gate which may be blocking updates when x_est is noisy
+        # === Apply gate and scheduling ===
         effective_gate = g_theta * g_theta_sched
-
-        # Minimum gate to ensure some update happens
-        min_gate = 0.1  # At least 10% of the update
+        min_gate = 0.1
         effective_gate = torch.maximum(effective_gate, torch.tensor(min_gate, device=device))
 
         theta_candidate = theta + effective_gate * delta_theta
 
-        # === Step 7: Clamp to Bounds ===
-        theta_clamped = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
-
-        # === Step 8: Acceptance Test ===
-        # TEMPORARILY DISABLED: Bussgang residual doesn't align well with actual improvement
-        # The residual_improvement is often negative even when theta is improving
-        # TODO: Fix Bussgang-domain acceptance or use different metric
-
-        # For now, just accept all updates (soft_accept = 1.0)
-        # This allows us to verify the update direction is correct
-        accept = torch.ones(B, 1, device=device)
-        soft_accept = torch.ones(B, 1, device=device)
-        improvement = torch.zeros(B, 1, device=device)  # Placeholder
-
-        # Final theta: use the updated value directly
-        theta_final = theta_clamped
+        # Clamp to bounds
+        theta_final = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
 
         # === Diagnostics ===
+        # Compute residual improvement in this domain
+        y_pred_new = phys_enc.forward_operator(x_est, theta_final)[:, :Np] * phase
+        var_new = torch.mean(torch.abs(y_pred_new)**2, dim=1, keepdim=True).clamp(min=1e-6)
+        alpha_new = math.sqrt(2/math.pi) / torch.sqrt(var_new)
+        y_tilde_new = y_q_pilot / (alpha_new + 1e-6)
+        r_new = y_tilde_new - y_pred_new
+
+        resid_old = torch.mean(torch.abs(r)**2, dim=1, keepdim=True)
+        resid_new = torch.mean(torch.abs(r_new)**2, dim=1, keepdim=True)
+        improvement = (resid_old - resid_new) / (resid_old + 1e-10)
+
+        # Condition number of G (for diagnostics)
+        try:
+            G_cond = torch.linalg.cond(G_reg).mean().item()
+        except:
+            G_cond = float('nan')
+
         info = {
-            'score': score.detach(),
-            'step_sizes': step_sizes.detach(),
             'delta_theta': delta_theta.detach(),
             'effective_gate': effective_gate.mean().item(),
-            'accept_rate': accept.mean().item(),
-            'soft_accept': soft_accept.mean().item(),
+            'accept_rate': 1.0,  # Always accept with GN
+            'soft_accept': 1.0,
             'delta_tau': delta_theta[:, 0].abs().mean().item(),
             'delta_v': delta_theta[:, 1].abs().mean().item(),
             'delta_a': delta_theta[:, 2].abs().mean().item(),
-            'confidence': confidence.mean().item(),
             'residual_improvement': improvement.mean().item(),
-            'bussgang_alpha': alpha.mean().item(),  # New diagnostic
+            'bussgang_alpha': alpha.mean().item(),
+            'G_cond': G_cond,  # New: condition number
+            'delta_gn_tau': delta_gn[:, 0].mean().item(),  # New: raw GN delta
+            'delta_gn_v': delta_gn[:, 1].mean().item(),
+            'delta_gn_a': delta_gn[:, 2].mean().item(),
         }
 
         return theta_final, info
