@@ -175,8 +175,17 @@ def evaluate_single_batch(
     # Generate data
     sim_data = simulate_batch(sim_cfg, batch_size)
 
+    # Helper function to convert to tensor
+    def to_tensor(x, device):
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x).to(device)
+        elif isinstance(x, torch.Tensor):
+            return x.to(device)
+        else:
+            return x
+
     # Create theta_init with noise
-    theta_true = sim_data['theta_true'].to(device)
+    theta_true = to_tensor(sim_data['theta_true'], device)
 
     if use_oracle_theta:
         theta_init = theta_true.clone()
@@ -189,13 +198,25 @@ def evaluate_single_batch(
         theta_init[:, 1:2] += noise_v
         theta_init[:, 2:3] += noise_a
 
-    # Prepare batch
+    # Prepare batch - convert all arrays to tensors
+    y_q = to_tensor(sim_data['y_q'], device)
+    x_true = to_tensor(sim_data['x_true'], device)
+
+    # Handle meta dict
+    meta = {}
+    for k, v in sim_data['meta'].items():
+        if isinstance(v, np.ndarray):
+            meta[k] = torch.from_numpy(v).to(device)
+        elif isinstance(v, torch.Tensor):
+            meta[k] = v.to(device)
+        else:
+            meta[k] = v
+
     batch = {
-        'y_q': sim_data['y_q'].to(device),
-        'x_true': sim_data['x_true'].to(device),
+        'y_q': y_q,
+        'x_true': x_true,
         'theta_init': theta_init,
-        'meta': {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in sim_data['meta'].items()},
+        'meta': meta,
         'snr_db': sim_cfg.snr_db,
     }
 
@@ -843,20 +864,27 @@ def main():
     # Load model - try multiple ways to find checkpoint
     ckpt_path = args.ckpt
 
+    # Debug: show current directory
+    print(f"Current directory: {os.getcwd()}")
+
     # If path contains wildcard or doesn't exist, try to find it
     if not ckpt_path or not os.path.exists(ckpt_path):
         import glob
-        # Try common patterns
+        # Try common patterns (including absolute paths)
         patterns = [
             'results/checkpoints/Stage2_*/final.pth',
             'results/checkpoints/Stage2_FineTrak_*/final.pth',
-            '../results/checkpoints/Stage2_*/final.pth',
+            './results/checkpoints/Stage2_*/final.pth',
+            '/content/THz-ISAC-Deep-Unfolded-Receiver/results/checkpoints/Stage2_*/final.pth',
         ]
+
+        print("Searching for checkpoints...")
         for pattern in patterns:
             matches = glob.glob(pattern)
+            print(f"  Pattern '{pattern}': {len(matches)} matches")
             if matches:
                 ckpt_path = sorted(matches)[-1]  # Use most recent
-                print(f"Found checkpoint: {ckpt_path}")
+                print(f"  -> Found: {ckpt_path}")
                 break
 
     if ckpt_path and os.path.exists(ckpt_path):
@@ -864,7 +892,8 @@ def main():
         model, gabv_cfg = load_model(ckpt_path, eval_cfg.device)
     else:
         print("WARNING: No checkpoint found. Creating default model.")
-        print("  Searched patterns: results/checkpoints/Stage2_*/final.pth")
+        print("  This will use untrained weights!")
+        print("  Please run training first: python train_gabv_net.py --curriculum")
         gabv_cfg = GABVConfig()
         model = create_gabv_model(gabv_cfg)
         model.to(eval_cfg.device)
