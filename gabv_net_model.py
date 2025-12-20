@@ -629,10 +629,12 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         # === CRITICAL: Use known pilots for y_pred and Jacobian ===
         # If x_pilot is provided, use it for prediction (not x_est which adapted to theta error)
-        # IMPORTANT: Use full x_pilot (not zero-padded) to preserve energy!
         if x_pilot is not None:
-            x_for_pred = x_pilot  # Use full pilot sequence (all symbols are known in training)
-            x_pilot_input_power = torch.mean(torch.abs(x_pilot)**2).item()
+            # IMPORTANT: Normalize x_pilot to unit power!
+            # The simulator may output non-normalized symbols
+            x_pilot_power = torch.mean(torch.abs(x_pilot)**2, dim=1, keepdim=True).clamp(min=1e-10)
+            x_for_pred = x_pilot / torch.sqrt(x_pilot_power)  # Normalize to unit power
+            x_pilot_input_power = x_pilot_power.mean().item()
         else:
             # Fallback: use x_est (less accurate for theta update)
             x_for_pred = x_est
