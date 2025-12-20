@@ -103,33 +103,38 @@ def main():
             print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A'):.4f}")
             print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A'):.6f}")
 
-            # Delta in samples
+            # Delta in samples (after clamp and gate)
             delta_tau = theta_info.get('delta_tau', 0)
             print(f"  delta_tau: {delta_tau / Ts:.4f} samples")
             print(f"  delta_v: {theta_info.get('delta_v', 0):.2f} m/s")
-            print(f"  delta_a: {theta_info.get('delta_a', 0):.2f} m/s²")
 
-            # Raw GN deltas (before gate/clamp)
-            print(f"\n[Raw Gauss-Newton Deltas]")
+            # Raw GN deltas (before clamp)
+            print(f"\n[Raw Gauss-Newton Deltas (before clamp)]")
             gn_tau = theta_info.get('delta_gn_tau', 0)
-            print(f"  delta_gn_tau: {gn_tau / Ts:.4f} samples")
-            print(f"  delta_gn_v: {theta_info.get('delta_gn_v', 0):.2f} m/s")
-            print(f"  delta_gn_a: {theta_info.get('delta_gn_a', 0):.2f} m/s²")
-
-            # Gram matrix condition number
+            gn_v = theta_info.get('delta_gn_v', 0)
+            print(f"  delta_gn_tau: {gn_tau / Ts:.4f} samples ({gn_tau:.2e} s)")
+            print(f"  delta_gn_v: {gn_v:.2f} m/s")
             print(f"  G_cond: {theta_info.get('G_cond', 'N/A'):.2f}")
 
-            # NEW: Debug info for b=0 issue
-            print(f"\n[Residual & Projection Debug]")
-            print(f"  r_norm: {theta_info.get('r_norm', 'N/A'):.4f}")
+            # Normalized deltas (from GN solve, before scale conversion)
+            print(f"\n[Normalized Deltas (GN solution)]")
+            print(f"  delta_n_tau: {theta_info.get('delta_n_tau', 'N/A'):.6f}")
+            print(f"  delta_n_v: {theta_info.get('delta_n_v', 'N/A'):.6f}")
+            print(f"  scale_tau: {theta_info.get('scale_tau', 'N/A'):.2e}")
+            print(f"  scale_v: {theta_info.get('scale_v', 'N/A'):.2e}")
+
+            # Residual & projections
+            print(f"\n[Residual & Projections]")
+            using_pilot = theta_info.get('using_x_pilot', 0)
+            print(f"  using_x_pilot: {'YES ✓' if using_pilot > 0.5 else 'NO (fallback to x_est)'}")
+            print(f"  ||r||: {theta_info.get('r_norm', 'N/A'):.4f}")
             print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")
             print(f"  b2 (J_v^H @ r, norm): {theta_info.get('b2', 'N/A'):.6f}")
-            print(f"  b3 (J_a^H @ r, norm): {theta_info.get('b3', 'N/A'):.6f}")
-            print(f"  b1_raw (J_tau^H @ r): {theta_info.get('b1_raw', 'N/A'):.2e}")
+            print(f"  b1_raw: {theta_info.get('b1_raw', 'N/A'):.2e}")
             print(f"  ||J_tau||: {theta_info.get('norm_J_tau', 'N/A'):.2e}")
             print(f"  ||J_v||: {theta_info.get('norm_J_v', 'N/A'):.2e}")
 
-            print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A'):.4f}")
+            print(f"\n  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A'):.4f}")
 
     # Check phi_est
     if 'phi_est' in outputs:

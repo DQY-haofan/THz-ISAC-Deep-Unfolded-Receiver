@@ -591,20 +591,22 @@ class ScoreBasedThetaUpdater(nn.Module):
                 snr_db: float = 20.0,
                 pilot_len: int = None,
                 phi_est: torch.Tensor = None,
+                x_pilot: torch.Tensor = None,  # NEW: Known pilot symbols
                 ) -> Tuple[torch.Tensor, Dict]:
         """
         Update theta using 3x3 Gauss-Newton with proper phase handling.
 
-        EXPERT FIX (Patch A + B):
+        CRITICAL FIX: Use known pilot symbols, not x_est!
 
-        Patch A: Do NOT rotate y_q!
-        - 1-bit quantization is done in fixed I/Q coordinates
-        - Rotating quantized signal breaks Bussgang statistics
-        - Instead, rotate y_pred and Jacobian to match y_q's domain
+        Problem: x_est is estimated using the current (possibly wrong) theta.
+        If theta_init has error, x_est "adapts" to compensate:
+        - y_pred = H(theta_init) × x_est ≈ y_obs (because x_est adapted)
+        - residual r = y_tilde - y_pred becomes small
+        - gradient b = J^H @ r also becomes small!
 
-        Patch B: Use 3x3 Gauss-Newton to decouple (τ, v, a)
-        - Single-parameter projection score is contaminated by Doppler mismatch
-        - GN automatically separates the contributions
+        Solution: Use known pilot symbols for y_pred and Jacobian.
+        - y_pred_pilot = H(theta) × x_pilot (known pilots, not estimated x_est)
+        - This gives true residual reflecting theta error
         """
         B = theta.shape[0]
         N_full = x_est.shape[1]
@@ -625,14 +627,25 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         phase = torch.exp(-1j * phi_const)  # [B, 1]
 
+        # === CRITICAL: Use known pilots for y_pred and Jacobian ===
+        # If x_pilot is provided, use it; otherwise fall back to x_est
+        if x_pilot is not None and x_pilot.shape[1] >= Np:
+            # Create full-length x with pilots and zeros for data
+            # Only pilots matter for residual computation
+            x_for_pred = torch.zeros_like(x_est)
+            x_for_pred[:, :Np] = x_pilot[:, :Np]
+        else:
+            # Fallback: use x_est (less accurate for theta update)
+            x_for_pred = x_est
+
         # === PATCH A: Rotate prediction, NOT y_q ===
-        # y_pred with phase applied (to match y_q's domain)
-        y_pred_full = phys_enc.forward_operator(x_est, theta)
+        # Use x_pilot for prediction (not x_est which adapted to theta error)
+        y_pred_full = phys_enc.forward_operator(x_for_pred, theta)
         y_pred = y_pred_full[:, :Np]
         y_pred_phi = y_pred * phase  # Put phase onto prediction
 
-        # === Jacobians with phase applied ===
-        dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_est)
+        # === Jacobians with phase applied (using x_pilot) ===
+        dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_for_pred)
         J_tau, J_v, J_a = dy_dtheta
         J_tau = J_tau[:, :Np] * phase
         J_v = J_v[:, :Np] * phase
@@ -749,8 +762,8 @@ class ScoreBasedThetaUpdater(nn.Module):
         theta_final = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
 
         # === Diagnostics ===
-        # Compute residual improvement in this domain
-        y_pred_new = phys_enc.forward_operator(x_est, theta_final)[:, :Np] * phase
+        # Compute residual improvement in this domain (using x_pilot for consistency)
+        y_pred_new = phys_enc.forward_operator(x_for_pred, theta_final)[:, :Np] * phase
         var_new = torch.mean(torch.abs(y_pred_new)**2, dim=1, keepdim=True).clamp(min=1e-6)
         alpha_new = math.sqrt(2/math.pi) / torch.sqrt(var_new)
         y_tilde_new = y_q_pilot / (alpha_new + 1e-6)
@@ -780,14 +793,22 @@ class ScoreBasedThetaUpdater(nn.Module):
             'delta_gn_tau': delta_gn[:, 0].mean().item(),
             'delta_gn_v': delta_gn[:, 1].mean().item(),
             'delta_gn_a': delta_gn[:, 2].mean().item(),
-            # New diagnostics to debug b=0 issue
+            # Debug info
             'r_norm': r_norm.mean().item(),
-            'b1': b1.mean().item(),  # J_tau^H @ r (normalized)
-            'b2': b2.mean().item(),  # J_v^H @ r (normalized)
-            'b3': b3.mean().item(),  # J_a^H @ r (normalized)
-            'b1_raw': b1_raw.mean().item(),  # J_tau^H @ r (un-normalized)
+            'b1': b1.mean().item(),
+            'b2': b2.mean().item(),
+            'b3': b3.mean().item(),
+            'b1_raw': b1_raw.mean().item(),
             'norm_J_tau': norm_tau.mean().item(),
             'norm_J_v': norm_v.mean().item(),
+            # Normalized deltas
+            'delta_n_tau': delta_normalized[:, 0].mean().item(),
+            'delta_n_v': delta_normalized[:, 1].mean().item(),
+            'delta_n_a': delta_normalized[:, 2].mean().item(),
+            'scale_tau': scale_tau.mean().item(),
+            'scale_v': scale_v.mean().item(),
+            # NEW: Flag if using known pilots
+            'using_x_pilot': 1.0 if (x_pilot is not None and x_pilot.shape[1] >= Np) else 0.0,
         }
 
         return theta_final, info
@@ -1006,15 +1027,16 @@ class GABVNet(nn.Module):
             # Theta update (if enabled)
             theta_info = {}
             if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # CRITICAL FIX (Expert 1): Pass phi_est to align phase domains!
-                # Without this, residual contains phi0 but Jacobian doesn't know about it,
-                # causing tau to "explain" phase offset → wrong direction!
+                # CRITICAL FIX: Pass known pilots for accurate residual!
+                # x_est adapts to theta error, giving small residual
+                # x_pilot (known pilots) gives true residual
                 theta, theta_info = self.theta_updater(
-                    theta, None, x_est,  # Full x_est for Jacobian computation
+                    theta, None, x_est,
                     gates['g_theta'], self.phys_enc,
                     y_q, g_theta_sched, snr_db,
-                    pilot_len=pilot_len,  # Use only first pilot_len symbols for residual
-                    phi_est=phi_est,      # Pass phase estimate for domain alignment
+                    pilot_len=pilot_len,
+                    phi_est=phi_est,
+                    x_pilot=x_pilot,  # NEW: Pass known pilots
                 )
 
                 # P0-1 FIX: Sync z to new theta!
