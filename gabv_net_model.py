@@ -628,12 +628,10 @@ class ScoreBasedThetaUpdater(nn.Module):
         phase = torch.exp(-1j * phi_const)  # [B, 1]
 
         # === CRITICAL: Use known pilots for y_pred and Jacobian ===
-        # If x_pilot is provided, use it; otherwise fall back to x_est
-        if x_pilot is not None and x_pilot.shape[1] >= Np:
-            # Create full-length x with pilots and zeros for data
-            # Only pilots matter for residual computation
-            x_for_pred = torch.zeros_like(x_est)
-            x_for_pred[:, :Np] = x_pilot[:, :Np]
+        # If x_pilot is provided, use it for prediction (not x_est which adapted to theta error)
+        # IMPORTANT: Use full x_pilot (not zero-padded) to preserve energy!
+        if x_pilot is not None:
+            x_for_pred = x_pilot  # Use full pilot sequence (all symbols are known in training)
         else:
             # Fallback: use x_est (less accurate for theta update)
             x_for_pred = x_est
