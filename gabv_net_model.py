@@ -684,6 +684,14 @@ class ScoreBasedThetaUpdater(nn.Module):
         b2 = torch.real(inner_product(J_v_n, r))
         b3 = torch.real(inner_product(J_a_n, r))
 
+        # DEBUG: Check residual and projection magnitudes
+        r_norm = torch.sqrt(torch.sum(torch.abs(r)**2, dim=1, keepdim=True))
+
+        # Raw (un-normalized) projections for diagnostics
+        b1_raw = torch.real(inner_product(J_tau, r))
+        b2_raw = torch.real(inner_product(J_v, r))
+        b3_raw = torch.real(inner_product(J_a, r))
+
         # Assemble [B, 3, 3] and [B, 3, 1]
         G = torch.zeros((B, 3, 3), device=device, dtype=torch.float32)
         G[:, 0, 0] = G11.squeeze(1)
@@ -768,10 +776,18 @@ class ScoreBasedThetaUpdater(nn.Module):
             'delta_a': delta_theta[:, 2].abs().mean().item(),
             'residual_improvement': improvement.mean().item(),
             'bussgang_alpha': alpha.mean().item(),
-            'G_cond': G_cond,  # New: condition number
-            'delta_gn_tau': delta_gn[:, 0].mean().item(),  # New: raw GN delta
+            'G_cond': G_cond,
+            'delta_gn_tau': delta_gn[:, 0].mean().item(),
             'delta_gn_v': delta_gn[:, 1].mean().item(),
             'delta_gn_a': delta_gn[:, 2].mean().item(),
+            # New diagnostics to debug b=0 issue
+            'r_norm': r_norm.mean().item(),
+            'b1': b1.mean().item(),  # J_tau^H @ r (normalized)
+            'b2': b2.mean().item(),  # J_v^H @ r (normalized)
+            'b3': b3.mean().item(),  # J_a^H @ r (normalized)
+            'b1_raw': b1_raw.mean().item(),  # J_tau^H @ r (un-normalized)
+            'norm_J_tau': norm_tau.mean().item(),
+            'norm_J_v': norm_v.mean().item(),
         }
 
         return theta_final, info

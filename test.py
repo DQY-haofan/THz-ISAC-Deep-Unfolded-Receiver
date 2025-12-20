@@ -111,13 +111,23 @@ def main():
 
             # Raw GN deltas (before gate/clamp)
             print(f"\n[Raw Gauss-Newton Deltas]")
-            print(f"  delta_gn_tau: {theta_info.get('delta_gn_tau', 0) / Ts:.4f} samples")
+            gn_tau = theta_info.get('delta_gn_tau', 0)
+            print(f"  delta_gn_tau: {gn_tau / Ts:.4f} samples")
             print(f"  delta_gn_v: {theta_info.get('delta_gn_v', 0):.2f} m/s")
             print(f"  delta_gn_a: {theta_info.get('delta_gn_a', 0):.2f} m/s²")
 
             # Gram matrix condition number
-            if 'G_cond' in theta_info:
-                print(f"  G_cond: {theta_info.get('G_cond', 'N/A'):.2f}")
+            print(f"  G_cond: {theta_info.get('G_cond', 'N/A'):.2f}")
+
+            # NEW: Debug info for b=0 issue
+            print(f"\n[Residual & Projection Debug]")
+            print(f"  r_norm: {theta_info.get('r_norm', 'N/A'):.4f}")
+            print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")
+            print(f"  b2 (J_v^H @ r, norm): {theta_info.get('b2', 'N/A'):.6f}")
+            print(f"  b3 (J_a^H @ r, norm): {theta_info.get('b3', 'N/A'):.6f}")
+            print(f"  b1_raw (J_tau^H @ r): {theta_info.get('b1_raw', 'N/A'):.2e}")
+            print(f"  ||J_tau||: {theta_info.get('norm_J_tau', 'N/A'):.2e}")
+            print(f"  ||J_v||: {theta_info.get('norm_J_v', 'N/A'):.2e}")
 
             print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A'):.4f}")
 
