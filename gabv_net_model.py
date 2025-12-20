@@ -736,6 +736,9 @@ class ScoreBasedThetaUpdater(nn.Module):
         G_diag = torch.diagonal(G, dim1=1, dim2=2)  # [B, 3]
         b_vec = torch.stack([b1.squeeze(1), b2.squeeze(1), b3.squeeze(1)], dim=1)  # [B, 3]
 
+        # CRITICAL: Ensure b has same dtype as G (float32)
+        b = b.float()  # Convert to float32 to match G
+
         # Solve: delta_normalized = inv(G_reg) @ b
         try:
             delta_normalized = torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3]
