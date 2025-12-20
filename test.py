@@ -127,6 +127,15 @@ def main():
             print(f"\n[Residual & Projections]")
             using_pilot = theta_info.get('using_x_pilot', 0)
             print(f"  using_x_pilot: {'YES ✓' if using_pilot > 0.5 else 'NO (fallback to x_est)'}")
+
+            # Power diagnostics (NEW)
+            print(f"\n[Power Diagnostics]")
+            print(f"  ||x_for_pred||²: {theta_info.get('x_power', 'N/A'):.6f}")
+            print(f"  ||x_est||²:      {theta_info.get('x_est_power', 'N/A'):.6f}")
+            print(f"  ||y_pred_full||²: {theta_info.get('y_pred_full_power', 'N/A'):.6f}")
+            print(f"  ||y_pred (pilot)||²: {theta_info.get('y_pred_power', 'N/A'):.6f}")
+
+            print(f"\n[Gradient Info]")
             print(f"  ||r||: {theta_info.get('r_norm', 'N/A'):.4f}")
             print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")
             print(f"  b2 (J_v^H @ r, norm): {theta_info.get('b2', 'N/A'):.6f}")

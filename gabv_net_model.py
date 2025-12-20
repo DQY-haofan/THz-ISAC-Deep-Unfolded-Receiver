@@ -642,6 +642,12 @@ class ScoreBasedThetaUpdater(nn.Module):
         y_pred = y_pred_full[:, :Np]
         y_pred_phi = y_pred * phase  # Put phase onto prediction
 
+        # DEBUG: Track power at each stage to find where energy is lost
+        x_power = torch.mean(torch.abs(x_for_pred)**2).item()
+        x_est_power = torch.mean(torch.abs(x_est)**2).item()
+        y_pred_full_power = torch.mean(torch.abs(y_pred_full)**2).item()
+        y_pred_power = torch.mean(torch.abs(y_pred)**2).item()
+
         # === Jacobians with phase applied (using x_pilot) ===
         dy_dtheta = phys_enc.compute_channel_jacobian(theta, x_for_pred)
         J_tau, J_v, J_a = dy_dtheta
@@ -806,7 +812,12 @@ class ScoreBasedThetaUpdater(nn.Module):
             'scale_tau': scale_tau.mean().item(),
             'scale_v': scale_v.mean().item(),
             # NEW: Flag if using known pilots
-            'using_x_pilot': 1.0 if (x_pilot is not None and x_pilot.shape[1] >= Np) else 0.0,
+            'using_x_pilot': 1.0 if x_pilot is not None else 0.0,
+            # Power diagnostics
+            'x_power': x_power,
+            'x_est_power': x_est_power,
+            'y_pred_full_power': y_pred_full_power,
+            'y_pred_power': y_pred_power,
         }
 
         return theta_final, info
