@@ -111,7 +111,27 @@ def load_model(ckpt_path: str, device: str) -> Tuple[GABVNet, GABVConfig]:
     # Get config
     if 'config' in ckpt:
         cfg_dict = ckpt['config']
-        cfg = GABVConfig(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict
+        if isinstance(cfg_dict, dict):
+            # Filter out fields that GABVConfig doesn't accept
+            # Known extra fields from training: 'stage', etc.
+            extra_fields = {'stage', 'description', 'theta_noise', 'loss_weights'}
+            filtered_dict = {k: v for k, v in cfg_dict.items() if k not in extra_fields}
+
+            # Also try to get valid fields from dataclass if available
+            try:
+                valid_fields = set(GABVConfig.__dataclass_fields__.keys())
+                filtered_dict = {k: v for k, v in filtered_dict.items() if k in valid_fields}
+            except AttributeError:
+                pass  # Not a dataclass, use filtered_dict as is
+
+            try:
+                cfg = GABVConfig(**filtered_dict)
+            except TypeError as e:
+                print(f"Warning: Could not load config from checkpoint: {e}")
+                print("Using default GABVConfig")
+                cfg = GABVConfig()
+        else:
+            cfg = cfg_dict
     else:
         cfg = GABVConfig()
 
