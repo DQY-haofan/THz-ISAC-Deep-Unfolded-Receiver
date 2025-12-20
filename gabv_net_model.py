@@ -1255,9 +1255,11 @@ class GABVNet(nn.Module):
                 pilot_len=pilot_len,
             )
 
-            # Sync z to new theta BEFORE VAMP
+            # CRITICAL FIX: Re-estimate φ̂ after τ update!
+            # The old φ̂ was computed for θ_init, not θ_updated
+            # Without this, τ-φ coupling causes wrong convergence
             z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
-            z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
+            z_derotated, phi_est = self.pn_tracker(z_doppler_removed, meta, x_pilot_slice)
             z = z_derotated
 
         # === Step 6: VAMP Detector (LAYER 2 of v7 Architecture) ===
