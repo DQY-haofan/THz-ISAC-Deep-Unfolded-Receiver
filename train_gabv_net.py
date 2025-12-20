@@ -200,8 +200,8 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             snr_range=(5, 25),  # Medium-high SNR
             enable_pn=True,
             lr_multiplier=0.5,
-            freeze_comm=True,  # Freeze comm modules
-            freeze_pn=True,
+            freeze_comm=False,  # FIXED: Don't freeze - solver needs to adapt to theta error
+            freeze_pn=False,  # FIXED: Don't freeze - pn_tracker needs to adapt
         ),
 
         # Stage 3: Full Tracking (at basin edge)
@@ -218,8 +218,8 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
             snr_range=(0, 25),  # Wide range including moderate low SNR
             enable_pn=True,
             lr_multiplier=0.3,
-            freeze_comm=True,
-            freeze_pn=True,
+            freeze_comm=False,  # FIXED: Don't freeze
+            freeze_pn=False,  # FIXED: Don't freeze
         ),
     ]
 
