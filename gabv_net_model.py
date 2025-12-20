@@ -740,8 +740,13 @@ class ScoreBasedThetaUpdater(nn.Module):
         b = b.float()  # Convert to float32 to match G
 
         # Solve: delta_normalized = inv(G_reg) @ b
+        # CRITICAL: We need negative sign because:
+        # - J = ∂y_pred/∂θ (Jacobian of prediction)
+        # - r = y_tilde - y_pred (residual)
+        # - To minimize ||r||², we need Δθ = -(J^H J)^-1 J^H r
+        # - The negative comes from ∂r/∂θ = -∂y_pred/∂θ = -J
         try:
-            delta_normalized = torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3]
+            delta_normalized = -torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3] - NOTE THE NEGATIVE!
             solve_success = True
         except Exception as e:
             # Fallback if solve fails
