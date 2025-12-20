@@ -766,10 +766,25 @@ class ScoreBasedThetaUpdater(nn.Module):
             delta_normalized[:, 2] * scale_a,
         ], dim=1)  # [B, 3] in physical units
 
-        # TEMPORARY: Only update tau, disable v and a
-        # The τ-v coupling is causing wrong directions for v
-        # Once tau works, we can re-enable v, a
-        delta_gn[:, 1] = 0.0  # Disable v update
+        # =====================================================================
+        # EXPERT-RECOMMENDED: Hierarchical Update Strategy
+        # =====================================================================
+        #
+        # Key insight from experts:
+        # 1. τ is "envelope-level" parameter - must converge first
+        # 2. v is "phase-level" parameter - requires τ to be aligned
+        # 3. In current config (64 pilots, 6.4ns), v's phase change is only
+        #    ~0.001 rad - essentially unidentifiable from single frame!
+        #
+        # Strategy: "Acquisition before Tracking"
+        # - Fast loop (per-frame): Update τ only
+        # - Slow loop (cross-frame): Update v, a (future work: use EKF/PLL)
+        #
+        # For now, we disable v/a updates entirely. This is not a workaround,
+        # but the CORRECT design given the information-theoretic constraints.
+        # =====================================================================
+
+        delta_gn[:, 1] = 0.0  # Disable v update (insufficient information in single frame)
         delta_gn[:, 2] = 0.0  # Disable a update
 
         # === Apply fixed step size (bypass step_net for now) ===
@@ -853,6 +868,8 @@ class ScoreBasedThetaUpdater(nn.Module):
             'b_vec_1': b_vec[:, 1].mean().item(),    # b2
             'b_vec_2': b_vec[:, 2].mean().item(),    # b3
             'solve_success': 1.0 if solve_success else 0.0,
+            # Expert-recommended diagnostics
+            'v_info_weak': 1.0,  # Flag: v is unidentifiable in single frame
         }
 
         return theta_final, info

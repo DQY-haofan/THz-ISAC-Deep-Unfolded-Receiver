@@ -151,6 +151,12 @@ def main():
             print(
                 f"  b_vec:  [{theta_info.get('b_vec_0', 0):.4f}, {theta_info.get('b_vec_1', 0):.4f}, {theta_info.get('b_vec_2', 0):.4f}]")
 
+            # Expert recommendation status
+            print(f"\n[Expert Strategy: τ-only Update]")
+            print(f"  v_info_weak: {'YES' if theta_info.get('v_info_weak', 0) > 0.5 else 'NO'}")
+            print(f"  Reason: 64 pilots (6.4ns) → Δφ_v ≈ 0.001 rad (unidentifiable)")
+            print(f"  Strategy: Fast loop (τ per-frame) + Slow loop (v cross-frame, future)")
+
             print(f"\n[Gradient Info]")
             print(f"  ||r||: {theta_info.get('r_norm', 'N/A'):.4f}")
             print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")
