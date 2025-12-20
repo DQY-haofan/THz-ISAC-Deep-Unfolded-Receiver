@@ -559,7 +559,7 @@ class TauEstimatorInternal(nn.Module):
             grad = torch.real(torch.sum(torch.conj(J_tau) * r, dim=1, keepdim=True))
 
             # GN step with damping
-            delta_tau = -self.damping * grad / J_norm_sq  # Negative for descent
+            delta_tau = self.damping * grad / J_norm_sq  # Negative for descent
             delta_tau = torch.clamp(delta_tau, -self.max_delta_tau, self.max_delta_tau)
 
             # Update τ only
