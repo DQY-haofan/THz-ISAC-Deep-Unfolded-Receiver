@@ -494,12 +494,15 @@ class TauEstimatorInternal(nn.Module):
     def forward(self,
                 theta: torch.Tensor,
                 y_q: torch.Tensor,
-                x_pilot: torch.Tensor,
+                x_pilot: torch.Tensor,  # Already sliced to [B, Np]
                 phi_est: torch.Tensor,
                 phys_enc,
                 pilot_len: int = 64) -> Tuple[torch.Tensor, Dict]:
         """
         Estimate τ using iterative Gauss-Newton.
+
+        Args:
+            x_pilot: Pilot symbols [B, Np] (already sliced)
 
         Returns:
             theta_hat: Updated theta [B, 3] (only τ modified)
@@ -507,14 +510,20 @@ class TauEstimatorInternal(nn.Module):
         """
         B = theta.shape[0]
         device = theta.device
+        N = y_q.shape[1]  # Full frame length
         Np = pilot_len
 
-        # Extract pilots
+        # Extract pilots from observation
         y_q_pilot = y_q[:, :Np]
 
-        # Normalize x_pilot
+        # Normalize x_pilot (already sliced to Np length)
         x_pilot_power = torch.mean(torch.abs(x_pilot)**2, dim=1, keepdim=True).clamp(min=1e-10)
         x_pilot_norm = x_pilot / torch.sqrt(x_pilot_power)
+
+        # Pad x_pilot to full length for forward_operator
+        # (forward_operator expects [B, N] input)
+        x_full = torch.zeros(B, N, dtype=x_pilot_norm.dtype, device=device)
+        x_full[:, :Np] = x_pilot_norm
 
         # Phase alignment
         if phi_est.dim() == 2 and phi_est.shape[1] > 1:
@@ -529,12 +538,12 @@ class TauEstimatorInternal(nn.Module):
         final_improvement = 0.0
 
         for it in range(self.n_iterations):
-            # Prediction
-            y_pred_full = phys_enc.forward_operator(x_pilot_norm, theta_current)
+            # Prediction (use padded x_full)
+            y_pred_full = phys_enc.forward_operator(x_full, theta_current)
             y_pred = y_pred_full[:, :Np] * phase
 
-            # Jacobian (τ only)
-            J_tau, _, _ = phys_enc.compute_channel_jacobian(theta_current, x_pilot_norm)
+            # Jacobian (τ only, use padded x_full)
+            J_tau, _, _ = phys_enc.compute_channel_jacobian(theta_current, x_full)
             J_tau = J_tau[:, :Np] * phase
 
             # Bussgang
@@ -1233,12 +1242,13 @@ class GABVNet(nn.Module):
         pilot_len = self.pn_tracker.n_pilot
         theta_info = {}
 
-        if self.cfg.enable_theta_update:
+        if self.cfg.enable_theta_update and x_pilot is not None:
             # Use new TauEstimator (deterministic, no learned gate)
+            # Pass x_pilot_slice (pilots only), not full x_pilot
             theta, theta_info = self.tau_estimator(
                 theta,
                 y_q,
-                x_pilot,
+                x_pilot_slice,  # Use sliced pilots, not full sequence
                 phi_est,
                 self.phys_enc,
                 pilot_len=pilot_len,
