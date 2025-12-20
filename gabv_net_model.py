@@ -797,9 +797,19 @@ class ScoreBasedThetaUpdater(nn.Module):
         delta_theta = torch.clamp(delta_theta, -self.max_delta, self.max_delta)
 
         # === Apply gate and scheduling ===
-        effective_gate = g_theta * g_theta_sched
-        min_gate = 0.1
-        effective_gate = torch.maximum(effective_gate, torch.tensor(min_gate, device=device))
+        # EXPERT FIX: Use FIXED gate instead of learned g_theta
+        #
+        # Why: PilotNavigator learns to shut down theta update (g_theta → 0)
+        # because Bussgang residual_improvement is negative due to domain mismatch,
+        # NOT because the τ update is actually harmful.
+        #
+        # Expert recommendation: Use fixed damped Newton step g = 0.5
+        # This is standard in Gauss-Newton optimization (damping factor)
+        # Only modulate by g_theta_sched to allow warmup
+        effective_gate = 0.5 * g_theta_sched
+
+        # Safety minimum
+        effective_gate = max(effective_gate, 0.1)
 
         theta_candidate = theta + effective_gate * delta_theta
 
@@ -807,11 +817,12 @@ class ScoreBasedThetaUpdater(nn.Module):
         theta_final = torch.clamp(theta_candidate, self.theta_min, self.theta_max)
 
         # === Diagnostics ===
-        # Compute residual improvement in this domain (using x_pilot for consistency)
+        # EXPERT FIX: Compare residuals with FROZEN alpha (use old alpha for both)
+        # Otherwise we're comparing different objective functions!
         y_pred_new = phys_enc.forward_operator(x_for_pred, theta_final)[:, :Np] * phase
-        var_new = torch.mean(torch.abs(y_pred_new)**2, dim=1, keepdim=True).clamp(min=1e-6)
-        alpha_new = math.sqrt(2/math.pi) / torch.sqrt(var_new)
-        y_tilde_new = y_q_pilot / (alpha_new + 1e-6)
+
+        # Use alpha_old (not recomputed) for fair comparison
+        y_tilde_new = y_q_pilot / (alpha + 1e-6)  # Same alpha as before!
         r_new = y_tilde_new - y_pred_new
 
         resid_old = torch.mean(torch.abs(r)**2, dim=1, keepdim=True)
@@ -1085,33 +1096,39 @@ class GABVNet(nn.Module):
             # VAMP iteration
             z, x_est = layer(z, gamma, self.phys_enc, theta)
 
-            # Theta update (if enabled)
-            theta_info = {}
-            if self.cfg.enable_theta_update and k >= self.cfg.theta_update_start_layer:
-                # CRITICAL FIX: Pass known pilots for accurate residual!
-                # x_est adapts to theta error, giving small residual
-                # x_pilot (known pilots) gives true residual
-                theta, theta_info = self.theta_updater(
-                    theta, None, x_est,
-                    gates['g_theta'], self.phys_enc,
-                    y_q, g_theta_sched, snr_db,
-                    pilot_len=pilot_len,
-                    phi_est=phi_est,
-                    x_pilot=x_pilot,  # NEW: Pass known pilots
-                )
-
-                # P0-1 FIX: Sync z to new theta!
-                # Without this, theta update benefits don't propagate to subsequent layers
-                z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
-                z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
-                z = z_derotated
+            # Note: theta update moved to after VAMP loop (Expert recommendation)
+            # Updating theta every layer causes instability because x_est hasn't converged yet
 
             layer_outputs.append({
                 'x_est': x_est.detach(),
                 'theta': theta.detach(),
                 'gates': {k: v.detach() for k, v in gates.items()},
-                'theta_info': theta_info,
+                'theta_info': {},
             })
+
+        # === EXPERT FIX: Update theta ONCE after VAMP completes ===
+        # Why: Updating every layer causes "half-converged x_est + theta update" instability
+        # Expert recommendation: "每个 forward 只更新一次 θ，在 VAMP 完成后"
+        theta_info = {}
+        if self.cfg.enable_theta_update:
+            theta, theta_info = self.theta_updater(
+                theta, None, x_est,
+                gates['g_theta'], self.phys_enc,
+                y_q, g_theta_sched, snr_db,
+                pilot_len=pilot_len,
+                phi_est=phi_est,
+                x_pilot=x_pilot,
+            )
+
+            # Sync z to new theta for any subsequent processing
+            z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
+            z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
+            z = z_derotated
+
+            # Update the last layer's theta_info
+            if layer_outputs:
+                layer_outputs[-1]['theta'] = theta.detach()
+                layer_outputs[-1]['theta_info'] = theta_info
 
         # === Step 6: Final Refinement with Residual ===
         if self.bypass_refiner:
