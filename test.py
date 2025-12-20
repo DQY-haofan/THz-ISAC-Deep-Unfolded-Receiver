@@ -107,7 +107,7 @@ def main():
         if 'theta_info' in last_layer and last_layer['theta_info']:
             theta_info = last_layer['theta_info']
             print(f"\n[Theta Update Diagnostics - 3x3 Gauss-Newton]")
-            print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A'):.4f}")
+            print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A'):.4f} (FIXED=0.5)")
             print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A'):.6f}")
 
             # Delta in samples (after clamp and gate)

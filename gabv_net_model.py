@@ -837,7 +837,7 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         info = {
             'delta_theta': delta_theta.detach(),
-            'effective_gate': effective_gate.mean().item(),
+            'effective_gate': effective_gate,  # Now a scalar, not tensor
             'accept_rate': 1.0,  # Always accept with GN
             'soft_accept': 1.0,
             'delta_tau': delta_theta[:, 0].abs().mean().item(),
