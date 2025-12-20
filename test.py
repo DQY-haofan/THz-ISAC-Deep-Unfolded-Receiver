@@ -42,6 +42,13 @@ def main():
     x_true = torch.from_numpy(data['x_true']).to(device)
     theta_true = torch.from_numpy(data['theta_true']).float().to(device)
 
+    # DEBUG: Check x_true power
+    x_true_power = torch.mean(torch.abs(x_true) ** 2).item()
+    print(f"\n[Data Check]")
+    print(f"  x_true shape: {x_true.shape}")
+    print(f"  x_true power: {x_true_power:.6f} (should be ~1.0)")
+    print(f"  x_true[0,:5]: {x_true[0, :5]}")
+
     # Add theta noise (0.5 samples)
     Ts = 1e-10
     noise_std = torch.tensor([0.5 * Ts, 50.0, 5.0], device=device)
@@ -130,6 +137,7 @@ def main():
 
             # Power diagnostics (NEW)
             print(f"\n[Power Diagnostics]")
+            print(f"  ||x_pilot input||²: {theta_info.get('x_pilot_input_power', 'N/A'):.6f}")
             print(f"  ||x_for_pred||²: {theta_info.get('x_power', 'N/A'):.6f}")
             print(f"  ||x_est||²:      {theta_info.get('x_est_power', 'N/A'):.6f}")
             print(f"  ||y_pred_full||²: {theta_info.get('y_pred_full_power', 'N/A'):.6f}")

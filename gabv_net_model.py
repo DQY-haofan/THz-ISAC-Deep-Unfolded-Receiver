@@ -632,9 +632,11 @@ class ScoreBasedThetaUpdater(nn.Module):
         # IMPORTANT: Use full x_pilot (not zero-padded) to preserve energy!
         if x_pilot is not None:
             x_for_pred = x_pilot  # Use full pilot sequence (all symbols are known in training)
+            x_pilot_input_power = torch.mean(torch.abs(x_pilot)**2).item()
         else:
             # Fallback: use x_est (less accurate for theta update)
             x_for_pred = x_est
+            x_pilot_input_power = 0.0
 
         # === PATCH A: Rotate prediction, NOT y_q ===
         # Use x_pilot for prediction (not x_est which adapted to theta error)
@@ -816,6 +818,7 @@ class ScoreBasedThetaUpdater(nn.Module):
             # Power diagnostics
             'x_power': x_power,
             'x_est_power': x_est_power,
+            'x_pilot_input_power': x_pilot_input_power,
             'y_pred_full_power': y_pred_full_power,
             'y_pred_power': y_pred_power,
         }
