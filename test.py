@@ -143,6 +143,14 @@ def main():
             print(f"  ||y_pred_full||²: {theta_info.get('y_pred_full_power', 'N/A'):.6f}")
             print(f"  ||y_pred (pilot)||²: {theta_info.get('y_pred_power', 'N/A'):.6f}")
 
+            # GN solve diagnostics (NEW)
+            print(f"\n[Gauss-Newton Solve]")
+            print(f"  solve_success: {'YES ✓' if theta_info.get('solve_success', 0) > 0.5 else 'NO ✗'}")
+            print(
+                f"  G_diag: [{theta_info.get('G_diag_0', 0):.4f}, {theta_info.get('G_diag_1', 0):.4f}, {theta_info.get('G_diag_2', 0):.4f}] (should be ~1)")
+            print(
+                f"  b_vec:  [{theta_info.get('b_vec_0', 0):.4f}, {theta_info.get('b_vec_1', 0):.4f}, {theta_info.get('b_vec_2', 0):.4f}]")
+
             print(f"\n[Gradient Info]")
             print(f"  ||r||: {theta_info.get('r_norm', 'N/A'):.4f}")
             print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")

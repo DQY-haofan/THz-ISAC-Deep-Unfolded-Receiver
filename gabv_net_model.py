@@ -732,12 +732,19 @@ class ScoreBasedThetaUpdater(nn.Module):
         I = torch.eye(3, device=device).unsqueeze(0).expand(B, -1, -1)
         G_reg = G + lam * I
 
+        # DEBUG: Check G matrix and b vector values
+        G_diag = torch.diagonal(G, dim1=1, dim2=2)  # [B, 3]
+        b_vec = torch.stack([b1.squeeze(1), b2.squeeze(1), b3.squeeze(1)], dim=1)  # [B, 3]
+
         # Solve: delta_normalized = inv(G_reg) @ b
         try:
             delta_normalized = torch.linalg.solve(G_reg, b).squeeze(-1)  # [B, 3]
-        except:
+            solve_success = True
+        except Exception as e:
             # Fallback if solve fails
             delta_normalized = torch.zeros(B, 3, device=device)
+            solve_success = False
+            print(f"[WARNING] GN solve failed: {e}")
 
         # Convert back to physical units
         # delta_physical = delta_normalized / norm (because J_n = J/norm)
@@ -823,6 +830,14 @@ class ScoreBasedThetaUpdater(nn.Module):
             'x_pilot_input_power': x_pilot_input_power,
             'y_pred_full_power': y_pred_full_power,
             'y_pred_power': y_pred_power,
+            # GN solve diagnostics
+            'G_diag_0': G_diag[:, 0].mean().item(),  # Should be ~1
+            'G_diag_1': G_diag[:, 1].mean().item(),  # Should be ~1
+            'G_diag_2': G_diag[:, 2].mean().item(),  # Should be ~1
+            'b_vec_0': b_vec[:, 0].mean().item(),    # b1
+            'b_vec_1': b_vec[:, 1].mean().item(),    # b2
+            'b_vec_2': b_vec[:, 2].mean().item(),    # b3
+            'solve_success': 1.0 if solve_success else 0.0,
         }
 
         return theta_final, info
