@@ -1120,15 +1120,22 @@ class GABVNet(nn.Module):
                 x_pilot=x_pilot,
             )
 
-            # Sync z to new theta for any subsequent processing
+            # Sync z to new theta
             z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
             z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
             z = z_derotated
+
+            # CRITICAL FIX: Re-run VAMP with updated theta to get better x_est!
+            # Without this, x_hat is computed with OLD theta, wasting the update.
+            # Run 2 additional VAMP iterations to refine x_est with new theta.
+            for _ in range(2):
+                z, x_est = self.solver_layers[-1](z, gamma, self.phys_enc, theta)
 
             # Update the last layer's theta_info
             if layer_outputs:
                 layer_outputs[-1]['theta'] = theta.detach()
                 layer_outputs[-1]['theta_info'] = theta_info
+                layer_outputs[-1]['x_est'] = x_est.detach()
 
         # === Step 6: Final Refinement with Residual ===
         if self.bypass_refiner:
