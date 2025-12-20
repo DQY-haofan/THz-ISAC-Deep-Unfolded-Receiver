@@ -526,11 +526,12 @@ class TauEstimatorInternal(nn.Module):
         x_full[:, :Np] = x_pilot_norm
 
         # Phase alignment
+        # y_q contains exp(+j×φ_0_true), so y_pred needs exp(+j×φ_est) to match
         if phi_est.dim() == 2 and phi_est.shape[1] > 1:
             phi_const = phi_est[:, :Np].mean(dim=1, keepdim=True)
         else:
             phi_const = phi_est
-        phase = torch.exp(-1j * phi_const)
+        phase = torch.exp(+1j * phi_const)  # CRITICAL FIX: +j, not -j!
 
         # Iterative GN
         theta_current = theta.clone()
