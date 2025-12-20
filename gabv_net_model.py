@@ -451,7 +451,139 @@ class PilotNavigator(nn.Module):
 
 
 # =============================================================================
-# Score-based Theta Updater
+# TauEstimator (v7 Architecture - Layer 1: Fast Loop)
+# =============================================================================
+
+class TauEstimatorInternal(nn.Module):
+    """
+    Deterministic τ estimator using Gauss-Newton on pilot symbols.
+
+    This is Layer 1 of the hierarchical inference architecture.
+
+    Key properties:
+    1. NO learned gates - deterministic update prevents collapse
+    2. τ-only - v/a are unidentifiable in single frame
+    3. Domain-consistent - φ̂ applied to prediction only
+    4. Frozen α - residual comparison uses same scale
+
+    Why separate from ScoreBasedThetaUpdater:
+    - Simpler (1D GN instead of 3D)
+    - More stable (no gate learning)
+    - Clearer physical interpretation
+    """
+
+    def __init__(self, cfg, n_iterations: int = 3):
+        super().__init__()
+        self.cfg = cfg
+        self.n_iterations = n_iterations
+        self.fs = cfg.fs
+
+        # Fixed damping (not learned)
+        self.damping = 0.5
+
+        # Max update per iteration
+        self.max_delta_tau = 0.3 / cfg.fs  # 0.3 samples
+
+        # Bounds
+        tau_max = 5.0 / cfg.fs
+        v_max = 10000.0
+        a_max = 1000.0
+        self.register_buffer('theta_min', torch.tensor([-tau_max, -v_max, -a_max]))
+        self.register_buffer('theta_max', torch.tensor([tau_max, v_max, a_max]))
+
+    def forward(self,
+                theta: torch.Tensor,
+                y_q: torch.Tensor,
+                x_pilot: torch.Tensor,
+                phi_est: torch.Tensor,
+                phys_enc,
+                pilot_len: int = 64) -> Tuple[torch.Tensor, Dict]:
+        """
+        Estimate τ using iterative Gauss-Newton.
+
+        Returns:
+            theta_hat: Updated theta [B, 3] (only τ modified)
+            info: Diagnostic information
+        """
+        B = theta.shape[0]
+        device = theta.device
+        Np = pilot_len
+
+        # Extract pilots
+        y_q_pilot = y_q[:, :Np]
+
+        # Normalize x_pilot
+        x_pilot_power = torch.mean(torch.abs(x_pilot)**2, dim=1, keepdim=True).clamp(min=1e-10)
+        x_pilot_norm = x_pilot / torch.sqrt(x_pilot_power)
+
+        # Phase alignment
+        if phi_est.dim() == 2 and phi_est.shape[1] > 1:
+            phi_const = phi_est[:, :Np].mean(dim=1, keepdim=True)
+        else:
+            phi_const = phi_est
+        phase = torch.exp(-1j * phi_const)
+
+        # Iterative GN
+        theta_current = theta.clone()
+        total_tau_change = 0.0
+        final_improvement = 0.0
+
+        for it in range(self.n_iterations):
+            # Prediction
+            y_pred_full = phys_enc.forward_operator(x_pilot_norm, theta_current)
+            y_pred = y_pred_full[:, :Np] * phase
+
+            # Jacobian (τ only)
+            J_tau, _, _ = phys_enc.compute_channel_jacobian(theta_current, x_pilot_norm)
+            J_tau = J_tau[:, :Np] * phase
+
+            # Bussgang
+            var = torch.mean(torch.abs(y_pred)**2, dim=1, keepdim=True).clamp(min=1e-6)
+            alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
+
+            # Residual
+            y_tilde = y_q_pilot / (alpha + 1e-6)
+            r = y_tilde - y_pred
+
+            # 1D GN: Δτ = Re(J^H r) / ||J||²
+            J_norm_sq = torch.sum(torch.abs(J_tau)**2, dim=1, keepdim=True).clamp(min=1e-10)
+            grad = torch.real(torch.sum(torch.conj(J_tau) * r, dim=1, keepdim=True))
+
+            # GN step with damping
+            delta_tau = -self.damping * grad / J_norm_sq  # Negative for descent
+            delta_tau = torch.clamp(delta_tau, -self.max_delta_tau, self.max_delta_tau)
+
+            # Update τ only
+            theta_new = theta_current.clone()
+            theta_new[:, 0:1] = theta_current[:, 0:1] + delta_tau
+            theta_new = torch.clamp(theta_new, self.theta_min, self.theta_max)
+
+            # Track changes
+            total_tau_change += delta_tau.abs().mean().item()
+
+            # Compute improvement (frozen α)
+            y_pred_new = phys_enc.forward_operator(x_pilot_norm, theta_new)[:, :Np] * phase
+            r_new = y_tilde - y_pred_new  # Same y_tilde (frozen α)
+
+            resid_old = torch.mean(torch.abs(r)**2)
+            resid_new = torch.mean(torch.abs(r_new)**2)
+            final_improvement = ((resid_old - resid_new) / (resid_old + 1e-10)).item()
+
+            theta_current = theta_new
+
+        info = {
+            'n_iterations': self.n_iterations,
+            'total_tau_change': total_tau_change,
+            'final_improvement': final_improvement,
+            'delta_tau': (theta_current[:, 0] - theta[:, 0]).abs().mean().item() * self.fs,  # In samples
+            'bussgang_alpha': alpha.mean().item(),
+        }
+
+        return theta_current, info
+
+
+# =============================================================================
+# Score-based Theta Updater (Legacy - kept for compatibility)
 # =============================================================================
 
 class ScoreBasedThetaUpdater(nn.Module):
@@ -974,11 +1106,15 @@ class GABVNet(nn.Module):
     """
     Geometry-Aware Bussgang-VAMP Network with Wideband Delay Model.
 
-    Architecture:
-        1. PN Tracker: Removes nuisance phase (including carrier phase)
-        2. Pilot Navigator: Computes adaptive gates
-        3. VAMP Layers: Iterative symbol estimation
-        4. Theta Updater: Refines channel parameters using score-based descent
+    v7 Architecture (Hierarchical Inference):
+        Layer 1: TauEstimator - Fast τ tracking (per-frame, deterministic GN)
+        Layer 2: VAMP Detector - Symbol estimation (uses τ_hat)
+        Layer 3: DopplerTracker - Slow v/a tracking (cross-frame, future)
+
+    Key design principles:
+        1. τ and v/a have different time scales (fast vs slow loop)
+        2. τ estimation is deterministic (no learned gates that can collapse)
+        3. VAMP uses fixed θ from TauEstimator
     """
 
     def __init__(self, cfg: GABVConfig):
@@ -991,16 +1127,21 @@ class GABVNet(nn.Module):
         # PN tracker (absorbs nuisance phase)
         self.pn_tracker = RiemannianPNTracker(cfg)
 
-        # Pilot navigator (gates)
+        # Pilot navigator (gates for data/prior blending, NOT for theta)
         self.pilot = PilotNavigator(cfg)
 
-        # VAMP solver layers
+        # === LAYER 1: TauEstimator (Fast Loop) ===
+        # Deterministic GN-based τ estimation using pilots
+        # This replaces the learned ScoreBasedThetaUpdater
+        self.tau_estimator = TauEstimatorInternal(cfg, n_iterations=3)
+
+        # Legacy theta_updater (kept for compatibility, but bypassed in v7)
+        self.theta_updater = ScoreBasedThetaUpdater(cfg)
+
+        # === LAYER 2: VAMP Detector ===
         self.solver_layers = nn.ModuleList([
             BussgangVAMPLayer(cfg) for _ in range(cfg.n_layers)
         ])
-
-        # Theta updater (score-based)
-        self.theta_updater = ScoreBasedThetaUpdater(cfg)
 
         # Symbol refiner with residual connection
         # This ensures output is at least as good as input initially
@@ -1086,58 +1227,47 @@ class GABVNet(nn.Module):
         z = z_derotated
         gamma = torch.ones(B, 1, device=device)
 
-        # === Step 5: Iterative Refinement ===
+        # === Step 5: τ Estimation (LAYER 1 of v7 Architecture) ===
+        # Use TauEstimator BEFORE VAMP to get better θ
+        # This is the "Fast Loop" - deterministic GN-based τ estimation
+        pilot_len = self.pn_tracker.n_pilot
+        theta_info = {}
+
+        if self.cfg.enable_theta_update:
+            # Use new TauEstimator (deterministic, no learned gate)
+            theta, theta_info = self.tau_estimator(
+                theta,
+                y_q,
+                x_pilot,
+                phi_est,
+                self.phys_enc,
+                pilot_len=pilot_len,
+            )
+
+            # Sync z to new theta BEFORE VAMP
+            z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
+            z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
+            z = z_derotated
+
+        # === Step 6: VAMP Detector (LAYER 2 of v7 Architecture) ===
+        # Run VAMP with updated θ from TauEstimator
         layer_outputs = []
 
-        # Pilot length for theta update (P0-3 fix: use pilots only for residual)
-        pilot_len = self.pn_tracker.n_pilot
-
         for k, layer in enumerate(self.solver_layers):
-            # VAMP iteration
+            # VAMP iteration with updated theta
             z, x_est = layer(z, gamma, self.phys_enc, theta)
-
-            # Note: theta update moved to after VAMP loop (Expert recommendation)
-            # Updating theta every layer causes instability because x_est hasn't converged yet
 
             layer_outputs.append({
                 'x_est': x_est.detach(),
                 'theta': theta.detach(),
                 'gates': {k: v.detach() for k, v in gates.items()},
-                'theta_info': {},
+                'theta_info': theta_info if k == 0 else {},
             })
 
-        # === EXPERT FIX: Update theta ONCE after VAMP completes ===
-        # Why: Updating every layer causes "half-converged x_est + theta update" instability
-        # Expert recommendation: "每个 forward 只更新一次 θ，在 VAMP 完成后"
-        theta_info = {}
-        if self.cfg.enable_theta_update:
-            theta, theta_info = self.theta_updater(
-                theta, None, x_est,
-                gates['g_theta'], self.phys_enc,
-                y_q, g_theta_sched, snr_db,
-                pilot_len=pilot_len,
-                phi_est=phi_est,
-                x_pilot=x_pilot,
-            )
+        # Note: theta update now happens BEFORE VAMP (in Step 5)
+        # This is the v7 architecture: TauEstimator → VAMP → Refiner
 
-            # Sync z to new theta
-            z_doppler_removed = self.phys_enc.adjoint_operator(y_q, theta)
-            z_derotated = z_doppler_removed * torch.exp(-1j * phi_est)
-            z = z_derotated
-
-            # CRITICAL FIX: Re-run VAMP with updated theta to get better x_est!
-            # Without this, x_hat is computed with OLD theta, wasting the update.
-            # Run 2 additional VAMP iterations to refine x_est with new theta.
-            for _ in range(2):
-                z, x_est = self.solver_layers[-1](z, gamma, self.phys_enc, theta)
-
-            # Update the last layer's theta_info
-            if layer_outputs:
-                layer_outputs[-1]['theta'] = theta.detach()
-                layer_outputs[-1]['theta_info'] = theta_info
-                layer_outputs[-1]['x_est'] = x_est.detach()
-
-        # === Step 6: Final Refinement with Residual ===
+        # === Step 7: Final Refinement with Residual ===
         if self.bypass_refiner:
             x_hat = x_est
         else:

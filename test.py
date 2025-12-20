@@ -103,69 +103,87 @@ def main():
 
     # Check layer diagnostics
     if outputs['layers']:
-        last_layer = outputs['layers'][-1]
-        if 'theta_info' in last_layer and last_layer['theta_info']:
-            theta_info = last_layer['theta_info']
-            print(f"\n[Theta Update Diagnostics - 3x3 Gauss-Newton]")
-            print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A'):.4f} (FIXED=0.5)")
-            print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A'):.6f}")
+        first_layer = outputs['layers'][0]
+        if 'theta_info' in first_layer and first_layer['theta_info']:
+            theta_info = first_layer['theta_info']
 
-            # Delta in samples (after clamp and gate)
-            delta_tau = theta_info.get('delta_tau', 0)
-            print(f"  delta_tau: {delta_tau / Ts:.4f} samples")
-            print(f"  delta_v: {theta_info.get('delta_v', 0):.2f} m/s")
+            # Check if using new TauEstimator or old ScoreBasedThetaUpdater
+            if 'n_iterations' in theta_info:
+                # New TauEstimator format (v7 architecture)
+                print(f"\n[TauEstimator Diagnostics (v7 Architecture)]")
+                print(f"  n_iterations: {theta_info.get('n_iterations', 'N/A')}")
+                print(f"  delta_tau: {theta_info.get('delta_tau', 0):.4f} samples")
+                print(f"  total_tau_change: {theta_info.get('total_tau_change', 0):.6f}")
+                print(f"  final_improvement: {theta_info.get('final_improvement', 0):.6f}")
+                print(f"  bussgang_alpha: {theta_info.get('bussgang_alpha', 0):.4f}")
 
-            # Raw GN deltas (before clamp)
-            print(f"\n[Raw Gauss-Newton Deltas (before clamp)]")
-            gn_tau = theta_info.get('delta_gn_tau', 0)
-            gn_v = theta_info.get('delta_gn_v', 0)
-            print(f"  delta_gn_tau: {gn_tau / Ts:.4f} samples ({gn_tau:.2e} s)")
-            print(f"  delta_gn_v: {gn_v:.2f} m/s")
-            print(f"  G_cond: {theta_info.get('G_cond', 'N/A'):.2f}")
+                print(f"\n[Architecture Info]")
+                print(f"  Layer 1: TauEstimator (Fast Loop) - τ updated BEFORE VAMP")
+                print(f"  Layer 2: VAMP Detector - uses updated θ")
+                print(f"  Layer 3: DopplerTracker (future) - v/a cross-frame")
 
-            # Normalized deltas (from GN solve, before scale conversion)
-            print(f"\n[Normalized Deltas (GN solution)]")
-            print(f"  delta_n_tau: {theta_info.get('delta_n_tau', 'N/A'):.6f}")
-            print(f"  delta_n_v: {theta_info.get('delta_n_v', 'N/A'):.6f}")
-            print(f"  scale_tau: {theta_info.get('scale_tau', 'N/A'):.2e}")
-            print(f"  scale_v: {theta_info.get('scale_v', 'N/A'):.2e}")
+            else:
+                # Old ScoreBasedThetaUpdater format
+                print(f"\n[Theta Update Diagnostics - 3x3 Gauss-Newton]")
+                print(f"  effective_gate: {theta_info.get('effective_gate', 'N/A'):.4f} (FIXED=0.5)")
+                print(f"  residual_improvement: {theta_info.get('residual_improvement', 'N/A'):.6f}")
 
-            # Residual & projections
-            print(f"\n[Residual & Projections]")
-            using_pilot = theta_info.get('using_x_pilot', 0)
-            print(f"  using_x_pilot: {'YES ✓' if using_pilot > 0.5 else 'NO (fallback to x_est)'}")
+                # Delta in samples (after clamp and gate)
+                delta_tau = theta_info.get('delta_tau', 0)
+                print(f"  delta_tau: {delta_tau / Ts:.4f} samples")
+                print(f"  delta_v: {theta_info.get('delta_v', 0):.2f} m/s")
 
-            # Power diagnostics (NEW)
-            print(f"\n[Power Diagnostics]")
-            print(f"  ||x_pilot input||²: {theta_info.get('x_pilot_input_power', 'N/A'):.6f}")
-            print(f"  ||x_for_pred||²: {theta_info.get('x_power', 'N/A'):.6f}")
-            print(f"  ||x_est||²:      {theta_info.get('x_est_power', 'N/A'):.6f}")
-            print(f"  ||y_pred_full||²: {theta_info.get('y_pred_full_power', 'N/A'):.6f}")
-            print(f"  ||y_pred (pilot)||²: {theta_info.get('y_pred_power', 'N/A'):.6f}")
+                # Raw GN deltas (before clamp)
+                print(f"\n[Raw Gauss-Newton Deltas (before clamp)]")
+                gn_tau = theta_info.get('delta_gn_tau', 0)
+                gn_v = theta_info.get('delta_gn_v', 0)
+                print(f"  delta_gn_tau: {gn_tau / Ts:.4f} samples ({gn_tau:.2e} s)")
+                print(f"  delta_gn_v: {gn_v:.2f} m/s")
+                print(f"  G_cond: {theta_info.get('G_cond', 'N/A'):.2f}")
 
-            # GN solve diagnostics (NEW)
-            print(f"\n[Gauss-Newton Solve]")
-            print(f"  solve_success: {'YES ✓' if theta_info.get('solve_success', 0) > 0.5 else 'NO ✗'}")
-            print(
-                f"  G_diag: [{theta_info.get('G_diag_0', 0):.4f}, {theta_info.get('G_diag_1', 0):.4f}, {theta_info.get('G_diag_2', 0):.4f}] (should be ~1)")
-            print(
-                f"  b_vec:  [{theta_info.get('b_vec_0', 0):.4f}, {theta_info.get('b_vec_1', 0):.4f}, {theta_info.get('b_vec_2', 0):.4f}]")
+                # Normalized deltas (from GN solve, before scale conversion)
+                print(f"\n[Normalized Deltas (GN solution)]")
+                print(f"  delta_n_tau: {theta_info.get('delta_n_tau', 'N/A'):.6f}")
+                print(f"  delta_n_v: {theta_info.get('delta_n_v', 'N/A'):.6f}")
+                print(f"  scale_tau: {theta_info.get('scale_tau', 'N/A'):.2e}")
+                print(f"  scale_v: {theta_info.get('scale_v', 'N/A'):.2e}")
 
-            # Expert recommendation status
-            print(f"\n[Expert Strategy: τ-only Update]")
-            print(f"  v_info_weak: {'YES' if theta_info.get('v_info_weak', 0) > 0.5 else 'NO'}")
-            print(f"  Reason: 64 pilots (6.4ns) → Δφ_v ≈ 0.001 rad (unidentifiable)")
-            print(f"  Strategy: Fast loop (τ per-frame) + Slow loop (v cross-frame, future)")
+                # Residual & projections
+                print(f"\n[Residual & Projections]")
+                using_pilot = theta_info.get('using_x_pilot', 0)
+                print(f"  using_x_pilot: {'YES ✓' if using_pilot > 0.5 else 'NO (fallback to x_est)'}")
 
-            print(f"\n[Gradient Info]")
-            print(f"  ||r||: {theta_info.get('r_norm', 'N/A'):.4f}")
-            print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")
-            print(f"  b2 (J_v^H @ r, norm): {theta_info.get('b2', 'N/A'):.6f}")
-            print(f"  b1_raw: {theta_info.get('b1_raw', 'N/A'):.2e}")
-            print(f"  ||J_tau||: {theta_info.get('norm_J_tau', 'N/A'):.2e}")
-            print(f"  ||J_v||: {theta_info.get('norm_J_v', 'N/A'):.2e}")
+                # Power diagnostics
+                print(f"\n[Power Diagnostics]")
+                print(f"  ||x_pilot input||²: {theta_info.get('x_pilot_input_power', 'N/A'):.6f}")
+                print(f"  ||x_for_pred||²: {theta_info.get('x_power', 'N/A'):.6f}")
+                print(f"  ||x_est||²:      {theta_info.get('x_est_power', 'N/A'):.6f}")
+                print(f"  ||y_pred_full||²: {theta_info.get('y_pred_full_power', 'N/A'):.6f}")
+                print(f"  ||y_pred (pilot)||²: {theta_info.get('y_pred_power', 'N/A'):.6f}")
 
-            print(f"\n  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A'):.4f}")
+                # GN solve diagnostics (NEW)
+                print(f"\n[Gauss-Newton Solve]")
+                print(f"  solve_success: {'YES ✓' if theta_info.get('solve_success', 0) > 0.5 else 'NO ✗'}")
+                print(
+                    f"  G_diag: [{theta_info.get('G_diag_0', 0):.4f}, {theta_info.get('G_diag_1', 0):.4f}, {theta_info.get('G_diag_2', 0):.4f}] (should be ~1)")
+                print(
+                    f"  b_vec:  [{theta_info.get('b_vec_0', 0):.4f}, {theta_info.get('b_vec_1', 0):.4f}, {theta_info.get('b_vec_2', 0):.4f}]")
+
+                # Expert recommendation status
+                print(f"\n[Expert Strategy: τ-only Update]")
+                print(f"  v_info_weak: {'YES' if theta_info.get('v_info_weak', 0) > 0.5 else 'NO'}")
+                print(f"  Reason: 64 pilots (6.4ns) → Δφ_v ≈ 0.001 rad (unidentifiable)")
+                print(f"  Strategy: Fast loop (τ per-frame) + Slow loop (v cross-frame, future)")
+
+                # Gradient info
+                print(f"\n[Gradient Info]")
+                print(f"  ||r||: {theta_info.get('r_norm', 'N/A'):.4f}")
+                print(f"  b1 (J_tau^H @ r, norm): {theta_info.get('b1', 'N/A'):.6f}")
+                print(f"  b2 (J_v^H @ r, norm): {theta_info.get('b2', 'N/A'):.6f}")
+                print(f"  b1_raw: {theta_info.get('b1_raw', 'N/A'):.2e}")
+                print(f"  ||J_tau||: {theta_info.get('norm_J_tau', 'N/A'):.2e}")
+                print(f"  ||J_v||: {theta_info.get('norm_J_v', 'N/A'):.2e}")
+                print(f"\n  bussgang_alpha: {theta_info.get('bussgang_alpha', 'N/A'):.4f}")
 
     # Check phi_est
     if 'phi_est' in outputs:
