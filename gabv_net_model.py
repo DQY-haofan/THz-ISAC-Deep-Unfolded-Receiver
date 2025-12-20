@@ -570,8 +570,8 @@ class TauEstimatorInternal(nn.Module):
             # Track changes
             total_tau_change += delta_tau.abs().mean().item()
 
-            # Compute improvement (frozen α)
-            y_pred_new = phys_enc.forward_operator(x_pilot_norm, theta_new)[:, :Np] * phase
+            # Compute improvement (frozen α) - use x_full for forward_operator
+            y_pred_new = phys_enc.forward_operator(x_full, theta_new)[:, :Np] * phase
             r_new = y_tilde - y_pred_new  # Same y_tilde (frozen α)
 
             resid_old = torch.mean(torch.abs(r)**2)
