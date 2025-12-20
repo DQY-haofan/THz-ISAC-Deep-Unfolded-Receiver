@@ -472,17 +472,17 @@ class TauEstimatorInternal(nn.Module):
     - Clearer physical interpretation
     """
 
-    def __init__(self, cfg, n_iterations: int = 3):
+    def __init__(self, cfg, n_iterations: int = 5):  # Increased from 3 to 5
         super().__init__()
         self.cfg = cfg
         self.n_iterations = n_iterations
         self.fs = cfg.fs
 
-        # Fixed damping (not learned)
-        self.damping = 0.5
+        # Fixed damping (not learned) - increased for faster convergence
+        self.damping = 0.7  # Increased from 0.5
 
-        # Max update per iteration
-        self.max_delta_tau = 0.3 / cfg.fs  # 0.3 samples
+        # Max update per iteration - increased for larger errors
+        self.max_delta_tau = 0.5 / cfg.fs  # Increased from 0.3 to 0.5 samples
 
         # Bounds
         tau_max = 5.0 / cfg.fs
@@ -554,12 +554,13 @@ class TauEstimatorInternal(nn.Module):
             y_tilde = y_q_pilot / (alpha + 1e-6)
             r = y_tilde - y_pred
 
-            # 1D GN: Δτ = Re(J^H r) / ||J||²
+            # 1D Gauss-Newton: Δτ = Re(J^H r) / ||J||²
+            # GN naturally gives descent direction, no negative sign needed!
             J_norm_sq = torch.sum(torch.abs(J_tau)**2, dim=1, keepdim=True).clamp(min=1e-10)
             grad = torch.real(torch.sum(torch.conj(J_tau) * r, dim=1, keepdim=True))
 
-            # GN step with damping
-            delta_tau = self.damping * grad / J_norm_sq  # Negative for descent
+            # GN step with damping (NO negative sign - GN is not gradient descent)
+            delta_tau = self.damping * grad / J_norm_sq
             delta_tau = torch.clamp(delta_tau, -self.max_delta_tau, self.max_delta_tau)
 
             # Update τ only
