@@ -516,9 +516,9 @@ class ScoreBasedThetaUpdater(nn.Module):
         self.register_buffer('theta_max', torch.tensor([tau_bound, 1e4, 100.0]))
 
         # Max delta per iteration (for stability)
-        # Large for testing - will clamp if needed
+        # Increased for more aggressive theta updates
         self.register_buffer('max_delta', torch.tensor([
-            0.3 / cfg.fs,   # 0.3 sample period max (LARGE for testing)
+            1.0 / cfg.fs,   # 1.0 sample period max (AGGRESSIVE for testing)
             200.0,          # 200 m/s per iteration
             20.0,           # 20 m/s² per iteration
         ]))
@@ -768,7 +768,8 @@ class ScoreBasedThetaUpdater(nn.Module):
 
         # === Apply fixed step size (bypass step_net for now) ===
         # Expert recommendation: use fixed mu until direction is verified
-        mu = 0.5  # Can tune 0.1 ~ 1.0
+        # Increase mu for tau to get more aggressive updates
+        mu = 1.0  # Increased from 0.5 - more aggressive
         delta_theta = mu * delta_gn
 
         # Clamp to physical limits
