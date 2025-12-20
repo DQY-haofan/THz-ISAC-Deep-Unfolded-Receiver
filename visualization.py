@@ -147,6 +147,7 @@ def load_model(ckpt_path: str, device: str) -> Tuple[GABVNet, GABVConfig]:
 
 def create_sim_config(gabv_cfg: GABVConfig, snr_db: float = 15.0) -> SimConfig:
     """Create simulation config matching GABVConfig."""
+    # Only use parameters that SimConfig accepts
     return SimConfig(
         N=gabv_cfg.N,
         fs=gabv_cfg.fs,
@@ -154,7 +155,7 @@ def create_sim_config(gabv_cfg: GABVConfig, snr_db: float = 15.0) -> SimConfig:
         snr_db=snr_db,
         enable_pa=True,
         enable_pn=True,
-        enable_jitter=True,
+        # Note: enable_jitter may not be supported in all versions
     )
 
 
@@ -839,12 +840,31 @@ def main():
         print(f"\nGenerated placeholder figures in {args.out_dir}")
         return
 
-    # Load model
-    if args.ckpt and os.path.exists(args.ckpt):
-        print(f"Loading model from {args.ckpt}")
-        model, gabv_cfg = load_model(args.ckpt, eval_cfg.device)
+    # Load model - try multiple ways to find checkpoint
+    ckpt_path = args.ckpt
+
+    # If path contains wildcard or doesn't exist, try to find it
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        import glob
+        # Try common patterns
+        patterns = [
+            'results/checkpoints/Stage2_*/final.pth',
+            'results/checkpoints/Stage2_FineTrak_*/final.pth',
+            '../results/checkpoints/Stage2_*/final.pth',
+        ]
+        for pattern in patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                ckpt_path = sorted(matches)[-1]  # Use most recent
+                print(f"Found checkpoint: {ckpt_path}")
+                break
+
+    if ckpt_path and os.path.exists(ckpt_path):
+        print(f"Loading model from {ckpt_path}")
+        model, gabv_cfg = load_model(ckpt_path, eval_cfg.device)
     else:
-        print("No checkpoint provided. Creating default model.")
+        print("WARNING: No checkpoint found. Creating default model.")
+        print("  Searched patterns: results/checkpoints/Stage2_*/final.pth")
         gabv_cfg = GABVConfig()
         model = create_gabv_model(gabv_cfg)
         model.to(eval_cfg.device)
