@@ -766,6 +766,12 @@ class ScoreBasedThetaUpdater(nn.Module):
             delta_normalized[:, 2] * scale_a,
         ], dim=1)  # [B, 3] in physical units
 
+        # TEMPORARY: Only update tau, disable v and a
+        # The τ-v coupling is causing wrong directions for v
+        # Once tau works, we can re-enable v, a
+        delta_gn[:, 1] = 0.0  # Disable v update
+        delta_gn[:, 2] = 0.0  # Disable a update
+
         # === Apply fixed step size (bypass step_net for now) ===
         # Expert recommendation: use fixed mu until direction is verified
         # Increase mu for tau to get more aggressive updates
