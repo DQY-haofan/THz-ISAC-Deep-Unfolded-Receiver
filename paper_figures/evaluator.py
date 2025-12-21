@@ -128,7 +128,9 @@ def create_sim_config(gabv_cfg, snr_db: float, pn_linewidth: float = None):
 def simulate_batch(sim_cfg, batch_size: int, seed: int = None) -> Dict:
     """Generate simulation data with optional seed."""
     from thz_isac_world import simulate_batch as sim_batch
-    return sim_batch(sim_cfg, batch_size, seed=seed)
+    # Ensure seed is valid before passing to sim_batch
+    valid_seed = make_valid_seed(seed) if seed is not None else None
+    return sim_batch(sim_cfg, batch_size, seed=valid_seed)
 
 
 # ============================================================================
@@ -236,6 +238,12 @@ def compute_metrics(x_hat, x_true, theta_hat, theta_true, theta_init,
 # P0-1: Fair Multi-Method Evaluation
 # ============================================================================
 
+def make_valid_seed(base_seed: int) -> int:
+    """Ensure seed is valid for numpy (0 to 2^32-1)."""
+    # Use modulo to ensure positive and within range
+    return abs(base_seed) % (2**32 - 1)
+
+
 def evaluate_methods_fair(
     model,
     sim_cfg,
@@ -274,13 +282,14 @@ def evaluate_methods_fair(
     Ts = 1.0 / sim_cfg.fs
     tau_noise = init_error_override if init_error_override is not None else theta_noise[0]
 
-    # Set seed for reproducibility
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+    # Set seed for reproducibility (ensure valid range)
+    valid_seed = make_valid_seed(seed) if seed is not None else None
+    if valid_seed is not None:
+        torch.manual_seed(valid_seed)
+        np.random.seed(valid_seed)
 
     # 1) Generate SHARED simulation data (same for all methods)
-    sim_data = simulate_batch(sim_cfg, batch_size, seed=seed)
+    sim_data = simulate_batch(sim_cfg, batch_size, seed=valid_seed)
 
     theta_true = to_tensor(sim_data['theta_true'], device)
     y_q = to_tensor(sim_data['y_q'], device)
