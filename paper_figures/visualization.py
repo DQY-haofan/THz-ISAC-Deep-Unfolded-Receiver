@@ -39,10 +39,10 @@ plt.rcParams.update({
 METHOD_NAMES = {
     "naive_slice": "Naive Slice",
     "matched_filter": "Matched Filter",
-    "adjoint_lmmse": "Adjoint+LMMSE", 
+    "adjoint_lmmse": "Adjoint+LMMSE",  # 补强(B)
     "adjoint_slice": "Adjoint+Slice",
     "proposed_no_update": "w/o τ update",
-    "proposed_no_learned_alpha": "w/o learned α",
+    "proposed_tau_slice": "Proposed (τ)+Slice",  # 消融：验证VAMP价值
     "proposed": "Proposed (GA-BV-Net)",
     "oracle": "Oracle θ",
     "random_init": "Random Init",
@@ -51,10 +51,10 @@ METHOD_NAMES = {
 METHOD_COLORS = {
     "naive_slice": "C7",       # 灰
     "matched_filter": "C3",    # 红
-    "adjoint_lmmse": "C1",     # 橙
+    "adjoint_lmmse": "C6",     # 粉（补强B）
     "adjoint_slice": "C4",     # 紫
     "proposed_no_update": "C5",# 棕
-    "proposed_no_learned_alpha": "C8",  # 浅绿
+    "proposed_tau_slice": "C8",# 浅绿
     "proposed": "C0",          # 蓝
     "oracle": "C2",            # 绿
     "random_init": "C9",       # 青
@@ -66,7 +66,7 @@ METHOD_MARKERS = {
     "adjoint_lmmse": "+",
     "adjoint_slice": "d",
     "proposed_no_update": "s",
-    "proposed_no_learned_alpha": "p",
+    "proposed_tau_slice": "p",
     "proposed": "o",
     "oracle": "^",
     "random_init": "*",
@@ -78,7 +78,7 @@ METHOD_LINESTYLES = {
     "adjoint_lmmse": "-.",
     "adjoint_slice": ":",
     "proposed_no_update": "-",
-    "proposed_no_learned_alpha": "-.",
+    "proposed_tau_slice": "-.",
     "proposed": "-",
     "oracle": "-",
     "random_init": ":",
@@ -282,26 +282,38 @@ def fig04_cliff_all_methods(df: pd.DataFrame, out_dir: str):
     """
     Fig 4: Cliff plot with ALL methods（核心图）
 
-    专家方案1 + 专家1建议的 Zone Shading：
-    - Green Zone: Basin of Attraction（梯度正确流动）
-    - Red Zone: Ambiguity Zone（梯度崩溃）
+    专家方案1 + 补强(A)：
+    - 盆地边界从 success_rate 数据推导，不是硬编码
+    - 加入 adjoint_lmmse（更强的线性基线）
     """
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
     agg = aggregate(df, ['init_error', 'method'], ['ber', 'rmse_tau_final', 'success_rate'])
 
-    methods_to_plot = ["naive_slice", "adjoint_slice", "matched_filter",
+    # 补强(A)：从数据计算盆地边界
+    # 定义：proposed 的 success_rate >= 0.5 的最大 init_error
+    proposed_data = agg[agg['method'] == 'proposed']
+    if len(proposed_data) > 0 and 'success_rate_mean' in proposed_data.columns:
+        success_mask = proposed_data['success_rate_mean'] >= 0.5
+        if success_mask.any():
+            basin_boundary = proposed_data[success_mask]['init_error'].max()
+        else:
+            basin_boundary = 0.3  # fallback
+    else:
+        basin_boundary = 0.3  # fallback
+
+    methods_to_plot = ["naive_slice", "adjoint_lmmse", "adjoint_slice", "matched_filter",
                        "proposed_no_update", "proposed", "oracle"]
 
     # ===== Panel A: BER vs init_error =====
 
-    # 1. 先画 Zone Shading（专家1建议）
-    ax1.axvspan(0, 0.3, color='green', alpha=0.08, label='Basin of Attraction')
-    ax1.axvspan(0.3, 0.5, color='orange', alpha=0.08, label='Transition Zone')
-    ax1.axvspan(0.5, 2.0, color='red', alpha=0.08, label='Ambiguity Zone')
+    # 数据驱动的 Zone Shading
+    ax1.axvspan(0, basin_boundary, color='green', alpha=0.08, label='Basin of Attraction')
+    ax1.axvspan(basin_boundary, basin_boundary + 0.2, color='orange', alpha=0.08, label='Transition Zone')
+    ax1.axvspan(basin_boundary + 0.2, 2.0, color='red', alpha=0.08, label='Ambiguity Zone')
 
-    # 2. 画方法曲线
+    # 画方法曲线
     for method in methods_to_plot:
         data = agg[agg['method'] == method]
         if len(data) == 0:
@@ -317,21 +329,15 @@ def fig04_cliff_all_methods(df: pd.DataFrame, out_dir: str):
                  label=METHOD_NAMES.get(method, method),
                  linewidth=2, markersize=8)
 
-    # 3. 添加标注（专家1建议）
+    # 数据驱动的 Basin 边界垂线
+    ax1.axvline(x=basin_boundary, color='green', linestyle='--', linewidth=2, alpha=0.7)
+    ax1.text(basin_boundary + 0.02, 0.45, f'Basin={basin_boundary:.2f}',
+             fontsize=10, color='green', alpha=0.8)
+
     ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-    ax1.text(1.2, 0.48, 'Random Guess', fontsize=10, color='gray', alpha=0.7)
+    ax1.text(1.3, 0.48, 'Random Guess', fontsize=9, color='gray', alpha=0.7)
 
-    # 标注 Basin 边界
-    ax1.annotate('Physical\nPull-in Range', xy=(0.3, 0.15), xytext=(0.6, 0.25),
-                 fontsize=10, color='green',
-                 arrowprops=dict(arrowstyle='->', color='green', alpha=0.7))
-
-    ax1.text(0.1, 0.45, "Gradient\nCorrect", color='green', fontweight='bold',
-             alpha=0.5, fontsize=9, ha='center')
-    ax1.text(0.8, 0.45, "Gradient\nCollapse", color='red', fontweight='bold',
-             alpha=0.5, fontsize=9, ha='center')
-
-    ax1.set_xlabel('Initial τ Error (samples)', fontsize=14)
+    ax1.set_xlabel('Initial $\\tau$ Error (samples)', fontsize=14)
     ax1.set_ylabel('BER', fontsize=14)
     ax1.set_title('(a) Communication Performance vs Sync Error', fontsize=14)
     ax1.legend(loc='upper left', fontsize=8, ncol=2)
@@ -341,12 +347,11 @@ def fig04_cliff_all_methods(df: pd.DataFrame, out_dir: str):
 
     # ===== Panel B: RMSE vs init_error =====
 
-    # 1. Zone Shading
-    ax2.axvspan(0, 0.3, color='green', alpha=0.08)
-    ax2.axvspan(0.3, 0.5, color='orange', alpha=0.08)
-    ax2.axvspan(0.5, 2.0, color='red', alpha=0.08)
+    # 数据驱动的 Zone Shading
+    ax2.axvspan(0, basin_boundary, color='green', alpha=0.08)
+    ax2.axvspan(basin_boundary, basin_boundary + 0.2, color='orange', alpha=0.08)
+    ax2.axvspan(basin_boundary + 0.2, 2.0, color='red', alpha=0.08)
 
-    # 2. 画方法曲线
     for method in methods_to_plot:
         if method == "oracle":
             continue
@@ -364,14 +369,14 @@ def fig04_cliff_all_methods(df: pd.DataFrame, out_dir: str):
                  label=METHOD_NAMES.get(method, method),
                  linewidth=2, markersize=8)
 
-    # 3. y=x 参考线和目标区域
+    # y=x 参考线和目标区域
     max_x = max(agg['init_error'].max(), 1.5)
     ax2.plot([0, max_x], [0, max_x], 'k--', alpha=0.5, label='No Improvement (y=x)')
     ax2.axhspan(0, 0.1, alpha=0.15, color='green')
-    ax2.text(0.05, 0.05, 'Target\n(<0.1)', fontsize=9, color='green', alpha=0.8)
+    ax2.axvline(x=basin_boundary, color='green', linestyle='--', linewidth=2, alpha=0.7)
 
-    ax2.set_xlabel('Initial τ Error (samples)', fontsize=14)
-    ax2.set_ylabel('Final τ RMSE (samples)', fontsize=14)
+    ax2.set_xlabel('Initial $\\tau$ Error (samples)', fontsize=14)
+    ax2.set_ylabel('Final $\\tau$ RMSE (samples)', fontsize=14)
     ax2.set_title('(b) Delay Estimation Performance', fontsize=14)
     ax2.legend(loc='upper left', fontsize=8)
     ax2.grid(True, alpha=0.3)
@@ -733,18 +738,20 @@ def fig09_latency(df: pd.DataFrame, out_dir: str):
 
 def fig10_ablation(df: pd.DataFrame, out_dir: str):
     """
-    Fig 10: 消融实验（专家方案2）
+    Fig 10: 消融实验（专家方案2，修正版）
 
     验证各组件的贡献：
-    - oracle > proposed ≈ proposed_no_learned_alpha > proposed_no_update > random_init
+    - oracle > proposed > proposed_tau_slice > proposed_no_update > random_init
+
+    P0-1 修复：删除了有 bug 的 proposed_no_learned_alpha
     """
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     agg = aggregate(df, ['snr_db', 'method'], ['ber', 'rmse_tau_final'])
 
-    # 消融实验方法顺序（从弱到强）
-    methods_order = ["random_init", "proposed_no_update", "proposed_no_learned_alpha", "proposed", "oracle"]
+    # 消融实验方法顺序（从弱到强）- P0-1 修复后
+    methods_order = ["random_init", "proposed_no_update", "proposed_tau_slice", "proposed", "oracle"]
 
     # Panel A: BER vs SNR
     for method in methods_order:
@@ -853,9 +860,11 @@ def generate_all_figures(data_dir: str, out_dir: str = None):
         fig05_snr_multi_init_error(data['snr_multi_init_error'], out_dir)
         print("  ✓ Fig 5: SNR @ multi init_error【方案3】")
 
-    if 'jacobian' in data:
-        fig06_jacobian_condition(data['jacobian'], out_dir)
-        print("  ✓ Fig 6: Jacobian Condition")
+    # P0-3: Jacobian 图暂时移除（当前实现是手写数值，不是真实计算）
+    # 如需恢复，需实现数值差分 Jacobian
+    # if 'jacobian' in data:
+    #     fig06_jacobian_condition(data['jacobian'], out_dir)
+    #     print("  ✓ Fig 6: Jacobian Condition")
 
     if 'pn_sweep' in data or 'pilot_sweep' in data:
         fig08_robustness(data.get('pn_sweep'), data.get('pilot_sweep'), out_dir)

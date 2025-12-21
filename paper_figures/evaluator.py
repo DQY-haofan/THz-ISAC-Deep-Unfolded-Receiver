@@ -31,6 +31,28 @@ from baselines import (
 
 
 # ============================================================================
+# P0-4 修复：异常处理辅助函数
+# ============================================================================
+
+def make_failed_record(**kwargs) -> dict:
+    """
+    创建失败记录，用 NaN 替代固定值
+
+    P0-4 修复：避免用固定值污染统计
+    """
+    record = {
+        'ber': float('nan'),
+        'rmse_tau_init': float('nan'),
+        'rmse_tau_final': float('nan'),
+        'improvement': float('nan'),
+        'success_rate': float('nan'),
+        'failed': True,
+    }
+    record.update(kwargs)
+    return record
+
+
+# ============================================================================
 # 配置
 # ============================================================================
 
@@ -304,16 +326,9 @@ def run_snr_sweep(model, gabv_cfg, eval_cfg: EvalConfig, methods: List[str] = No
                     })
                 except Exception as e:
                     print(f"Warning: {method} @ SNR={snr_db} failed: {e}")
-                    records.append({
-                        'snr_db': snr_db,
-                        'method': method,
-                        'mc_id': mc_id,
-                        'ber': 0.5,
-                        'rmse_tau_init': 0.3,
-                        'rmse_tau_final': 0.3,
-                        'improvement': 1.0,
-                        'success_rate': 0.0,
-                    })
+                    records.append(make_failed_record(
+                        snr_db=snr_db, method=method, mc_id=mc_id, error=str(e)
+                    ))
 
                 pbar.update(1)
 
@@ -362,16 +377,9 @@ def run_cliff_sweep(model, gabv_cfg, eval_cfg: EvalConfig, snr_db: float = 15.0,
                     })
                 except Exception as e:
                     print(f"Warning: {method} @ init_error={init_error} failed: {e}")
-                    records.append({
-                        'init_error': init_error,
-                        'method': method,
-                        'mc_id': mc_id,
-                        'ber': 0.5,
-                        'rmse_tau_init': init_error,
-                        'rmse_tau_final': init_error,
-                        'improvement': 1.0,
-                        'success_rate': 0.0,
-                    })
+                    records.append(make_failed_record(
+                        init_error=init_error, method=method, mc_id=mc_id, error=str(e)
+                    ))
 
                 pbar.update(1)
 
@@ -428,16 +436,10 @@ def run_snr_sweep_multi_init_error(model, gabv_cfg, eval_cfg: EvalConfig,
                         })
                     except Exception as e:
                         print(f"Warning: {method} @ SNR={snr_db}, init={init_error} failed: {e}")
-                        records.append({
-                            'init_error': init_error,
-                            'snr_db': snr_db,
-                            'method': method,
-                            'mc_id': mc_id,
-                            'ber': 0.5,
-                            'rmse_tau_init': init_error,
-                            'rmse_tau_final': init_error,
-                            'success_rate': 0.0,
-                        })
+                        records.append(make_failed_record(
+                            init_error=init_error, snr_db=snr_db, method=method,
+                            mc_id=mc_id, error=str(e)
+                        ))
 
                     pbar.update(1)
 
@@ -633,16 +635,9 @@ def run_ablation_sweep(model, gabv_cfg, eval_cfg: EvalConfig, snr_db: float = 15
                     })
                 except Exception as e:
                     print(f"Warning: {method} @ SNR={snr_db_val} failed: {e}")
-                    records.append({
-                        'snr_db': snr_db_val,
-                        'method': method,
-                        'mc_id': mc_id,
-                        'ber': 0.5,
-                        'rmse_tau_init': 0.3,
-                        'rmse_tau_final': 0.3,
-                        'improvement': 1.0,
-                        'success_rate': 0.0,
-                    })
+                    records.append(make_failed_record(
+                        snr_db=snr_db_val, method=method, mc_id=mc_id, error=str(e)
+                    ))
 
                 pbar.update(1)
 
@@ -695,21 +690,14 @@ def run_heatmap_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
                         })
                     except Exception as e:
                         print(f"Warning: {method} @ SNR={snr_db}, init={init_error} failed: {e}")
-                        records.append({
-                            'snr_db': snr_db,
-                            'init_error': init_error,
-                            'method': method,
-                            'mc_id': mc_id,
-                            'ber': 0.5,
-                            'rmse_tau_final': init_error,
-                            'success_rate': 0.0,
-                        })
+                        records.append(make_failed_record(
+                            snr_db=snr_db, init_error=init_error, method=method,
+                            mc_id=mc_id, error=str(e)
+                        ))
 
                     pbar.update(1)
 
     pbar.close()
-    return pd.DataFrame(records)
-
     return pd.DataFrame(records)
 
 

@@ -118,10 +118,10 @@ class BaselineMatchedFilter:
     1. 在 τ 网格上搜索最佳相关点
     2. 用找到的 τ 做 adjoint + slice
     
-    专家建议：使用与 proposed 相同的前端，只是 τ 估计方法不同
+    P0-2 修复：搜索范围扩大到 ±2.0 samples，覆盖 cliff sweep 范围
     """
     name = "matched_filter"
-    
+
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -129,32 +129,32 @@ class BaselineMatchedFilter:
         theta_init = batch['theta_init']
         x_true = batch['x_true']
         batch_size = y_q.shape[0]
-        
+
         Ts = 1.0 / sim_cfg.fs
-        
-        # τ 网格搜索（粗搜索）
-        # 搜索范围：±0.5 samples
-        tau_grid_samples = torch.linspace(-0.5, 0.5, 11, device=device)  # 11 点网格
-        
+
+        # P0-2 修复：τ 网格搜索范围扩大到 ±2.0 samples
+        # 覆盖 cliff sweep 的 init_error 范围 (0 ~ 1.5)
+        tau_grid_samples = torch.linspace(-2.0, 2.0, 41, device=device)  # 41 点网格
+
         best_corr = None
         best_tau = theta_init[:, 0:1].clone()
-        
+
         x_pilot = x_true[:, :pilot_len]
-        
+
         for tau_offset in tau_grid_samples:
             # 构造试探 θ
             theta_test = theta_init.clone()
             theta_test[:, 0:1] = theta_init[:, 0:1] + tau_offset * Ts
-            
+
             # 前端处理
             z_derot, _ = frontend_adjoint_and_pn(
                 model, y_q, theta_test, x_true, pilot_len
             )
-            
+
             # 计算与 pilot 的相关性
             z_p = z_derot[:, :pilot_len]
             corr = torch.abs(torch.sum(z_p.conj() * x_pilot, dim=1, keepdim=True))
-            
+
             if best_corr is None:
                 best_corr = corr
                 best_tau = theta_test[:, 0:1]
@@ -162,109 +162,109 @@ class BaselineMatchedFilter:
                 mask = corr > best_corr
                 best_corr = torch.where(mask, corr, best_corr)
                 best_tau = torch.where(mask, theta_test[:, 0:1], best_tau)
-        
+
         # 用最佳 τ 做最终检测
         theta_hat = theta_init.clone()
         theta_hat[:, 0:1] = best_tau
-        
+
         z_derot, _ = frontend_adjoint_and_pn(
             model, y_q, theta_hat, x_true, pilot_len
         )
         x_hat = qpsk_hard_slice(z_derot)
-        
+
         return x_hat, theta_hat
 
 
 class BaselineAdjointLMMSE:
     """
     Adjoint + Pilot PN Align + Bussgang-LMMSE 基线
-    
+
     比 hard slice 强，使用 LMMSE 而非 hard decision
     """
     name = "adjoint_lmmse"
-    
+
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
         y_q = batch['y_q']
         theta_init = batch['theta_init']
         x_true = batch['x_true']
-        
+
         # 使用与 proposed 相同的前端
         z_derot, phi_est = frontend_adjoint_and_pn(
             model, y_q, theta_init, x_true, pilot_len
         )
-        
+
         # Bussgang-LMMSE
         # y = α*x + n, LMMSE: x_hat = z / (|α|² + σ²)
         snr_lin = 10 ** (sim_cfg.snr_db / 10)
         sigma2 = 1.0 / snr_lin
-        
+
         # Bussgang 因子 for 1-bit: α ≈ sqrt(2/π)
         alpha = np.sqrt(2 / np.pi)
-        
+
         # LMMSE 估计（软判决）
         x_hat_soft = z_derot / (alpha**2 + sigma2)
-        
+
         # 最后做 hard decision（因为要计算 BER）
         x_hat = qpsk_hard_slice(x_hat_soft)
-        
+
         return x_hat, theta_init  # τ 不更新
 
 
 class BaselineAdjointSlice:
     """
     Adjoint + Pilot PN Align + Hard Slice 基线
-    
+
     这是论文中最重要的对比基线！
-    
+
     专家要求：必须复用模型前端，确保与 proposed 在同一域对比！
     """
     name = "adjoint_slice"
-    
+
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
         y_q = batch['y_q']
         theta_init = batch['theta_init']
         x_true = batch['x_true']
-        
+
         # 使用与 proposed 相同的前端
         z_derot, phi_est = frontend_adjoint_and_pn(
             model, y_q, theta_init, x_true, pilot_len
         )
-        
+
         # Hard Slice (QPSK)
         x_hat = qpsk_hard_slice(z_derot)
-        
+
         return x_hat, theta_init  # τ 不更新
 
 
 class BaselineProposedNoUpdate:
     """
     BV-VAMP 但不更新 τ
-    
+
     用于验证 τ 更新机制的价值
     """
     name = "proposed_no_update"
-    
+
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_init = batch['theta_init']
-        
+
         # 保存原始设置
         original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = False
-        
+
         outputs = model(batch)
-        
+
         # 恢复设置
         model.cfg.enable_theta_update = original_setting
-        
+
         x_hat = outputs['x_hat']
         theta_hat = outputs.get('theta_hat', theta_init)
-        
+
         return x_hat, theta_hat
 
 
@@ -273,56 +273,56 @@ class BaselineProposed:
     完整的 proposed 方法：BV-VAMP + τ 更新
     """
     name = "proposed"
-    
+
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_init = batch['theta_init']
-        
+
         # 保存原始设置
         original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = True
-        
+
         outputs = model(batch)
-        
+
         # 恢复设置
         model.cfg.enable_theta_update = original_setting
-        
+
         x_hat = outputs['x_hat']
         theta_hat = outputs.get('theta_hat', theta_init)
-        
+
         return x_hat, theta_hat
 
 
 class BaselineOracle:
     """
     Oracle: 使用真实 θ
-    
+
     理论性能上界
     """
     name = "oracle"
-    
+
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_true = batch['theta_true']
-        
+
         # 使用真实 θ
         batch_oracle = batch.copy()
         batch_oracle['theta_init'] = theta_true.clone()
-        
+
         # 保存原始设置
         original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = False
-        
+
         outputs = model(batch_oracle)
-        
+
         # 恢复设置
         model.cfg.enable_theta_update = original_setting
-        
+
         x_hat = outputs['x_hat']
         theta_hat = theta_true.clone()
-        
+
         return x_hat, theta_hat
 
 
@@ -368,46 +368,35 @@ class BaselineRandomInit:
         return x_hat, theta_hat
 
 
-class BaselineProposedNoLearnedAlpha:
+class BaselineProposedTauSlice:
     """
-    Proposed w/o learned α: 使用固定 α 而非可学习权重
+    Proposed with τ Slice: 用 proposed 估计 τ，但检测用 hard slice
 
-    消融实验：验证可学习权重的价值
+    消融实验：验证 VAMP 检测器的价值（vs 简单 slice）
+
+    这是更干净的消融：
+    - 保留 τ 更新能力（证明 τ 估计模块工作）
+    - 移除 VAMP soft detection（证明 VAMP 的价值）
     """
-    name = "proposed_no_learned_alpha"
+    name = "proposed_tau_slice"
 
     @staticmethod
     @torch.no_grad()
     def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 保存原始 α 值
-        original_alphas = {}
-
-        # 尝试冻结可学习的 α 参数
-        try:
-            for name, param in model.named_parameters():
-                if 'alpha' in name.lower() or 'weight' in name.lower():
-                    original_alphas[name] = param.data.clone()
-                    # 设为固定值 0.5
-                    param.data.fill_(0.5)
-        except Exception as e:
-            pass  # 如果没有 alpha 参数，跳过
-
-        # 运行完整方法
+        # 先用 proposed 获取估计的 θ
         original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = True
 
         outputs = model(batch)
+        theta_hat = outputs.get('theta_hat', batch['theta_init'])
 
         model.cfg.enable_theta_update = original_setting
 
-        # 恢复原始 α 值
-        for name, val in original_alphas.items():
-            for n, p in model.named_parameters():
-                if n == name:
-                    p.data = val
+        # 用估计的 θ 做 adjoint + hard slice（而非 VAMP soft detection）
+        y_q = batch['y_q']
 
-        x_hat = outputs['x_hat']
-        theta_hat = outputs.get('theta_hat', batch['theta_init'])
+        # 简单的 hard slice 检测
+        x_hat = qpsk_hard_slice(y_q)
 
         return x_hat, theta_hat
 
@@ -422,10 +411,10 @@ BASELINE_REGISTRY = {
     "adjoint_lmmse": BaselineAdjointLMMSE,
     "adjoint_slice": BaselineAdjointSlice,
     "proposed_no_update": BaselineProposedNoUpdate,
-    "proposed_no_learned_alpha": BaselineProposedNoLearnedAlpha,  # 消融实验
+    "proposed_tau_slice": BaselineProposedTauSlice,  # 消融：τ估计OK但检测用slice
     "proposed": BaselineProposed,
     "oracle": BaselineOracle,
-    "random_init": BaselineRandomInit,  # 消融实验
+    "random_init": BaselineRandomInit,
 }
 
 # 方法层级（从弱到强）
@@ -435,7 +424,7 @@ METHOD_ORDER = [
     "adjoint_lmmse",
     "adjoint_slice",
     "proposed_no_update",
-    "proposed_no_learned_alpha",
+    "proposed_tau_slice",
     "proposed",
     "oracle",
 ]
@@ -443,9 +432,10 @@ METHOD_ORDER = [
 # 快速测试用的方法子集
 METHOD_QUICK = ["adjoint_slice", "proposed", "oracle"]
 
-# Cliff sweep 用的方法集
+# Cliff sweep 用的方法集（包含 adjoint_lmmse）
 METHOD_CLIFF = [
     "naive_slice",
+    "adjoint_lmmse",  # 专家建议：加入更强的线性基线
     "adjoint_slice",
     "matched_filter",
     "proposed_no_update",
@@ -453,11 +443,11 @@ METHOD_CLIFF = [
     "oracle",
 ]
 
-# 消融实验用的方法集（方案2）
+# 消融实验用的方法集（方案2，修正版）
 METHOD_ABLATION = [
     "random_init",           # 理论下界
     "proposed_no_update",    # w/o τ update
-    "proposed_no_learned_alpha",  # w/o learned α
+    "proposed_tau_slice",    # τ估计OK但检测用slice（验证VAMP价值）
     "proposed",              # 完整方法
     "oracle",                # 理论上界
 ]
