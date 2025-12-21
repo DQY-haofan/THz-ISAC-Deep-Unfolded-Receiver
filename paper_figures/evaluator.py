@@ -33,7 +33,7 @@ from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 
 # Local imports
-from baselines_v2 import (
+from baselines import (
     run_baseline,
     get_baseline,
     METHOD_ORDER,
@@ -136,7 +136,7 @@ def load_model(ckpt_path: str, device: str):
 def create_sim_config(gabv_cfg, snr_db: float, pn_linewidth: float = None,
                       adc_bits: int = 1):
     """Create simulation configuration."""
-    from thz_isac_world_v2 import SimConfig
+    from thz_isac_world import SimConfig
 
     sim_cfg = SimConfig(
         N=gabv_cfg.N if hasattr(gabv_cfg, 'N') else 1024,
@@ -203,7 +203,7 @@ def generate_trial(sim_cfg, batch_size: int, seed: int, device: str,
     Returns:
         trial: Dictionary with y_q, x_true, theta_true, theta_init, meta, seed
     """
-    from thz_isac_world_v2 import simulate_batch
+    from thz_isac_world import simulate_batch
 
     Ts = 1.0 / sim_cfg.fs
 
@@ -879,7 +879,7 @@ def compute_numeric_fim_tau(sim_cfg, batch_size: int = 256, n_mc: int = 50,
     Returns:
         Dictionary with FIM, CRLB, and diagnostics
     """
-    from thz_isac_world_v2 import simulate_batch, wideband_delay_operator
+    from thz_isac_world import simulate_batch, wideband_delay_operator
 
     fs = sim_cfg.fs
     Ts = 1.0 / fs

@@ -91,7 +91,7 @@ except ImportError:
     except ImportError:
         from visualization import generate_all_figures
 
-from baselines_v2 import (
+from baselines import (
     METHOD_ORDER, METHOD_CLIFF, METHOD_ABLATION,
     METHOD_SNR_SWEEP, get_method_info
 )
