@@ -1,21 +1,23 @@
 """
-baselines.py - Baseline algorithms (Expert v2.0 - Top Journal Ready)
+baselines_v2.py - Baseline algorithms (Expert v3.0 - Top Journal Ready)
 
 Expert Requirements Implemented:
-- P0-2: Dual Oracle naming (oracle_sync = Oracle-A, oracle_ideal = Oracle-B)
-- P0-3: Paper method sets (METHOD_PAPER_CORE, METHOD_PAPER_FULL, METHOD_DEBUG)
-- Fair comparison: All baselines share same frontend
+- P0-1: Trial-first evaluation support (same trial for all methods)
+- P0-2: Fixed matched_filter (41 grid points, covers max init_error)
+- P0-3: Added proposed_tau_slice (ablation: τ update + hard slice)
+- P0-4: Added oracle_local_best (Oracle-B: local τ search)
+- P0-5: Dual Oracle naming (oracle_sync = Oracle-A, oracle_local_best = Oracle-B)
 
 Method hierarchy (weak → strong):
-1. naive_slice      - Direct slice (no frontend)
-2. matched_filter   - Grid Search τ + Slice (expensive upper bound)
-3. adjoint_lmmse    - Adjoint + PN Align + LMMSE
-4. adjoint_slice    - Adjoint + PN Align + Hard Slice
-5. proposed_no_update - BV-VAMP without τ update
-6. proposed_tau_slice - Proposed τ estimation + Slice (ablation)
-7. proposed         - Full method (BV-VAMP + τ update)
-8. oracle_sync      - Oracle-A: Same hardware, true θ (main comparison)
-9. oracle_ideal     - Oracle-B: Ideal hardware (optional, appendix only)
+1. naive_slice         - Direct slice (no frontend)
+2. matched_filter      - Grid Search τ + Slice (41-point, expensive upper bound)
+3. adjoint_lmmse       - Adjoint + PN Align + LMMSE
+4. adjoint_slice       - Adjoint + PN Align + Hard Slice
+5. proposed_no_update  - BV-VAMP without τ update
+6. proposed_tau_slice  - Proposed τ estimation + Slice (ablation)
+7. proposed            - Full method (BV-VAMP + τ update)
+8. oracle_sync         - Oracle-A: Same hardware, true θ (main comparison)
+9. oracle_local_best   - Oracle-B: Local best τ (strongest bound)
 """
 
 import torch
@@ -93,7 +95,8 @@ class BaselineNaiveSlice:
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         y_q = batch['y_q']
         theta_init = batch['theta_init']
         x_hat = qpsk_hard_slice(y_q)
@@ -104,14 +107,28 @@ class BaselineMatchedFilter:
     """
     Matched Filter / Grid Search τ estimation + Hard Slice.
 
-    Note: This is an EXPENSIVE upper bound (41× FFTs).
-    Visualize as semi-transparent dashed line to show computational cost.
+    FIXED (Expert v3.0):
+    - grid_points = 41 (was 11)
+    - search_half_range = max_init_error + 0.2 margin (was fixed ±0.5)
+    - Label: "Matched Filter (41-point τ-search)"
     """
     name = "matched_filter"
 
+    # Configuration
+    GRID_POINTS = 41
+    DEFAULT_SEARCH_HALF_RANGE = 1.7  # samples (covers 1.5 + margin)
+
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            search_half_range: float = None, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run matched filter with configurable search range.
+
+        Args:
+            search_half_range: Half range for τ search in samples.
+                              If None, uses DEFAULT_SEARCH_HALF_RANGE.
+        """
         y_q = batch['y_q']
         theta_init = batch['theta_init']
         x_true = batch['x_true']
@@ -119,8 +136,15 @@ class BaselineMatchedFilter:
 
         Ts = 1.0 / sim_cfg.fs
 
-        # τ grid search range: ±2.0 samples (41 points)
-        tau_grid_samples = torch.linspace(-0.5, 0.5, 11, device=device)
+        # Use provided search range or default
+        if search_half_range is None:
+            search_half_range = BaselineMatchedFilter.DEFAULT_SEARCH_HALF_RANGE
+
+        # τ grid search: 41 points covering ±search_half_range samples
+        grid_points = BaselineMatchedFilter.GRID_POINTS
+        tau_grid_samples = torch.linspace(
+            -search_half_range, search_half_range, grid_points, device=device
+        )
 
         best_corr = None
         best_tau = theta_init[:, 0:1].clone()
@@ -158,7 +182,8 @@ class BaselineAdjointLMMSE:
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         y_q = batch['y_q']
         theta_init = batch['theta_init']
         x_true = batch['x_true']
@@ -185,7 +210,8 @@ class BaselineAdjointSlice:
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         y_q = batch['y_q']
         theta_init = batch['theta_init']
         x_true = batch['x_true']
@@ -202,7 +228,8 @@ class BaselineProposedNoUpdate:
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_init = batch['theta_init']
 
         original_setting = model.cfg.enable_theta_update
@@ -222,13 +249,17 @@ class BaselineProposedTauSlice:
     """
     Proposed τ estimation + Hard Slice (ablation: verify VAMP value).
 
-    Uses proposed for τ estimation but slice for detection.
+    NEW in v2.0:
+    Uses proposed method for τ estimation but hard slice for detection.
+    This shows: "good τ tracking but poor detection → VAMP is essential"
     """
     name = "proposed_tau_slice"
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Enable tau update to get good theta estimate
         original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = True
 
@@ -237,6 +268,7 @@ class BaselineProposedTauSlice:
 
         model.cfg.enable_theta_update = original_setting
 
+        # Use hard slice for detection (not VAMP output)
         y_q = batch['y_q']
         x_true = batch['x_true']
 
@@ -252,7 +284,8 @@ class BaselineProposed:
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_init = batch['theta_init']
 
         original_setting = model.cfg.enable_theta_update
@@ -274,17 +307,23 @@ class BaselineOracleSync:
 
     This is the PRIMARY oracle for gap-to-oracle computation.
     Used to measure the "inference efficiency" of the estimator.
+
+    FIXED (Expert v3.0):
+    - Explicitly disable τ update (oracle already has true θ)
+    - This is a "receiver-model oracle", not information-theoretic bound
     """
     name = "oracle_sync"
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_true = batch['theta_true']
 
         batch_oracle = batch.copy()
         batch_oracle['theta_init'] = theta_true.clone()
 
+        # CRITICAL: Disable τ update for oracle (already has true value)
         original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = False
 
@@ -294,6 +333,81 @@ class BaselineOracleSync:
 
         x_hat = outputs['x_hat']
         theta_hat = theta_true.clone()
+
+        return x_hat, theta_hat
+
+
+class BaselineOracleLocalBest:
+    """
+    Oracle-B (Local Best τ): High-resolution τ search around true value.
+
+    NEW in v2.0:
+    Searches ±0.2 samples around true τ with 201 points to find
+    the "receiver-model optimal" τ. This is the strongest bound.
+
+    Purpose: If proposed exceeds Oracle-A, Oracle-B shows whether
+    the gap is due to model mismatch or estimation efficiency.
+    """
+    name = "oracle_local_best"
+
+    SEARCH_HALF_RANGE = 0.2  # samples
+    GRID_POINTS = 201  # High resolution
+
+    @staticmethod
+    @torch.no_grad()
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        y_q = batch['y_q']
+        theta_true = batch['theta_true']
+        x_true = batch['x_true']
+        batch_size = y_q.shape[0]
+
+        Ts = 1.0 / sim_cfg.fs
+
+        # High-resolution τ grid around true value
+        tau_grid_samples = torch.linspace(
+            -BaselineOracleLocalBest.SEARCH_HALF_RANGE,
+            BaselineOracleLocalBest.SEARCH_HALF_RANGE,
+            BaselineOracleLocalBest.GRID_POINTS,
+            device=device
+        )
+
+        best_corr = None
+        best_tau = theta_true[:, 0:1].clone()
+        x_pilot = x_true[:, :pilot_len]
+
+        for tau_offset in tau_grid_samples:
+            theta_test = theta_true.clone()
+            theta_test[:, 0:1] = theta_true[:, 0:1] + tau_offset * Ts
+
+            z_derot, _ = frontend_adjoint_and_pn(model, y_q, theta_test, x_true, pilot_len)
+
+            z_p = z_derot[:, :pilot_len]
+            corr = torch.abs(torch.sum(z_p.conj() * x_pilot, dim=1, keepdim=True))
+
+            if best_corr is None:
+                best_corr = corr
+                best_tau = theta_test[:, 0:1]
+            else:
+                mask = corr > best_corr
+                best_corr = torch.where(mask, corr, best_corr)
+                best_tau = torch.where(mask, theta_test[:, 0:1], best_tau)
+
+        theta_hat = theta_true.clone()
+        theta_hat[:, 0:1] = best_tau
+
+        # Run VAMP with best tau
+        batch_oracle = batch.copy()
+        batch_oracle['theta_init'] = theta_hat.clone()
+
+        original_setting = model.cfg.enable_theta_update
+        model.cfg.enable_theta_update = False
+
+        outputs = model(batch_oracle)
+
+        model.cfg.enable_theta_update = original_setting
+
+        x_hat = outputs['x_hat']
 
         return x_hat, theta_hat
 
@@ -310,7 +424,8 @@ class BaselineRandomInit:
 
     @staticmethod
     @torch.no_grad()
-    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64,
+            **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         theta_true = batch['theta_true']
         batch_size = theta_true.shape[0]
         Ts = 1.0 / sim_cfg.fs
@@ -353,13 +468,14 @@ BASELINE_REGISTRY = {
     "proposed_tau_slice": BaselineProposedTauSlice,
     "proposed": BaselineProposed,
     "oracle_sync": BaselineOracleSync,
+    "oracle_local_best": BaselineOracleLocalBest,
     "oracle": BaselineOracle,  # Legacy alias
     "random_init": BaselineRandomInit,
 }
 
 
 # ============================================================================
-# Paper Method Sets (P0-3)
+# Paper Method Sets (Expert v3.0)
 # ============================================================================
 
 # Paper Core: Main text figures (minimal set for core story)
@@ -400,7 +516,7 @@ METHOD_CLIFF = [
     "oracle_sync",
 ]
 
-# Ablation methods
+# Ablation methods (FIXED: includes proposed_tau_slice)
 METHOD_ABLATION = [
     "random_init",
     "proposed_no_update",
@@ -426,6 +542,13 @@ METHOD_ROBUSTNESS = [
     "oracle_sync",
 ]
 
+# Oracle comparison (includes both oracles)
+METHOD_ORACLE_COMPARE = [
+    "proposed",
+    "oracle_sync",
+    "oracle_local_best",
+]
+
 # Legacy aliases
 METHOD_ORDER = METHOD_PAPER_FULL
 METHOD_QUICK = METHOD_DEBUG
@@ -447,10 +570,10 @@ def get_baseline(method_name: str):
 
 
 def run_baseline(method_name: str, model, batch: Dict, sim_cfg, device: str,
-                 pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+                 pilot_len: int = 64, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run specified baseline algorithm."""
     baseline_cls = get_baseline(method_name)
-    return baseline_cls.run(model, batch, sim_cfg, device, pilot_len)
+    return baseline_cls.run(model, batch, sim_cfg, device, pilot_len, **kwargs)
 
 
 def validate_method_set(methods: List[str], required_methods: List[str],
@@ -461,3 +584,21 @@ def validate_method_set(methods: List[str], required_methods: List[str],
         print(f"⚠️ {context}: Missing methods {missing}")
         return False
     return True
+
+
+def get_method_info() -> Dict[str, Dict]:
+    """Get information about all registered methods."""
+    info = {}
+    for name, cls in BASELINE_REGISTRY.items():
+        info[name] = {
+            'name': cls.name,
+            'class': cls.__name__,
+        }
+        # Add matched filter specifics
+        if name == 'matched_filter':
+            info[name]['grid_points'] = cls.GRID_POINTS
+            info[name]['default_search_half_range'] = cls.DEFAULT_SEARCH_HALF_RANGE
+        elif name == 'oracle_local_best':
+            info[name]['search_half_range'] = cls.SEARCH_HALF_RANGE
+            info[name]['grid_points'] = cls.GRID_POINTS
+    return info

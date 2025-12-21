@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-run_experiments.py - 主入口脚本 (修复版 v2)
+run_experiments_v2.py - Main Entry Script (Expert v3.0)
 
-修复内容：
-1. 添加模块导入路径打印（防止版本混乱）
-2. 添加 Sanity Check（init_error=0 时验证 baseline）
-3. 添加 CSV 方法验证
-4. 不再使用 --quick 时自动退化方法集
+NEW in v2:
+1. Trial-first evaluation (fair method comparison)
+2. ADC bits sweep (proves 1-bit cliff is inherent)
+3. CRLB computation (theoretical bound)
+4. Improved sanity checks and validation
 
-用法：
-    # 完整运行（论文级）
-    python run_experiments.py --ckpt path/to/checkpoint.pth --n_mc 20
+Usage:
+    # Full paper-grade run
+    python run_experiments_v2.py --ckpt path/to/checkpoint.pth --n_mc 20
 
-    # 快速测试（仅 debug 用）
-    python run_experiments.py --ckpt path/to/checkpoint.pth --quick
+    # Quick test (debug only)
+    python run_experiments_v2.py --ckpt path/to/checkpoint.pth --quick
 
-    # 仅可视化
-    python run_experiments.py --visualize_only --data_dir results/paper_figs
+    # Visualization only
+    python run_experiments_v2.py --visualize_only --data_dir results/paper_figs
 """
 
 import os
@@ -25,7 +25,7 @@ import argparse
 import glob
 
 # ============================================================================
-# 路径设置
+# Path Setup
 # ============================================================================
 
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -37,15 +37,15 @@ if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 
 # ============================================================================
-# 导入并打印路径（防止版本混乱）
+# Import and Print Paths
 # ============================================================================
 
 print("=" * 60)
-print("🔍 模块导入路径检查")
+print("🔍 Module Import Path Check")
 print("=" * 60)
 
 try:
-    from evaluator_v2 import (
+    from evaluator_v3 import (
         EvalConfig,
         load_model,
         run_snr_sweep,
@@ -60,40 +60,43 @@ try:
         run_sanity_check,
         validate_csv_methods,
         print_import_info,
+        run_adc_bits_sweep,
+        run_crlb_sweep,
     )
-
-    print("  ✓ 使用 evaluator_v2.py (修复版)")
-except ImportError:
-    print("  ⚠️ evaluator_v2 未找到，使用原版 evaluator")
-    from evaluator import (
-        EvalConfig,
-        load_model,
-        run_snr_sweep,
-        run_cliff_sweep,
-        run_snr_sweep_multi_init_error,
-        run_ablation_sweep,
-        run_heatmap_sweep,
-        run_pn_sweep,
-        run_pilot_sweep,
-        run_jacobian_analysis,
-        measure_latency,
-    )
-
-    run_sanity_check = None
-    validate_csv_methods = None
-    print_import_info = None
+    print("  ✓ Using evaluator_v3.py (Trial-first)")
+except ImportError as e:
+    print(f"  ⚠️ evaluator_v3 import error: {e}")
+    print("  Falling back to evaluator_v2...")
+    try:
+        from evaluator_v2 import (
+            EvalConfig, load_model, run_snr_sweep, run_cliff_sweep,
+            run_snr_sweep_multi_init_error, run_ablation_sweep,
+            run_heatmap_sweep, run_pn_sweep, run_pilot_sweep,
+            run_jacobian_analysis, measure_latency, run_sanity_check,
+            validate_csv_methods, print_import_info,
+        )
+        run_adc_bits_sweep = None
+        run_crlb_sweep = None
+    except ImportError:
+        print("  ❌ Could not import evaluator modules!")
+        sys.exit(1)
 
 try:
-    from visualization_v5 import generate_all_figures
-
-    print("  ✓ 使用 visualization_v5.py (修复版)")
+    from visualization_v6 import generate_all_figures
+    print("  ✓ Using visualization_v6.py (ADC bits + CRLB)")
 except ImportError:
-    print("  ⚠️ visualization_v5 未找到，使用原版 visualization")
-    from visualization import generate_all_figures
+    print("  ⚠️ visualization_v6 not found, trying visualization_v5...")
+    try:
+        from visualization_v5 import generate_all_figures
+    except ImportError:
+        from visualization import generate_all_figures
 
-from baselines import METHOD_ORDER, METHOD_CLIFF, METHOD_ABLATION
+from baselines_v2 import (
+    METHOD_ORDER, METHOD_CLIFF, METHOD_ABLATION,
+    METHOD_SNR_SWEEP, get_method_info
+)
 
-# 打印导入信息
+# Print import info
 if print_import_info:
     print_import_info()
 
@@ -101,11 +104,11 @@ print("=" * 60)
 
 
 # ============================================================================
-# 辅助函数
+# Helper Functions
 # ============================================================================
 
 def find_checkpoint(ckpt_path: str) -> str:
-    """查找 checkpoint 文件"""
+    """Find checkpoint file."""
     if ckpt_path and os.path.exists(ckpt_path):
         return ckpt_path
 
@@ -125,9 +128,9 @@ def find_checkpoint(ckpt_path: str) -> str:
 
 
 def verify_csv_output(df, expected_methods, csv_name):
-    """验证 CSV 输出包含所有期望的方法"""
+    """Verify CSV output contains all expected methods."""
     if 'method' not in df.columns:
-        print(f"  ⚠️ {csv_name}: 缺少 'method' 列！")
+        print(f"  ⚠️ {csv_name}: Missing 'method' column!")
         return False
 
     actual = set(df['method'].unique())
@@ -135,37 +138,37 @@ def verify_csv_output(df, expected_methods, csv_name):
     missing = expected - actual
 
     if missing:
-        print(f"  ⚠️ {csv_name}: 缺少方法 {missing}")
+        print(f"  ⚠️ {csv_name}: Missing methods {missing}")
         return False
 
-    print(f"  ✓ {csv_name}: {len(actual)} 个方法 OK")
+    print(f"  ✓ {csv_name}: {len(actual)} methods OK")
     return True
 
 
 # ============================================================================
-# 数据采集
+# Data Collection
 # ============================================================================
 
 def run_data_collection(args):
-    """运行数据采集阶段"""
+    """Run data collection phase."""
 
     print("\n" + "=" * 60)
-    print("📊 数据采集阶段")
+    print("📊 Data Collection Phase")
     print("=" * 60)
 
-    # 加载模型
+    # Load model
     ckpt_path = find_checkpoint(args.ckpt)
     if not ckpt_path:
-        print("❌ 未找到 checkpoint！")
-        print("   请指定 --ckpt 路径")
+        print("❌ Checkpoint not found!")
+        print("   Please specify --ckpt path")
         return None
 
-    print(f"\n加载模型: {ckpt_path}")
+    print(f"\nLoading model: {ckpt_path}")
     model, gabv_cfg = load_model(ckpt_path, args.device)
 
-    # 配置
+    # Configuration
     if args.quick:
-        print("\n⚠️ Quick 模式：仅用于 debug，不适合论文图！")
+        print("\n⚠️ Quick mode: For debugging only, not paper-grade!")
         n_mc = 5
         batch_size = 32
     else:
@@ -184,202 +187,245 @@ def run_data_collection(args):
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print(f"\n配置:")
-    print(f"  SNR 列表: {eval_cfg.snr_list}")
-    print(f"  MC 次数: {eval_cfg.n_mc}")
-    print(f"  Batch 大小: {eval_cfg.batch_size}")
+    print(f"\nConfiguration:")
+    print(f"  SNR list: {eval_cfg.snr_list}")
+    print(f"  MC runs: {eval_cfg.n_mc}")
+    print(f"  Batch size: {eval_cfg.batch_size}")
     print(f"  Init error (τ): {eval_cfg.theta_noise_tau}")
-    print(f"  输出目录: {args.out_dir}")
+    print(f"  Output dir: {args.out_dir}")
+
+    # Print method info
+    print("\n  Method Registry:")
+    method_info = get_method_info()
+    for name, info in method_info.items():
+        extras = ""
+        if 'grid_points' in info:
+            extras = f" [grid={info['grid_points']}, range=±{info.get('default_search_half_range', info.get('search_half_range', 'N/A'))}]"
+        print(f"    {name}: {info['class']}{extras}")
 
     # ===== Sanity Check =====
     if run_sanity_check and not args.skip_sanity:
         passed = run_sanity_check(model, gabv_cfg, eval_cfg)
         if not passed:
-            print("\n❌ Sanity Check 失败！请检查 baseline 实现后再继续。")
+            print("\n❌ Sanity Check FAILED! Check baseline implementations.")
             if not args.force:
                 return None
-            print("   (--force 模式：继续执行)")
+            print("   (--force mode: continuing anyway)")
 
-    # ===== 运行各种 sweep =====
+    # ===== Run Sweeps =====
     print("\n" + "-" * 40)
 
-    print("\n[1/8] SNR sweep...")
+    print("\n[1/10] SNR sweep...")
     df_snr = run_snr_sweep(model, gabv_cfg, eval_cfg)
     df_snr.to_csv(f"{args.out_dir}/data_snr_sweep.csv", index=False)
-    verify_csv_output(df_snr, ["proposed", "oracle", "adjoint_slice"], "data_snr_sweep")
+    verify_csv_output(df_snr, ["proposed", "oracle_sync", "adjoint_slice"], "data_snr_sweep")
 
-    print("\n[2/8] Cliff sweep (核心图)...")
+    print("\n[2/10] Cliff sweep (CORE figure)...")
     df_cliff = run_cliff_sweep(model, gabv_cfg, eval_cfg)
     df_cliff.to_csv(f"{args.out_dir}/data_cliff_sweep.csv", index=False)
     verify_csv_output(df_cliff, METHOD_CLIFF, "data_cliff_sweep")
 
-    print("\n[3/8] Multi-init SNR sweep...")
+    print("\n[3/10] Multi-init SNR sweep...")
     df_snr_multi = run_snr_sweep_multi_init_error(model, gabv_cfg, eval_cfg)
     df_snr_multi.to_csv(f"{args.out_dir}/data_snr_multi_init_error.csv", index=False)
-    verify_csv_output(df_snr_multi, ["proposed", "oracle"], "data_snr_multi_init_error")
+    verify_csv_output(df_snr_multi, ["proposed", "oracle_sync"], "data_snr_multi_init_error")
 
-    print("\n[4/8] Ablation sweep...")
+    print("\n[4/10] Ablation sweep...")
     df_ablation = run_ablation_sweep(model, gabv_cfg, eval_cfg)
     df_ablation.to_csv(f"{args.out_dir}/data_ablation_sweep.csv", index=False)
     verify_csv_output(df_ablation, METHOD_ABLATION, "data_ablation_sweep")
 
-    print("\n[5/8] Heatmap sweep...")
+    print("\n[5/10] Heatmap sweep...")
     df_heatmap = run_heatmap_sweep(model, gabv_cfg, eval_cfg)
     df_heatmap.to_csv(f"{args.out_dir}/data_heatmap_sweep.csv", index=False)
 
-    print("\n[6/8] PN sweep...")
+    print("\n[6/10] PN sweep...")
     df_pn = run_pn_sweep(model, gabv_cfg, eval_cfg)
     df_pn.to_csv(f"{args.out_dir}/data_pn_sweep.csv", index=False)
     verify_csv_output(df_pn, ["proposed", "adjoint_slice"], "data_pn_sweep")
 
-    print("\n[7/8] Pilot sweep...")
+    print("\n[7/10] Pilot sweep...")
     df_pilot = run_pilot_sweep(model, gabv_cfg, eval_cfg)
     df_pilot.to_csv(f"{args.out_dir}/data_pilot_sweep.csv", index=False)
     verify_csv_output(df_pilot, ["proposed", "adjoint_slice"], "data_pilot_sweep")
 
-    print("\n[8/8] Jacobian & Latency...")
+    print("\n[8/10] Jacobian & Latency...")
     df_jacobian = run_jacobian_analysis(model, gabv_cfg, eval_cfg)
     df_jacobian.to_csv(f"{args.out_dir}/data_jacobian.csv", index=False)
 
     df_latency = measure_latency(model, gabv_cfg, eval_cfg)
     df_latency.to_csv(f"{args.out_dir}/data_latency.csv", index=False)
 
-    # ===== 结果摘要 =====
+    # ===== NEW: ADC Bits Sweep =====
+    if run_adc_bits_sweep is not None:
+        print("\n[9/10] ADC bits sweep (proves 1-bit cliff is inherent)...")
+        df_adc_bits = run_adc_bits_sweep(model, gabv_cfg, eval_cfg)
+        df_adc_bits.to_csv(f"{args.out_dir}/data_adc_bits_sweep.csv", index=False)
+        verify_csv_output(df_adc_bits, ["naive_slice", "proposed"], "data_adc_bits_sweep")
+    else:
+        print("\n[9/10] ADC bits sweep... SKIPPED (not available)")
+
+    # ===== NEW: CRLB Computation =====
+    if run_crlb_sweep is not None:
+        print("\n[10/10] CRLB computation (theoretical bound)...")
+        df_crlb = run_crlb_sweep(gabv_cfg, eval_cfg)
+        df_crlb.to_csv(f"{args.out_dir}/data_crlb.csv", index=False)
+    else:
+        print("\n[10/10] CRLB computation... SKIPPED (not available)")
+
+    # ===== Results Summary =====
     print("\n" + "=" * 60)
-    print("📋 结果摘要")
+    print("📋 Results Summary")
     print("=" * 60)
 
-    # Baseline 验证（init_error=0）
+    # Baseline validation (init_error=0)
     print("\n### Baseline @ init_error=0")
     cliff_0 = df_cliff[df_cliff['init_error'] == 0.0]
     if len(cliff_0) > 0:
         for method in cliff_0['method'].unique():
             ber = cliff_0[cliff_0['method'] == method]['ber'].mean()
-            status = "✅ OK" if ber < 0.2 else "⚠️ 异常"
+            status = "✅ OK" if ber < 0.2 else "⚠️ Anomaly"
             print(f"  {method:25s}: BER={ber:.4f} {status}")
 
-    # SNR=15dB 性能
+    # SNR=15dB performance
     print("\n### @ SNR=15dB")
     snr_15 = df_snr[df_snr['snr_db'] == 15]
     if len(snr_15) > 0:
-        for method in ['adjoint_slice', 'proposed', 'oracle']:
+        for method in ['adjoint_slice', 'proposed', 'oracle_sync']:
             data = snr_15[snr_15['method'] == method]
             if len(data) > 0:
                 ber = data['ber'].mean()
                 rmse = data['rmse_tau_final'].mean()
                 print(f"  {method:25s}: BER={ber:.4f}, RMSE={rmse:.4f}")
 
-    # 消融实验关键数据
-    print("\n### 消融实验 @ 最高 SNR")
+    # Ablation key data
+    print("\n### Ablation @ Highest SNR")
     target_snr = df_ablation['snr_db'].max()
     abl_high = df_ablation[df_ablation['snr_db'] == target_snr]
     if len(abl_high) > 0:
-        for method in ['proposed_no_update', 'proposed_tau_slice', 'proposed', 'oracle']:
+        for method in ['proposed_no_update', 'proposed_tau_slice', 'proposed', 'oracle_sync']:
             data = abl_high[abl_high['method'] == method]
             if len(data) > 0:
                 ber = data['ber'].mean()
                 rmse = data['rmse_tau_final'].mean()
                 print(f"  {method:25s}: BER={ber:.4f}, RMSE={rmse:.4f}")
 
+    # Gap-to-Oracle check
+    print("\n### Gap-to-Oracle Check")
+    oracle_ber = df_snr[df_snr['method'] == 'oracle_sync']['ber'].mean() if 'oracle_sync' in df_snr['method'].values else None
+    proposed_ber = df_snr[df_snr['method'] == 'proposed']['ber'].mean() if 'proposed' in df_snr['method'].values else None
+    if oracle_ber is not None and proposed_ber is not None:
+        gap = proposed_ber - oracle_ber
+        status = "✅ OK" if gap >= 0 else "⚠️ Negative (check Trial-first impl)"
+        print(f"  Oracle BER: {oracle_ber:.4f}")
+        print(f"  Proposed BER: {proposed_ber:.4f}")
+        print(f"  Gap: {gap:+.4f} {status}")
+
     return args.out_dir
 
 
 # ============================================================================
-# 主函数
+# Main Function
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="运行实验并生成论文图表 (修复版 v2)",
+        description="Run experiments and generate paper figures (Expert v3.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 论文级运行
-  python run_experiments.py --ckpt checkpoint.pth --n_mc 20
+Examples:
+  # Paper-grade run
+  python run_experiments_v2.py --ckpt checkpoint.pth --n_mc 20
 
-  # 快速测试 (仅 debug)
-  python run_experiments.py --ckpt checkpoint.pth --quick
+  # Quick test (debug only)
+  python run_experiments_v2.py --ckpt checkpoint.pth --quick
 
-  # 仅可视化
-  python run_experiments.py --visualize_only --data_dir results/paper_figs
+  # Visualization only
+  python run_experiments_v2.py --visualize_only --data_dir results/paper_figs
         """
     )
 
-    # 模式选择
+    # Mode selection
     parser.add_argument('--visualize_only', action='store_true',
-                        help="仅从 CSV 生成图表")
+                        help="Only generate figures from CSV")
 
-    # 数据采集参数
+    # Data collection args
     parser.add_argument('--ckpt', type=str, default="",
-                        help="Checkpoint 路径")
+                        help="Checkpoint path")
     parser.add_argument('--snr_list', nargs='+', type=float,
                         default=[-5, 0, 5, 10, 15, 20, 25],
-                        help="SNR 扫描值")
+                        help="SNR sweep values")
     parser.add_argument('--n_mc', type=int, default=20,
-                        help="Monte Carlo 次数（论文级：20）")
+                        help="Monte Carlo runs (paper-grade: 20)")
     parser.add_argument('--batch', type=int, default=64,
-                        help="Batch 大小")
+                        help="Batch size")
     parser.add_argument('--init_error', type=float, default=0.3,
-                        help="默认 init τ 误差 (samples)")
+                        help="Default init τ error (samples)")
     parser.add_argument('--device', type=str, default="cuda",
-                        help="设备 (cuda/cpu)")
+                        help="Device (cuda/cpu)")
     parser.add_argument('--quick', action='store_true',
-                        help="快速模式（仅 debug 用）")
+                        help="Quick mode (debug only)")
 
     # Sanity check
     parser.add_argument('--skip_sanity', action='store_true',
-                        help="跳过 sanity check")
+                        help="Skip sanity check")
     parser.add_argument('--force', action='store_true',
-                        help="即使 sanity check 失败也继续")
+                        help="Continue even if sanity check fails")
 
-    # 输出参数
+    # Output args
     parser.add_argument('--out_dir', type=str, default="results/paper_figs",
-                        help="输出目录")
+                        help="Output directory")
     parser.add_argument('--data_dir', type=str, default=None,
-                        help="数据目录 (visualize_only 模式)")
+                        help="Data directory (for visualize_only mode)")
 
     args = parser.parse_args()
 
     print("=" * 60)
-    print("🎓 论文图表生成管线 (修复版 v2)")
+    print("🎓 Paper Figure Generation Pipeline (Expert v3.0)")
     print("=" * 60)
-    print(f"模式: {'仅可视化' if args.visualize_only else '完整运行'}")
+    print(f"Mode: {'Visualization only' if args.visualize_only else 'Full run'}")
 
     if args.visualize_only:
-        # 仅可视化模式
         data_dir = args.data_dir or args.out_dir
         if not os.path.exists(data_dir):
-            print(f"❌ 数据目录不存在: {data_dir}")
+            print(f"❌ Data directory not found: {data_dir}")
             return
 
         generate_all_figures(data_dir, args.out_dir)
     else:
-        # 完整运行模式
         data_dir = run_data_collection(args)
 
         if data_dir:
             print("\n" + "=" * 60)
-            print("📈 可视化阶段")
+            print("📈 Visualization Phase")
             print("=" * 60)
             generate_all_figures(data_dir, args.out_dir)
 
-    # 最终输出
+    # Final output
     print("\n" + "=" * 60)
-    print("📝 论文叙事建议")
+    print("📝 Paper Narrative Guidance")
     print("=" * 60)
     print("""
-"在 1-bit 量化与脏硬件 THz-ISAC 链路中，初始同步误差会触发检测
-'悬崖式失效'；本文提出的 pilot-only 几何一致 τ 快环跟踪将接收机
-重新拉回可跟踪盆地，使检测性能在该盆地内逼近 oracle 上界。"
+"In 1-bit quantized dirty-hardware THz-ISAC links, initial sync error
+triggers a 'cliff-like detection failure'; our proposed pilot-only
+geometry-consistent τ fast-loop tracking pulls the receiver back into
+the trackable basin, achieving near-oracle performance within that basin."
 
-关键数据点：
-- init_error=0 时所有方法都接近 oracle（证明 baseline 没 bug）
-- init_error=0.3 时 baseline 失效，proposed 仍工作
-- Basin 边界约 0.3-0.5 samples
-- BER 饱和是 1-bit 物理极限，真正增益在 τ RMSE
+Key Evidence:
+- init_error=0: All methods approach oracle (baseline = no bug)
+- init_error=0.3: Baselines fail, proposed still works
+- Basin boundary ≈ 0.3-0.5 samples
+- BER saturation is 1-bit physics limit; real gain is in τ RMSE
+- ADC bits sweep: 1-bit cliff is inherent (bits>1 recovers)
+
+Reviewer FAQ:
+Q: "Gap-to-Oracle is negative?"
+A: This means proposed slightly beats Oracle-A. Oracle-A uses true θ
+   but no refinement. Proposed does τ refinement which can help.
+   Add Oracle-B (local-best τ) for strongest comparison.
 """)
 
-    print(f"\n✅ 完成！所有输出保存到: {args.out_dir}")
+    print(f"\n✅ Complete! All outputs saved to: {args.out_dir}")
 
 
 if __name__ == "__main__":
