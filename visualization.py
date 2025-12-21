@@ -159,6 +159,45 @@ def create_sim_config(gabv_cfg: GABVConfig, snr_db: float = 15.0) -> SimConfig:
     )
 
 
+def construct_meta_features(meta_dict: Dict, batch_size: int) -> torch.Tensor:
+    """
+    Construct meta feature tensor from simulation metadata.
+
+    Schema (must match model!):
+        meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
+        meta[:, 1] = gamma_eff_db_norm = (10*log10(gamma_eff) - 10) / 20
+        meta[:, 2] = chi              (raw, range [0, 2/π])
+        meta[:, 3] = sigma_eta_norm   = sigma_eta / 0.1
+        meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
+        meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
+    """
+    snr_db = meta_dict.get('snr_db', 20.0)
+    gamma_eff = meta_dict.get('gamma_eff', 1.0)
+    chi = meta_dict.get('chi', 0.1)
+    sigma_eta = meta_dict.get('sigma_eta', 0.01)
+    pn_linewidth = meta_dict.get('pn_linewidth', 100e3)
+    ibo_dB = meta_dict.get('ibo_dB', 3.0)
+
+    # Normalize
+    snr_db_norm = (snr_db - 15) / 15
+    gamma_eff_db = 10 * np.log10(max(gamma_eff, 1e-6))
+    gamma_eff_db_norm = (gamma_eff_db - 10) / 20
+    sigma_eta_norm = sigma_eta / 0.1
+    pn_linewidth_norm = np.log10(pn_linewidth + 1) / np.log10(1e6)
+    ibo_db_norm = (ibo_dB - 3) / 3
+
+    meta_vec = np.array([
+        snr_db_norm,
+        gamma_eff_db_norm,
+        chi,
+        sigma_eta_norm,
+        pn_linewidth_norm,
+        ibo_db_norm,
+    ], dtype=np.float32)
+
+    return torch.from_numpy(np.tile(meta_vec, (batch_size, 1)))
+
+
 def evaluate_single_batch(
         model: GABVNet,
         sim_cfg: SimConfig,
@@ -202,15 +241,9 @@ def evaluate_single_batch(
     y_q = to_tensor(sim_data['y_q'], device)
     x_true = to_tensor(sim_data['x_true'], device)
 
-    # Handle meta dict
-    meta = {}
-    for k, v in sim_data['meta'].items():
-        if isinstance(v, np.ndarray):
-            meta[k] = torch.from_numpy(v).to(device)
-        elif isinstance(v, torch.Tensor):
-            meta[k] = v.to(device)
-        else:
-            meta[k] = v
+    # CRITICAL FIX: Convert meta dict to tensor using construct_meta_features
+    # The model expects meta as a tensor [B, meta_dim], not a dictionary!
+    meta = construct_meta_features(sim_data['meta'], batch_size).to(device)
 
     batch = {
         'y_q': y_q,
@@ -430,7 +463,7 @@ def fig01_ber_vs_snr(df: pd.DataFrame, out_dir: str):
 
     ax.set_xlabel('SNR (dB)')
     ax.set_ylabel('BER')
-    ax.set_title('Communication Performance: BER vs SNR')
+    # ax.set_title removed for publication style
     ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
     ax.set_ylim([1e-3, 0.5])
@@ -470,7 +503,7 @@ def fig02_rmse_tau_vs_snr(df: pd.DataFrame, out_dir: str):
 
     ax.set_xlabel('SNR (dB)')
     ax.set_ylabel('RMSE τ (samples)')
-    ax.set_title('Sensing Performance: Delay Estimation Error vs SNR')
+    # ax.set_title removed for publication style
     ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
 
@@ -502,7 +535,7 @@ def fig03_improvement_vs_snr(df: pd.DataFrame, out_dir: str):
 
     ax.set_xlabel('SNR (dB)')
     ax.set_ylabel('Improvement Ratio (RMSE_init / RMSE_final)')
-    ax.set_title('τ Estimation Improvement vs SNR')
+    # ax.set_title removed for publication style
     ax.legend()
     ax.grid(True, alpha=0.3, axis='y')
 
@@ -531,7 +564,7 @@ def fig04_tau_error_cdf(df: pd.DataFrame, out_dir: str, snr_list: List[float] = 
 
     ax.set_xlabel('|τ error| (samples)')
     ax.set_ylabel('CDF')
-    ax.set_title('Distribution of τ Estimation Error')
+    # ax.set_title removed for publication style
     ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 0.5])
@@ -553,7 +586,7 @@ def fig05_tau_error_boxplot(df: pd.DataFrame, out_dir: str):
 
     ax.set_xlabel('SNR (dB)')
     ax.set_ylabel('|τ error| (samples)')
-    ax.set_title('τ Estimation Error Distribution vs SNR')
+    # ax.set_title removed for publication style
     ax.grid(True, alpha=0.3, axis='y')
 
     fig.savefig(f"{out_dir}/fig05_tau_error_boxplot.png")
@@ -589,7 +622,7 @@ def fig06_identifiability_cliff(df_cliff: pd.DataFrame, out_dir: str):
 
     ax1.set_xlabel('Initial τ Error (samples)')
     ax1.set_ylabel('RMSE τ (samples)')
-    ax1.set_title('(a) Identifiability Cliff: τ Estimation')
+    # ax1.set_title removed for publication style
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
@@ -604,7 +637,7 @@ def fig06_identifiability_cliff(df_cliff: pd.DataFrame, out_dir: str):
 
     ax2.set_xlabel('Initial τ Error (samples)')
     ax2.set_ylabel('BER')
-    ax2.set_title('(b) Communication Impact')
+    # ax2.set_title removed for publication style
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -629,14 +662,14 @@ def fig07_heatmap(df_heatmap: pd.DataFrame, out_dir: str):
                 annot=True, fmt='.1f', cbar_kws={'label': 'Improvement Ratio'})
     ax1.set_xlabel('SNR (dB)')
     ax1.set_ylabel('Initial τ Error (samples)')
-    ax1.set_title('(a) τ Improvement Ratio')
+    # ax1.set_title removed for publication style
 
     # RMSE heatmap
     sns.heatmap(pivot_rmse, ax=ax2, cmap='RdYlGn_r',
                 annot=True, fmt='.2f', cbar_kws={'label': 'RMSE τ (samples)'})
     ax2.set_xlabel('SNR (dB)')
     ax2.set_ylabel('Initial τ Error (samples)')
-    ax2.set_title('(b) Final τ RMSE')
+    # ax2.set_title removed for publication style
 
     fig.tight_layout()
     fig.savefig(f"{out_dir}/fig07_heatmap.png")
@@ -662,13 +695,13 @@ def fig08_ablation_iterations(model, gabv_cfg, eval_cfg, out_dir: str):
     ax1.bar(iterations, rmse, color='C0', alpha=0.7)
     ax1.set_xlabel('GN Iterations')
     ax1.set_ylabel('RMSE τ (samples)')
-    ax1.set_title('(a) τ Estimation vs Iterations')
+    # ax1.set_title removed for publication style
     ax1.grid(True, alpha=0.3, axis='y')
 
     ax2.bar(iterations, ber, color='C2', alpha=0.7)
     ax2.set_xlabel('GN Iterations')
     ax2.set_ylabel('BER')
-    ax2.set_title('(b) Communication vs Iterations')
+    # ax2.set_title removed for publication style
     ax2.grid(True, alpha=0.3, axis='y')
 
     fig.tight_layout()
@@ -698,7 +731,7 @@ def fig09_ablation_design(out_dir: str):
     bars = ax.bar(designs, rmse, color=colors, alpha=0.7, edgecolor='black')
 
     ax.set_ylabel('RMSE τ (samples)')
-    ax.set_title('Ablation: Impact of Key Design Fixes')
+    # ax.set_title removed for publication style
     ax.grid(True, alpha=0.3, axis='y')
 
     # Add value labels
@@ -725,13 +758,13 @@ def fig10_diagnostics(out_dir: str):
     ax1.plot(iterations, resid_improve, 'o-', color='C0')
     ax1.set_xlabel('GN Iteration')
     ax1.set_ylabel('Residual Improvement')
-    ax1.set_title('(a) Residual Reduction per Iteration')
+    # ax1.set_title removed for publication style
     ax1.grid(True, alpha=0.3)
 
     ax2.plot(iterations, delta_tau, 's-', color='C2')
     ax2.set_xlabel('GN Iteration')
     ax2.set_ylabel('|Δτ| (samples)')
-    ax2.set_title('(b) Update Magnitude per Iteration')
+    # ax2.set_title removed for publication style
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -761,7 +794,7 @@ def fig11_complexity(out_dir: str):
 
     ax.set_xlabel('Relative Complexity (FLOPs)')
     ax.set_ylabel('RMSE τ (samples)')
-    ax.set_title('Complexity-Performance Tradeoff')
+    # ax.set_title removed for publication style
     ax.set_xscale('log')
 
     cbar = plt.colorbar(scatter)
@@ -788,7 +821,7 @@ def fig12_robustness(out_dir: str):
     ax1.set_xlabel('PN Severity (×baseline)')
     ax1.set_ylabel('RMSE τ (samples)', color='C0')
     ax1.tick_params(axis='y', labelcolor='C0')
-    ax1.set_title('(a) Impact of Phase Noise')
+    # ax1.set_title removed for publication style
     ax1.grid(True, alpha=0.3)
 
     ax1_twin = ax1.twinx()
@@ -805,7 +838,7 @@ def fig12_robustness(out_dir: str):
     ax2.set_xlabel('PA Nonlinearity (×baseline)')
     ax2.set_ylabel('RMSE τ (samples)', color='C0')
     ax2.tick_params(axis='y', labelcolor='C0')
-    ax2.set_title('(b) Impact of PA Nonlinearity')
+    # ax2.set_title removed for publication style
     ax2.grid(True, alpha=0.3)
 
     ax2_twin = ax2.twinx()
