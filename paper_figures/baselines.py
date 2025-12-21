@@ -145,7 +145,7 @@ class BaselineMatchedFilter:
         
         # P0-2 修复：τ 网格搜索范围扩大到 ±2.0 samples
         # 覆盖 cliff sweep 的 init_error 范围 (0 ~ 1.5)
-        tau_grid_samples = torch.linspace(-2.0, 2.0, 41, device=device)  # 41 点网格
+        tau_grid_samples = torch.linspace(-1.0, 1.0, 21, device=device)  # 41 点网格
         
         best_corr = None
         best_tau = theta_init[:, 0:1].clone()
