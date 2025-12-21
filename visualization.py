@@ -65,6 +65,55 @@ except ImportError as e:
     print(f"Warning: Could not import dependencies: {e}")
     HAS_DEPS = False
 
+
+# ============================================================================
+# 核心修改0: construct_meta_features（从 train_gabv_net.py 复制）
+# ============================================================================
+
+def construct_meta_features(meta_dict: Dict, batch_size: int, snr_db: float = None) -> torch.Tensor:
+    """
+    Construct meta feature tensor from simulation metadata.
+
+    Schema (must match model!):
+        meta[:, 0] = snr_db_norm      = (snr_db - 15) / 15
+        meta[:, 1] = gamma_eff_db_norm = (10*log10(gamma_eff) - 10) / 20
+        meta[:, 2] = chi              (raw, range [0, 2/π])
+        meta[:, 3] = sigma_eta_norm   = sigma_eta / 0.1
+        meta[:, 4] = pn_linewidth_norm = log10(pn_linewidth + 1) / log10(1e6)
+        meta[:, 5] = ibo_db_norm      = (ibo_dB - 3) / 3
+    """
+    # 如果显式传入 snr_db，优先使用
+    if snr_db is not None:
+        snr = snr_db
+    else:
+        snr = meta_dict.get('snr_db', 20.0)
+
+    gamma_eff = meta_dict.get('gamma_eff', 1.0)
+    chi = meta_dict.get('chi', 0.1)
+    sigma_eta = meta_dict.get('sigma_eta', 0.01)
+    pn_linewidth = meta_dict.get('pn_linewidth', 100e3)
+    ibo_dB = meta_dict.get('ibo_dB', 3.0)
+
+    # Normalize
+    snr_db_norm = (snr - 15) / 15
+    gamma_eff_db = 10 * np.log10(max(gamma_eff, 1e-6))
+    gamma_eff_db_norm = (gamma_eff_db - 10) / 20
+    sigma_eta_norm = sigma_eta / 0.1
+    pn_linewidth_norm = np.log10(pn_linewidth + 1) / np.log10(1e6)
+    ibo_db_norm = (ibo_dB - 3) / 3
+
+    meta_vec = np.array([
+        snr_db_norm,
+        gamma_eff_db_norm,
+        chi,
+        sigma_eta_norm,
+        pn_linewidth_norm,
+        ibo_db_norm,
+    ], dtype=np.float32)
+
+    return torch.from_numpy(np.tile(meta_vec, (batch_size, 1)))
+
+
 # ============================================================================
 # 核心修改1: 统一方法集合
 # ============================================================================
@@ -278,55 +327,55 @@ def evaluate_single_batch(
     y_q = to_tensor(sim_data['y_q'], device)
     x_true = to_tensor(sim_data['x_true'], device)
 
-    meta = {}
-    for k, v in sim_data['meta'].items():
-        if isinstance(v, np.ndarray):
-            meta[k] = torch.from_numpy(v).to(device)
-        elif isinstance(v, torch.Tensor):
-            meta[k] = v.to(device)
-        else:
-            meta[k] = v
+    # 关键修复：使用 construct_meta_features 转换 meta
+    raw_meta = sim_data.get('meta', {})
+    meta_tensor = construct_meta_features(raw_meta, batch_size, snr_db=sim_cfg.snr_db).to(device)
 
+    # 构建 batch - 与训练时格式一致
     batch = {
         'y_q': y_q,
         'x_true': x_true,
         'theta_init': theta_init,
-        'meta': meta,
+        'theta_true': theta_true,
+        'meta': meta_tensor,  # tensor 格式，不是 dict
         'snr_db': sim_cfg.snr_db,
     }
 
-    # 处理 adjoint_slice 基线
+    # 设置 theta update
+    original_setting = model.cfg.enable_theta_update
+
     if method == "adjoint_slice":
-        # 简化版：使用 no_update 作为 adjoint_slice 的近似
-        # 真正的实现需要调用 baselines_receivers.py
-        original_setting = model.cfg.enable_theta_update
         model.cfg.enable_theta_update = False
+    elif method == "proposed_no_update":
+        model.cfg.enable_theta_update = False
+    elif method == "proposed":
+        model.cfg.enable_theta_update = True
+    elif method == "oracle":
+        model.cfg.enable_theta_update = False
+        batch['theta_init'] = theta_true.clone()
 
-        with torch.no_grad():
-            outputs = model(batch)
+    with torch.no_grad():
+        outputs = model(batch)
 
-        model.cfg.enable_theta_update = original_setting
-    else:
-        original_setting = model.cfg.enable_theta_update
-        model.cfg.enable_theta_update = enable_theta_update
-
-        with torch.no_grad():
-            outputs = model(batch)
-
-        model.cfg.enable_theta_update = original_setting
+    # Restore setting
+    model.cfg.enable_theta_update = original_setting
 
     # Compute metrics
     x_hat = outputs['x_hat']
-    theta_hat = outputs['theta_hat']
+    theta_hat = outputs.get('theta_hat', batch['theta_init'])
 
-    # BER (QPSK)
-    x_hat_bits = torch.stack([torch.sign(x_hat.real), torch.sign(x_hat.imag)], dim=-1)
-    x_true_bits = torch.stack([torch.sign(x_true.real), torch.sign(x_true.imag)], dim=-1)
+    # BER (QPSK) - 只在 data symbols 上计算（排除 pilots）
+    pilot_length = pilot_len if pilot_len is not None else 64
+    x_hat_data = x_hat[:, pilot_length:]
+    x_true_data = x_true[:, pilot_length:]
+
+    x_hat_bits = torch.stack([torch.sign(x_hat_data.real), torch.sign(x_hat_data.imag)], dim=-1)
+    x_true_bits = torch.stack([torch.sign(x_true_data.real), torch.sign(x_true_data.imag)], dim=-1)
     ber = (x_hat_bits != x_true_bits).float().mean().item()
 
     # τ errors (in samples)
     tau_true = theta_true[:, 0].cpu().numpy() * sim_cfg.fs
-    tau_init = theta_init[:, 0].cpu().numpy() * sim_cfg.fs
+    tau_init = batch['theta_init'][:, 0].cpu().numpy() * sim_cfg.fs
     tau_hat = theta_hat[:, 0].cpu().numpy() * sim_cfg.fs
 
     tau_error_init = np.abs(tau_init - tau_true)
