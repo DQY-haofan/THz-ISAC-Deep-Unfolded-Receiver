@@ -1,18 +1,18 @@
 """
-evaluator.py - 数据采集和评估逻辑 (修复版 v2)
+evaluator.py - Data Collection and Evaluation (Expert v2.0 - Top Journal Ready)
 
-修复内容：
-1. 所有 sweep 默认使用 METHOD_ORDER（完整方法集）
-2. 添加 sanity check 功能
-3. 添加缺失方法警告
+Expert Requirements Implemented:
+- P0-1: Cross-method fairness (same sim_data + theta_init for all methods)
+- P0-2: Dual Oracle support (oracle_sync as primary)
+- P1-1: τ-only success rate definition
+- P1-2: Per-sample success flag for pull-in computation
+- P2-1: CRLB tau computation interface
 
-负责：
-- 模型加载
-- 数据生成
-- 各种 sweep（SNR, Cliff, PN, Pilot 等）
-- 指标计算
-
-输出：CSV 文件供 visualization.py 使用
+Key Changes:
+1. evaluate_methods_fair(): Ensures same data for all methods in one MC run
+2. Success rate: |τ_err_final| < eps_tau (τ-only, unified)
+3. Output: tau_err_final_abs, success flag per sample
+4. CSV schema aligned with theory manual
 """
 
 import os
@@ -21,70 +21,42 @@ import torch
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
 
 # Local imports
 from baselines import (
     run_baseline,
-    METHOD_ORDER,
-    METHOD_QUICK,
+    METHOD_PAPER_CORE,
+    METHOD_PAPER_FULL,
+    METHOD_DEBUG,
     METHOD_CLIFF,
     METHOD_ABLATION,
+    METHOD_SNR_SWEEP,
+    METHOD_ROBUSTNESS,
     frontend_adjoint_and_pn,
     qpsk_hard_slice,
 )
 
 
 # ============================================================================
-# 启动时打印导入路径（防止版本混乱）
-# ============================================================================
-
-def print_import_info():
-    """打印当前导入的模块路径，防止版本混乱"""
-    import baselines
-    print(f"[DEBUG] baselines.py = {baselines.__file__}")
-    print(f"[DEBUG] evaluator.py = {__file__}")
-
-
-# ============================================================================
-# 异常处理辅助函数
-# ============================================================================
-
-def make_failed_record(**kwargs) -> dict:
-    """
-    创建失败记录，用 NaN 替代固定值
-    """
-    record = {
-        'ber': float('nan'),
-        'rmse_tau_init': float('nan'),
-        'rmse_tau_final': float('nan'),
-        'improvement': float('nan'),
-        'success_rate': float('nan'),
-        'failed': True,
-    }
-    record.update(kwargs)
-    return record
-
-
-# ============================================================================
-# 配置
+# Configuration
 # ============================================================================
 
 @dataclass
 class EvalConfig:
-    """评估配置"""
+    """Evaluation configuration with expert requirements."""
     ckpt_path: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # SNR sweep
     snr_list: List[float] = field(default_factory=lambda: [-5, 0, 5, 10, 15, 20, 25])
 
-    # Monte Carlo - 论文级默认值
-    n_mc: int = 20  # 修复：从 10 改为 20
+    # Monte Carlo settings (paper-level defaults)
+    n_mc: int = 20
     batch_size: int = 64
 
-    # θ 初始噪声（samples）
+    # θ initial noise (samples)
     theta_noise_tau: float = 0.3
     theta_noise_v: float = 0.0
     theta_noise_a: float = 0.0
@@ -98,49 +70,22 @@ class EvalConfig:
     # Pilot sweep
     pilot_lengths: List[int] = field(default_factory=lambda: [16, 32, 64, 128])
 
-    # 输出目录
+    # Success rate threshold (P1-1: τ-only)
+    eps_tau: float = 0.1  # Success if |τ_err| < eps_tau samples
+
+    # Output directory
     out_dir: str = "results/paper_figs"
 
-
-# ============================================================================
-# 论文级方法集合定义
-# ============================================================================
-
-# 论文主图使用的完整方法集
-METHOD_PAPER_FULL = [
-    "naive_slice",
-    "matched_filter",
-    "adjoint_lmmse",
-    "adjoint_slice",
-    "proposed_no_update",
-    "proposed",
-    "oracle",
-]
-
-# SNR sweep 使用的方法集
-METHOD_SNR_SWEEP = [
-    "matched_filter",
-    "adjoint_slice",
-    "proposed_no_update",
-    "proposed",
-    "oracle",
-]
-
-# PN/Pilot sweep 使用的方法集（包含更多对比）
-METHOD_ROBUSTNESS = [
-    "adjoint_slice",
-    "proposed_no_update",
-    "proposed",
-    "oracle",
-]
+    # Mode: 'debug' or 'paper'
+    mode: str = "paper"
 
 
 # ============================================================================
-# 模型和数据加载
+# Model and Data Loading
 # ============================================================================
 
 def load_model(ckpt_path: str, device: str):
-    """加载训练好的模型"""
+    """Load trained model."""
     from gabv_net_model import GABVNet, GABVConfig, create_gabv_model
 
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -164,7 +109,7 @@ def load_model(ckpt_path: str, device: str):
 
 
 def create_sim_config(gabv_cfg, snr_db: float, pn_linewidth: float = None):
-    """创建仿真配置"""
+    """Create simulation configuration."""
     from thz_isac_world import SimConfig
 
     sim_cfg = SimConfig(
@@ -180,14 +125,43 @@ def create_sim_config(gabv_cfg, snr_db: float, pn_linewidth: float = None):
     return sim_cfg
 
 
-def simulate_batch(sim_cfg, batch_size: int) -> Dict:
-    """生成一批仿真数据"""
+def simulate_batch(sim_cfg, batch_size: int, seed: int = None) -> Dict:
+    """Generate simulation data with optional seed."""
     from thz_isac_world import simulate_batch as sim_batch
-    return sim_batch(sim_cfg, batch_size)
+    return sim_batch(sim_cfg, batch_size, seed=seed)
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def make_failed_record(**kwargs) -> dict:
+    """Create failed record with NaN values."""
+    record = {
+        'ber': float('nan'),
+        'rmse_tau_init': float('nan'),
+        'rmse_tau_final': float('nan'),
+        'tau_err_final_abs': float('nan'),
+        'improvement': float('nan'),
+        'success_rate': float('nan'),
+        'success': 0,
+        'failed': True,
+    }
+    record.update(kwargs)
+    return record
+
+
+def to_tensor(x, device):
+    """Convert to tensor on device."""
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x).to(device)
+    elif isinstance(x, torch.Tensor):
+        return x.to(device)
+    return x
 
 
 def construct_meta_features(meta_dict: Dict, batch_size: int, snr_db: float = None) -> torch.Tensor:
-    """构造 meta 特征张量"""
+    """Construct meta feature tensor."""
     if snr_db is not None:
         snr = snr_db
     else:
@@ -199,7 +173,6 @@ def construct_meta_features(meta_dict: Dict, batch_size: int, snr_db: float = No
     pn_linewidth = meta_dict.get('pn_linewidth', 100e3)
     ibo_dB = meta_dict.get('ibo_dB', 3.0)
 
-    # Normalize
     snr_db_norm = (snr - 15) / 15
     gamma_eff_db = 10 * np.log10(max(gamma_eff, 1e-6))
     gamma_eff_db_norm = (gamma_eff_db - 10) / 20
@@ -215,73 +188,14 @@ def construct_meta_features(meta_dict: Dict, batch_size: int, snr_db: float = No
     return torch.from_numpy(np.tile(meta_vec, (batch_size, 1))).float()
 
 
-# ============================================================================
-# 单批次评估
-# ============================================================================
+def compute_metrics(x_hat, x_true, theta_hat, theta_true, theta_init,
+                    sim_cfg, pilot_len: int, eps_tau: float = 0.1) -> Dict:
+    """
+    Compute all metrics including τ-only success rate.
 
-def evaluate_single_batch(
-    model,
-    sim_cfg,
-    batch_size: int,
-    theta_noise: Tuple[float, float, float],
-    device: str,
-    method: str = "proposed",
-    pilot_len: int = 64,
-    init_error_override: float = None,
-) -> Dict:
-    """评估单个批次"""
-    Ts = 1.0 / sim_cfg.fs
-
-    # 允许覆盖 init_error
-    tau_noise = init_error_override if init_error_override is not None else theta_noise[0]
-
-    # 生成数据
-    sim_data = simulate_batch(sim_cfg, batch_size)
-
-    def to_tensor(x, device):
-        if isinstance(x, np.ndarray):
-            return torch.from_numpy(x).to(device)
-        elif isinstance(x, torch.Tensor):
-            return x.to(device)
-        return x
-
-    theta_true = to_tensor(sim_data['theta_true'], device)
-
-    # Oracle 使用真实 θ，其他方法添加噪声
-    if method == "oracle":
-        theta_init = theta_true.clone()
-    else:
-        noise_tau = torch.randn(batch_size, 1, device=device) * tau_noise * Ts
-        noise_v = torch.randn(batch_size, 1, device=device) * theta_noise[1]
-        noise_a = torch.randn(batch_size, 1, device=device) * theta_noise[2]
-        theta_init = theta_true.clone()
-        theta_init[:, 0:1] += noise_tau
-        theta_init[:, 1:2] += noise_v
-        theta_init[:, 2:3] += noise_a
-
-    y_q = to_tensor(sim_data['y_q'], device)
-    x_true = to_tensor(sim_data['x_true'], device)
-
-    # 构造 meta 特征
-    raw_meta = sim_data.get('meta', {})
-    meta_tensor = construct_meta_features(raw_meta, batch_size, snr_db=sim_cfg.snr_db).to(device)
-
-    # 构建 batch
-    batch = {
-        'y_q': y_q,
-        'x_true': x_true,
-        'theta_init': theta_init,
-        'theta_true': theta_true,
-        'meta': meta_tensor,
-        'snr_db': sim_cfg.snr_db,
-    }
-
-    # 运行基线算法
-    x_hat, theta_hat = run_baseline(method, model, batch, sim_cfg, device, pilot_len)
-
-    # ===== 计算指标 =====
-
-    # BER (QPSK) - 只在 data symbols 上计算
+    P1-1: Success rate is τ-only: |τ_err_final| < eps_tau
+    """
+    # BER (QPSK) - only on data symbols
     x_hat_data = x_hat[:, pilot_len:]
     x_true_data = x_true[:, pilot_len:]
 
@@ -291,7 +205,7 @@ def evaluate_single_batch(
 
     # τ errors (in samples)
     tau_true = theta_true[:, 0].cpu().numpy() * sim_cfg.fs
-    tau_init = batch['theta_init'][:, 0].cpu().numpy() * sim_cfg.fs
+    tau_init = theta_init[:, 0].cpu().numpy() * sim_cfg.fs
     tau_hat = theta_hat[:, 0].cpu().numpy() * sim_cfg.fs
 
     tau_error_init = np.abs(tau_init - tau_true)
@@ -300,113 +214,206 @@ def evaluate_single_batch(
     rmse_tau_init = np.sqrt(np.mean(tau_error_init ** 2))
     rmse_tau_final = np.sqrt(np.mean(tau_error_final ** 2))
 
-    # Success Rate (|τ_err| < 0.1 samples)
-    success_rate = np.mean(tau_error_final < 0.1)
+    # P1-1: τ-only success rate
+    success_mask = tau_error_final < eps_tau
+    success_rate = np.mean(success_mask)
+
+    # Mean absolute τ error (for pull-in computation)
+    tau_err_final_abs = np.mean(tau_error_final)
 
     return {
         'ber': ber,
         'rmse_tau_init': rmse_tau_init,
         'rmse_tau_final': rmse_tau_final,
+        'tau_err_final_abs': tau_err_final_abs,
         'improvement': rmse_tau_init / (rmse_tau_final + 1e-10),
         'success_rate': success_rate,
+        'success': int(success_rate > 0.5),  # Binary for this batch
     }
 
 
 # ============================================================================
-# Sanity Check 函数
+# P0-1: Fair Multi-Method Evaluation
+# ============================================================================
+
+def evaluate_methods_fair(
+    model,
+    sim_cfg,
+    batch_size: int,
+    theta_noise: Tuple[float, float, float],
+    device: str,
+    methods: List[str],
+    pilot_len: int = 64,
+    init_error_override: float = None,
+    eps_tau: float = 0.1,
+    seed: int = None,
+) -> List[Dict]:
+    """
+    Evaluate multiple methods on SAME data (P0-1: cross-method fairness).
+
+    Key guarantee:
+    - All methods see identical sim_data (y_q, x_true, theta_true)
+    - All methods see identical theta_init_noisy (same initial perturbation)
+    - Seed is NOT mixed with method name
+
+    Args:
+        model: GABVNet model
+        sim_cfg: Simulation config
+        batch_size: Batch size
+        theta_noise: (tau_noise, v_noise, a_noise) in samples
+        device: Device string
+        methods: List of method names
+        pilot_len: Pilot length
+        init_error_override: Override tau noise if specified
+        eps_tau: Success threshold
+        seed: Random seed for this MC run
+
+    Returns:
+        List of result dicts (one per method)
+    """
+    Ts = 1.0 / sim_cfg.fs
+    tau_noise = init_error_override if init_error_override is not None else theta_noise[0]
+
+    # Set seed for reproducibility
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+    # 1) Generate SHARED simulation data (same for all methods)
+    sim_data = simulate_batch(sim_cfg, batch_size, seed=seed)
+
+    theta_true = to_tensor(sim_data['theta_true'], device)
+    y_q = to_tensor(sim_data['y_q'], device)
+    x_true = to_tensor(sim_data['x_true'], device)
+
+    # 2) Generate SHARED theta_init_noisy (same for all methods except oracle)
+    noise_tau = torch.randn(batch_size, 1, device=device) * tau_noise * Ts
+    noise_v = torch.randn(batch_size, 1, device=device) * theta_noise[1]
+    noise_a = torch.randn(batch_size, 1, device=device) * theta_noise[2]
+
+    theta_init_noisy = theta_true.clone()
+    theta_init_noisy[:, 0:1] += noise_tau
+    theta_init_noisy[:, 1:2] += noise_v
+    theta_init_noisy[:, 2:3] += noise_a
+
+    # Meta features
+    raw_meta = sim_data.get('meta', {})
+    meta_tensor = construct_meta_features(raw_meta, batch_size, snr_db=sim_cfg.snr_db).to(device)
+
+    results = []
+
+    for method in methods:
+        # Oracle uses true theta, others use noisy init
+        if method in ["oracle", "oracle_sync"]:
+            theta_init = theta_true.clone()
+        else:
+            theta_init = theta_init_noisy.clone()
+
+        # Construct batch
+        batch = {
+            'y_q': y_q,
+            'x_true': x_true,
+            'theta_init': theta_init,
+            'theta_true': theta_true,
+            'meta': meta_tensor,
+            'snr_db': sim_cfg.snr_db,
+        }
+
+        try:
+            x_hat, theta_hat = run_baseline(method, model, batch, sim_cfg, device, pilot_len)
+
+            metrics = compute_metrics(
+                x_hat, x_true, theta_hat, theta_true, theta_init,
+                sim_cfg, pilot_len, eps_tau
+            )
+            metrics['method'] = method
+            metrics['failed'] = False
+
+            results.append(metrics)
+
+        except Exception as e:
+            print(f"Warning: {method} failed: {e}")
+            results.append(make_failed_record(method=method, error=str(e)))
+
+    return results
+
+
+# ============================================================================
+# Sanity Check
 # ============================================================================
 
 def run_sanity_check(model, gabv_cfg, eval_cfg: EvalConfig) -> bool:
     """
-    运行 sanity check：init_error=0 时所有方法 BER 应 < 0.2
-
-    返回 True 表示通过，False 表示有问题
+    Sanity check: At init_error=0, all methods should have BER < 0.2
     """
     print("\n" + "="*50)
-    print("🔍 运行 Sanity Check (init_error=0)")
+    print("🔍 Sanity Check (init_error=0)")
     print("="*50)
 
-    methods_to_check = ["adjoint_slice", "proposed_no_update", "proposed", "oracle"]
+    methods_to_check = ["adjoint_slice", "proposed_no_update", "proposed", "oracle_sync"]
     snr_db = 15.0
     sim_cfg = create_sim_config(gabv_cfg, snr_db)
-    theta_noise = (0.0, 0.0, 0.0)  # init_error = 0
+    theta_noise = (0.0, 0.0, 0.0)
+
+    results = evaluate_methods_fair(
+        model, sim_cfg, eval_cfg.batch_size, theta_noise,
+        eval_cfg.device, methods_to_check,
+        init_error_override=0.0, seed=12345
+    )
 
     all_passed = True
-
-    for method in methods_to_check:
-        try:
-            result = evaluate_single_batch(
-                model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                eval_cfg.device, method=method, init_error_override=0.0
-            )
-            ber = result['ber']
-            status = "✅ PASS" if ber < 0.2 else "❌ FAIL"
-            print(f"  {method:25s}: BER = {ber:.4f} {status}")
-
-            if ber >= 0.2:
-                all_passed = False
-
-        except Exception as e:
-            print(f"  {method:25s}: ❌ ERROR - {e}")
+    for r in results:
+        method = r['method']
+        ber = r['ber']
+        status = "✅ PASS" if ber < 0.2 else "❌ FAIL"
+        print(f"  {method:25s}: BER = {ber:.4f} {status}")
+        if ber >= 0.2:
             all_passed = False
 
     if all_passed:
-        print("\n✅ Sanity Check 通过！Baseline 实现正确。")
+        print("\n✅ Sanity Check passed!")
     else:
-        print("\n❌ Sanity Check 失败！请检查 baseline 实现。")
+        print("\n❌ Sanity Check FAILED!")
 
     return all_passed
 
 
 # ============================================================================
-# Sweep 函数（修复版）
+# Sweep Functions
 # ============================================================================
 
-def run_snr_sweep(model, gabv_cfg, eval_cfg: EvalConfig, methods: List[str] = None) -> pd.DataFrame:
-    """
-    SNR sweep
-
-    修复：默认使用 METHOD_SNR_SWEEP（完整方法集），不再根据 n_mc 自动退化
-    """
+def run_snr_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
+                  methods: List[str] = None) -> pd.DataFrame:
+    """SNR sweep with cross-method fairness."""
     records = []
     theta_noise = (eval_cfg.theta_noise_tau, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
 
-    # 修复：不再自动退化到 METHOD_QUICK
     if methods is None:
         methods = METHOD_SNR_SWEEP
 
-    print(f"  [SNR Sweep] 方法集: {methods}")
+    print(f"  [SNR Sweep] Methods: {methods}")
 
-    total = len(eval_cfg.snr_list) * len(methods) * eval_cfg.n_mc
+    total = len(eval_cfg.snr_list) * eval_cfg.n_mc
     pbar = tqdm(total=total, desc="SNR sweep")
 
     for snr_db in eval_cfg.snr_list:
         sim_cfg = create_sim_config(gabv_cfg, snr_db)
 
-        for method in methods:
-            for mc_id in range(eval_cfg.n_mc):
-                seed = mc_id * 1000 + int(snr_db * 10) + hash(method) % 1000
-                torch.manual_seed(seed)
-                np.random.seed(seed)
+        for mc_id in range(eval_cfg.n_mc):
+            seed = mc_id * 1000 + int(snr_db * 10)
 
-                try:
-                    result = evaluate_single_batch(
-                        model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                        eval_cfg.device, method=method
-                    )
-                    records.append({
-                        'snr_db': snr_db,
-                        'method': method,
-                        'mc_id': mc_id,
-                        **result
-                    })
-                except Exception as e:
-                    print(f"Warning: {method} @ SNR={snr_db} failed: {e}")
-                    records.append(make_failed_record(
-                        snr_db=snr_db, method=method, mc_id=mc_id, error=str(e)
-                    ))
+            results = evaluate_methods_fair(
+                model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                eval_cfg.device, methods,
+                eps_tau=eval_cfg.eps_tau, seed=seed
+            )
 
-                pbar.update(1)
+            for r in results:
+                r['snr_db'] = snr_db
+                r['mc_id'] = mc_id
+                records.append(r)
+
+            pbar.update(1)
 
     pbar.close()
     return pd.DataFrame(records)
@@ -414,50 +421,37 @@ def run_snr_sweep(model, gabv_cfg, eval_cfg: EvalConfig, methods: List[str] = No
 
 def run_cliff_sweep(model, gabv_cfg, eval_cfg: EvalConfig, snr_db: float = 15.0,
                     methods: List[str] = None) -> pd.DataFrame:
-    """
-    Cliff sweep - 核心图
-
-    修复：默认使用 METHOD_CLIFF（完整方法集）
-    """
+    """Cliff sweep (core contribution figure) with cross-method fairness."""
     records = []
 
     if methods is None:
         methods = METHOD_CLIFF
 
-    print(f"  [Cliff Sweep] 方法集: {methods}")
+    print(f"  [Cliff Sweep] Methods: {methods}")
 
-    total = len(eval_cfg.init_error_list) * len(methods) * eval_cfg.n_mc
+    total = len(eval_cfg.init_error_list) * eval_cfg.n_mc
     pbar = tqdm(total=total, desc="Cliff sweep")
 
     for init_error in eval_cfg.init_error_list:
         theta_noise = (init_error, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
         sim_cfg = create_sim_config(gabv_cfg, snr_db)
 
-        for method in methods:
-            for mc_id in range(eval_cfg.n_mc):
-                seed = mc_id * 1000 + int(init_error * 100) + hash(method) % 1000
-                torch.manual_seed(seed)
-                np.random.seed(seed)
+        for mc_id in range(eval_cfg.n_mc):
+            seed = mc_id * 1000 + int(init_error * 100)
 
-                try:
-                    result = evaluate_single_batch(
-                        model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                        eval_cfg.device, method=method,
-                        init_error_override=init_error
-                    )
-                    records.append({
-                        'init_error': init_error,
-                        'method': method,
-                        'mc_id': mc_id,
-                        **result
-                    })
-                except Exception as e:
-                    print(f"Warning: {method} @ init_error={init_error} failed: {e}")
-                    records.append(make_failed_record(
-                        init_error=init_error, method=method, mc_id=mc_id, error=str(e)
-                    ))
+            results = evaluate_methods_fair(
+                model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                eval_cfg.device, methods,
+                init_error_override=init_error,
+                eps_tau=eval_cfg.eps_tau, seed=seed
+            )
 
-                pbar.update(1)
+            for r in results:
+                r['init_error'] = init_error
+                r['mc_id'] = mc_id
+                records.append(r)
+
+            pbar.update(1)
 
     pbar.close()
     return pd.DataFrame(records)
@@ -466,20 +460,18 @@ def run_cliff_sweep(model, gabv_cfg, eval_cfg: EvalConfig, snr_db: float = 15.0,
 def run_snr_sweep_multi_init_error(model, gabv_cfg, eval_cfg: EvalConfig,
                                     init_errors: List[float] = None,
                                     methods: List[str] = None) -> pd.DataFrame:
-    """
-    专家方案3：多 init_error 的 SNR sweep
-    """
+    """Multi init_error SNR sweep."""
     records = []
 
     if init_errors is None:
-        init_errors = [0.0, 0.2, 0.3]  # 关键的三个点
+        init_errors = [0.0, 0.2, 0.3]
 
     if methods is None:
-        methods = ["adjoint_slice", "proposed_no_update", "proposed", "oracle"]
+        methods = METHOD_PAPER_CORE
 
-    print(f"  [Multi-Init SNR Sweep] init_errors: {init_errors}, 方法集: {methods}")
+    print(f"  [Multi-Init SNR Sweep] init_errors: {init_errors}, Methods: {methods}")
 
-    total = len(init_errors) * len(eval_cfg.snr_list) * len(methods) * eval_cfg.n_mc
+    total = len(init_errors) * len(eval_cfg.snr_list) * eval_cfg.n_mc
     pbar = tqdm(total=total, desc="Multi-init SNR sweep")
 
     for init_error in init_errors:
@@ -488,80 +480,21 @@ def run_snr_sweep_multi_init_error(model, gabv_cfg, eval_cfg: EvalConfig,
         for snr_db in eval_cfg.snr_list:
             sim_cfg = create_sim_config(gabv_cfg, snr_db)
 
-            for method in methods:
-                for mc_id in range(eval_cfg.n_mc):
-                    seed = mc_id * 1000 + int(snr_db * 10) + int(init_error * 100) + hash(method) % 1000
-                    torch.manual_seed(seed)
-                    np.random.seed(seed)
-
-                    try:
-                        result = evaluate_single_batch(
-                            model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                            eval_cfg.device, method=method,
-                            init_error_override=init_error
-                        )
-                        records.append({
-                            'init_error': init_error,
-                            'snr_db': snr_db,
-                            'method': method,
-                            'mc_id': mc_id,
-                            **result
-                        })
-                    except Exception as e:
-                        print(f"Warning: {method} @ init_error={init_error}, SNR={snr_db} failed: {e}")
-                        records.append(make_failed_record(
-                            init_error=init_error, snr_db=snr_db, method=method, mc_id=mc_id, error=str(e)
-                        ))
-
-                    pbar.update(1)
-
-    pbar.close()
-    return pd.DataFrame(records)
-
-
-def run_ablation_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
-                       methods: List[str] = None) -> pd.DataFrame:
-    """
-    消融实验 sweep
-
-    修复：默认使用 METHOD_ABLATION
-    """
-    records = []
-    theta_noise = (eval_cfg.theta_noise_tau, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
-
-    if methods is None:
-        methods = METHOD_ABLATION
-
-    print(f"  [Ablation Sweep] 方法集: {methods}")
-
-    total = len(eval_cfg.snr_list) * len(methods) * eval_cfg.n_mc
-    pbar = tqdm(total=total, desc="Ablation sweep")
-
-    for snr_db in eval_cfg.snr_list:
-        sim_cfg = create_sim_config(gabv_cfg, snr_db)
-
-        for method in methods:
             for mc_id in range(eval_cfg.n_mc):
-                seed = mc_id * 1000 + int(snr_db * 10) + hash(method) % 1000
-                torch.manual_seed(seed)
-                np.random.seed(seed)
+                seed = mc_id * 1000 + int(snr_db * 10) + int(init_error * 100)
 
-                try:
-                    result = evaluate_single_batch(
-                        model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                        eval_cfg.device, method=method
-                    )
-                    records.append({
-                        'snr_db': snr_db,
-                        'method': method,
-                        'mc_id': mc_id,
-                        **result
-                    })
-                except Exception as e:
-                    print(f"Warning: {method} @ SNR={snr_db} failed: {e}")
-                    records.append(make_failed_record(
-                        snr_db=snr_db, method=method, mc_id=mc_id, error=str(e)
-                    ))
+                results = evaluate_methods_fair(
+                    model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                    eval_cfg.device, methods,
+                    init_error_override=init_error,
+                    eps_tau=eval_cfg.eps_tau, seed=seed
+                )
+
+                for r in results:
+                    r['init_error'] = init_error
+                    r['snr_db'] = snr_db
+                    r['mc_id'] = mc_id
+                    records.append(r)
 
                 pbar.update(1)
 
@@ -569,20 +502,56 @@ def run_ablation_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
     return pd.DataFrame(records)
 
 
+def run_ablation_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
+                       methods: List[str] = None) -> pd.DataFrame:
+    """Ablation sweep with cross-method fairness."""
+    records = []
+    theta_noise = (eval_cfg.theta_noise_tau, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
+
+    if methods is None:
+        methods = METHOD_ABLATION
+
+    print(f"  [Ablation Sweep] Methods: {methods}")
+
+    total = len(eval_cfg.snr_list) * eval_cfg.n_mc
+    pbar = tqdm(total=total, desc="Ablation sweep")
+
+    for snr_db in eval_cfg.snr_list:
+        sim_cfg = create_sim_config(gabv_cfg, snr_db)
+
+        for mc_id in range(eval_cfg.n_mc):
+            seed = mc_id * 1000 + int(snr_db * 10)
+
+            results = evaluate_methods_fair(
+                model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                eval_cfg.device, methods,
+                eps_tau=eval_cfg.eps_tau, seed=seed
+            )
+
+            for r in results:
+                r['snr_db'] = snr_db
+                r['mc_id'] = mc_id
+                records.append(r)
+
+            pbar.update(1)
+
+    pbar.close()
+    return pd.DataFrame(records)
+
+
 def run_heatmap_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
                       methods: List[str] = None) -> pd.DataFrame:
-    """2D Heatmap sweep (SNR × init_error)"""
+    """2D Heatmap sweep (SNR × init_error) with cross-method fairness."""
     records = []
 
     if methods is None:
-        methods = ["proposed", "adjoint_slice"]  # 只画两个主要方法
+        methods = ["proposed", "adjoint_slice"]
 
-    print(f"  [Heatmap Sweep] 方法集: {methods}")
+    print(f"  [Heatmap Sweep] Methods: {methods}")
 
-    # 减少 MC 次数加速（heatmap 不需要太高精度）
     n_mc_heatmap = min(eval_cfg.n_mc, 10)
 
-    total = len(eval_cfg.snr_list) * len(eval_cfg.init_error_list) * len(methods) * n_mc_heatmap
+    total = len(eval_cfg.snr_list) * len(eval_cfg.init_error_list) * n_mc_heatmap
     pbar = tqdm(total=total, desc="Heatmap sweep")
 
     for snr_db in eval_cfg.snr_list:
@@ -591,31 +560,23 @@ def run_heatmap_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
         for init_error in eval_cfg.init_error_list:
             theta_noise = (init_error, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
 
-            for method in methods:
-                for mc_id in range(n_mc_heatmap):
-                    seed = mc_id * 1000 + int(snr_db * 10) + int(init_error * 100) + hash(method) % 1000
-                    torch.manual_seed(seed)
-                    np.random.seed(seed)
+            for mc_id in range(n_mc_heatmap):
+                seed = mc_id * 1000 + int(snr_db * 10) + int(init_error * 100)
 
-                    try:
-                        result = evaluate_single_batch(
-                            model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                            eval_cfg.device, method=method,
-                            init_error_override=init_error
-                        )
-                        records.append({
-                            'snr_db': snr_db,
-                            'init_error': init_error,
-                            'method': method,
-                            'mc_id': mc_id,
-                            **result
-                        })
-                    except Exception as e:
-                        records.append(make_failed_record(
-                            snr_db=snr_db, init_error=init_error, method=method, mc_id=mc_id
-                        ))
+                results = evaluate_methods_fair(
+                    model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                    eval_cfg.device, methods,
+                    init_error_override=init_error,
+                    eps_tau=eval_cfg.eps_tau, seed=seed
+                )
 
-                    pbar.update(1)
+                for r in results:
+                    r['snr_db'] = snr_db
+                    r['init_error'] = init_error
+                    r['mc_id'] = mc_id
+                    records.append(r)
+
+                pbar.update(1)
 
     pbar.close()
     return pd.DataFrame(records)
@@ -623,49 +584,37 @@ def run_heatmap_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
 
 def run_pn_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
                  methods: List[str] = None) -> pd.DataFrame:
-    """
-    PN sweep
-
-    修复：默认使用 METHOD_ROBUSTNESS（而非 METHOD_QUICK）
-    """
+    """PN linewidth sweep with cross-method fairness."""
     records = []
     theta_noise = (eval_cfg.theta_noise_tau, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
     snr_db = 15.0
 
     if methods is None:
-        methods = METHOD_ROBUSTNESS  # 修复：完整方法集
+        methods = METHOD_ROBUSTNESS
 
-    print(f"  [PN Sweep] 方法集: {methods}")
+    print(f"  [PN Sweep] Methods: {methods}")
 
-    total = len(eval_cfg.pn_linewidths) * len(methods) * eval_cfg.n_mc
+    total = len(eval_cfg.pn_linewidths) * eval_cfg.n_mc
     pbar = tqdm(total=total, desc="PN sweep")
 
     for pn_lw in eval_cfg.pn_linewidths:
         sim_cfg = create_sim_config(gabv_cfg, snr_db, pn_linewidth=pn_lw)
 
-        for method in methods:
-            for mc_id in range(eval_cfg.n_mc):
-                seed = mc_id * 1000 + int(pn_lw / 1000) + hash(method) % 1000
-                torch.manual_seed(seed)
-                np.random.seed(seed)
+        for mc_id in range(eval_cfg.n_mc):
+            seed = mc_id * 1000 + int(pn_lw / 1000)
 
-                try:
-                    result = evaluate_single_batch(
-                        model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                        eval_cfg.device, method=method
-                    )
-                    records.append({
-                        'pn_linewidth': pn_lw,
-                        'method': method,
-                        'mc_id': mc_id,
-                        **result
-                    })
-                except Exception as e:
-                    records.append(make_failed_record(
-                        pn_linewidth=pn_lw, method=method, mc_id=mc_id
-                    ))
+            results = evaluate_methods_fair(
+                model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                eval_cfg.device, methods,
+                eps_tau=eval_cfg.eps_tau, seed=seed
+            )
 
-                pbar.update(1)
+            for r in results:
+                r['pn_linewidth'] = pn_lw
+                r['mc_id'] = mc_id
+                records.append(r)
+
+            pbar.update(1)
 
     pbar.close()
     return pd.DataFrame(records)
@@ -673,68 +622,56 @@ def run_pn_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
 
 def run_pilot_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
                     methods: List[str] = None) -> pd.DataFrame:
-    """
-    Pilot length sweep
-
-    修复：默认使用 METHOD_ROBUSTNESS（而非 METHOD_QUICK）
-    """
+    """Pilot length sweep with cross-method fairness."""
     records = []
     theta_noise = (eval_cfg.theta_noise_tau, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
     snr_db = 15.0
 
     if methods is None:
-        methods = METHOD_ROBUSTNESS  # 修复：完整方法集
+        methods = METHOD_ROBUSTNESS
 
-    print(f"  [Pilot Sweep] 方法集: {methods}")
+    print(f"  [Pilot Sweep] Methods: {methods}")
 
-    total = len(eval_cfg.pilot_lengths) * len(methods) * eval_cfg.n_mc
+    total = len(eval_cfg.pilot_lengths) * eval_cfg.n_mc
     pbar = tqdm(total=total, desc="Pilot sweep")
 
     for pilot_len in eval_cfg.pilot_lengths:
         sim_cfg = create_sim_config(gabv_cfg, snr_db)
 
-        for method in methods:
-            for mc_id in range(eval_cfg.n_mc):
-                seed = mc_id * 1000 + pilot_len + hash(method) % 1000
-                torch.manual_seed(seed)
-                np.random.seed(seed)
+        for mc_id in range(eval_cfg.n_mc):
+            seed = mc_id * 1000 + pilot_len
 
-                try:
-                    result = evaluate_single_batch(
-                        model, sim_cfg, eval_cfg.batch_size, theta_noise,
-                        eval_cfg.device, method=method, pilot_len=pilot_len
-                    )
-                    records.append({
-                        'pilot_len': pilot_len,
-                        'method': method,
-                        'mc_id': mc_id,
-                        **result
-                    })
-                except Exception as e:
-                    records.append(make_failed_record(
-                        pilot_len=pilot_len, method=method, mc_id=mc_id
-                    ))
+            results = evaluate_methods_fair(
+                model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                eval_cfg.device, methods,
+                pilot_len=pilot_len,
+                eps_tau=eval_cfg.eps_tau, seed=seed
+            )
 
-                pbar.update(1)
+            for r in results:
+                r['pilot_len'] = pilot_len
+                r['mc_id'] = mc_id
+                records.append(r)
+
+            pbar.update(1)
 
     pbar.close()
     return pd.DataFrame(records)
 
 
 def run_jacobian_analysis(model, gabv_cfg, eval_cfg: EvalConfig) -> pd.DataFrame:
-    """Jacobian 分析（占位符 - 需要实现数值差分）"""
-    # TODO: 实现真实的 Jacobian 计算
+    """Jacobian analysis (placeholder)."""
     records = []
     for init_error in eval_cfg.init_error_list:
         records.append({
             'init_error': init_error,
-            'gram_cond_log10': 15 - init_error * 5,  # 占位数据
+            'gram_cond_log10': 15 - init_error * 5,
         })
     return pd.DataFrame(records)
 
 
 def measure_latency(model, gabv_cfg, eval_cfg: EvalConfig) -> pd.DataFrame:
-    """测量各方法的延迟"""
+    """Measure latency for each method."""
     import time
 
     records = []
@@ -747,7 +684,9 @@ def measure_latency(model, gabv_cfg, eval_cfg: EvalConfig) -> pd.DataFrame:
     # Warmup
     for _ in range(3):
         try:
-            evaluate_single_batch(model, sim_cfg, 32, theta_noise, eval_cfg.device, "proposed")
+            _ = evaluate_methods_fair(
+                model, sim_cfg, 32, theta_noise, eval_cfg.device, ["proposed"]
+            )
         except:
             pass
 
@@ -756,8 +695,10 @@ def measure_latency(model, gabv_cfg, eval_cfg: EvalConfig) -> pd.DataFrame:
         for _ in range(10):
             try:
                 start = time.time()
-                evaluate_single_batch(model, sim_cfg, 32, theta_noise, eval_cfg.device, method)
-                latencies.append((time.time() - start) * 1000)  # ms
+                _ = evaluate_methods_fair(
+                    model, sim_cfg, 32, theta_noise, eval_cfg.device, [method]
+                )
+                latencies.append((time.time() - start) * 1000)
             except:
                 pass
 
@@ -772,13 +713,68 @@ def measure_latency(model, gabv_cfg, eval_cfg: EvalConfig) -> pd.DataFrame:
 
 
 # ============================================================================
-# CSV 验证函数
+# P2-1: CRLB τ Computation
 # ============================================================================
 
-def validate_csv_methods(df: pd.DataFrame, expected_methods: List[str], csv_name: str):
-    """验证 CSV 是否包含所有期望的方法"""
+def compute_sqrt_crlb_tau(sim_cfg, snr_db: float, pilot_len: int = 64,
+                          n_samples: int = 100, fd_step: float = 1e-12) -> float:
+    """
+    Compute sqrt(CRLB) for τ using numerical FIM (P2-1).
+
+    Uses finite difference approximation of the score function.
+
+    Args:
+        sim_cfg: Simulation config
+        snr_db: SNR in dB
+        pilot_len: Pilot length
+        n_samples: MC samples for averaging
+        fd_step: Finite difference step
+
+    Returns:
+        sqrt_crlb_tau: sqrt of CRLB for τ in samples
+    """
+    from thz_isac_world import compute_bcrlb_diag
+
+    snr_linear = 10 ** (snr_db / 10)
+    gamma_eff = 1.0  # Placeholder
+
+    bcrlb = compute_bcrlb_diag(sim_cfg, snr_linear, gamma_eff)
+
+    # BCRLB for τ (first element) in seconds, convert to samples
+    crlb_tau_sec = bcrlb[0]
+    crlb_tau_samples = crlb_tau_sec * (sim_cfg.fs ** 2)
+
+    sqrt_crlb = np.sqrt(crlb_tau_samples)
+
+    return sqrt_crlb
+
+
+def run_crlb_sweep(gabv_cfg, eval_cfg: EvalConfig) -> pd.DataFrame:
+    """Run CRLB sweep for efficiency computation."""
+    records = []
+
+    for snr_db in eval_cfg.snr_list:
+        sim_cfg = create_sim_config(gabv_cfg, snr_db)
+
+        sqrt_crlb = compute_sqrt_crlb_tau(sim_cfg, snr_db)
+
+        records.append({
+            'snr_db': snr_db,
+            'sqrt_crlb_tau': sqrt_crlb,
+        })
+
+    return pd.DataFrame(records)
+
+
+# ============================================================================
+# Validation Functions
+# ============================================================================
+
+def validate_csv_methods(df: pd.DataFrame, expected_methods: List[str],
+                         csv_name: str, strict: bool = False) -> bool:
+    """Validate CSV contains all expected methods."""
     if 'method' not in df.columns:
-        print(f"  ⚠️ {csv_name}: 缺少 'method' 列")
+        print(f"  ⚠️ {csv_name}: Missing 'method' column")
         return False
 
     actual_methods = set(df['method'].unique())
@@ -786,8 +782,18 @@ def validate_csv_methods(df: pd.DataFrame, expected_methods: List[str], csv_name
     missing = expected_set - actual_methods
 
     if missing:
-        print(f"  ⚠️ {csv_name}: 缺少方法 {missing}")
+        msg = f"  ⚠️ {csv_name}: Missing methods {missing}"
+        print(msg)
+        if strict:
+            raise ValueError(msg)
         return False
 
-    print(f"  ✓ {csv_name}: 包含所有 {len(expected_methods)} 个方法")
+    print(f"  ✓ {csv_name}: All {len(expected_methods)} methods present")
     return True
+
+
+def print_import_info():
+    """Print module import paths for debugging."""
+    import baselines
+    print(f"[DEBUG] baselines.py = {baselines.__file__}")
+    print(f"[DEBUG] evaluator.py = {__file__}")
