@@ -649,6 +649,67 @@ def run_ablation_sweep(model, gabv_cfg, eval_cfg: EvalConfig, snr_db: float = 15
     pbar.close()
     return pd.DataFrame(records)
 
+
+def run_heatmap_sweep(model, gabv_cfg, eval_cfg: EvalConfig,
+                      methods: List[str] = None) -> pd.DataFrame:
+    """
+    2D Heatmap sweep: SNR × init_error
+
+    专家建议：展示在不同 SNR 和 init_error 组合下的性能变化
+    """
+    records = []
+
+    if methods is None:
+        methods = ["proposed", "adjoint_slice"]  # Heatmap 只画关键对比
+
+    snr_list = [0, 5, 10, 15, 20]
+    init_error_list = [0.0, 0.1, 0.2, 0.3, 0.5]
+
+    total = len(snr_list) * len(init_error_list) * len(methods) * eval_cfg.n_mc
+    pbar = tqdm(total=total, desc="Heatmap sweep")
+
+    for snr_db in snr_list:
+        sim_cfg = create_sim_config(gabv_cfg, snr_db)
+
+        for init_error in init_error_list:
+            theta_noise = (init_error, eval_cfg.theta_noise_v, eval_cfg.theta_noise_a)
+
+            for method in methods:
+                for mc_id in range(eval_cfg.n_mc):
+                    seed = mc_id * 1000 + int(snr_db * 10) + int(init_error * 100) + hash(method) % 1000
+                    torch.manual_seed(seed)
+                    np.random.seed(seed)
+
+                    try:
+                        result = evaluate_single_batch(
+                            model, sim_cfg, eval_cfg.batch_size, theta_noise,
+                            eval_cfg.device, method=method,
+                            init_error_override=init_error
+                        )
+                        records.append({
+                            'snr_db': snr_db,
+                            'init_error': init_error,
+                            'method': method,
+                            'mc_id': mc_id,
+                            **result
+                        })
+                    except Exception as e:
+                        print(f"Warning: {method} @ SNR={snr_db}, init={init_error} failed: {e}")
+                        records.append({
+                            'snr_db': snr_db,
+                            'init_error': init_error,
+                            'method': method,
+                            'mc_id': mc_id,
+                            'ber': 0.5,
+                            'rmse_tau_final': init_error,
+                            'success_rate': 0.0,
+                        })
+
+                    pbar.update(1)
+
+    pbar.close()
+    return pd.DataFrame(records)
+
     return pd.DataFrame(records)
 
 

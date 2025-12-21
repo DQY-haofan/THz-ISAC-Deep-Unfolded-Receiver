@@ -33,6 +33,7 @@ from evaluator import (
     run_cliff_sweep,
     run_snr_sweep_multi_init_error,
     run_ablation_sweep,
+    run_heatmap_sweep,
     run_pn_sweep,
     run_pilot_sweep,
     run_jacobian_analysis,
@@ -114,22 +115,27 @@ def run_data_collection(args):
     df_snr_multi.to_csv(f"{args.out_dir}/data_snr_multi_init_error.csv", index=False)
     print(f"      Saved: data_snr_multi_init_error.csv ({len(df_snr_multi)} records)")
 
-    print("\n[4/7] Ablation sweep - 方案2...")
+    print("\n[4/8] Ablation sweep - 方案2...")
     df_ablation = run_ablation_sweep(model, gabv_cfg, eval_cfg)
     df_ablation.to_csv(f"{args.out_dir}/data_ablation_sweep.csv", index=False)
     print(f"      Saved: data_ablation_sweep.csv ({len(df_ablation)} records)")
 
-    print("\n[5/7] PN sweep...")
+    print("\n[5/8] Heatmap sweep (2D: SNR × init_error)...")
+    df_heatmap = run_heatmap_sweep(model, gabv_cfg, eval_cfg)
+    df_heatmap.to_csv(f"{args.out_dir}/data_heatmap_sweep.csv", index=False)
+    print(f"      Saved: data_heatmap_sweep.csv ({len(df_heatmap)} records)")
+
+    print("\n[6/8] PN sweep...")
     df_pn = run_pn_sweep(model, gabv_cfg, eval_cfg)
     df_pn.to_csv(f"{args.out_dir}/data_pn_sweep.csv", index=False)
     print(f"      Saved: data_pn_sweep.csv ({len(df_pn)} records)")
 
-    print("\n[6/7] Pilot sweep...")
+    print("\n[7/8] Pilot sweep...")
     df_pilot = run_pilot_sweep(model, gabv_cfg, eval_cfg)
     df_pilot.to_csv(f"{args.out_dir}/data_pilot_sweep.csv", index=False)
     print(f"      Saved: data_pilot_sweep.csv ({len(df_pilot)} records)")
 
-    print("\n[7/7] Jacobian analysis & Latency...")
+    print("\n[8/8] Jacobian analysis & Latency...")
     df_jacobian = run_jacobian_analysis(model, gabv_cfg, eval_cfg)
     df_jacobian.to_csv(f"{args.out_dir}/data_jacobian.csv", index=False)
 
