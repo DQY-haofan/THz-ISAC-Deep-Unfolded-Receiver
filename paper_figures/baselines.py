@@ -120,7 +120,7 @@ class BaselineMatchedFilter:
         Ts = 1.0 / sim_cfg.fs
 
         # τ grid search range: ±2.0 samples (41 points)
-        tau_grid_samples = torch.linspace(-2.0, 2.0, 41, device=device)
+        tau_grid_samples = torch.linspace(-0.5, 0.5, 11, device=device)
 
         best_corr = None
         best_tau = theta_init[:, 0:1].clone()

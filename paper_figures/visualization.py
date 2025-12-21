@@ -1,18 +1,14 @@
 """
-visualization.py - Journal-Quality Figures (Expert v2.0 - Top Journal Ready)
+visualization.py - 纯绘图函数
 
-Expert Requirements Implemented:
-- NO TITLES on figures (use axis labels only)
-- P1-2: Pull-in range auto-computation and visualization
-- P1-3: Gap-to-oracle figure
-- P1-4: Basin map (SNR × init_error) with success rate
-- IEEE-style formatting
+负责：
+- 从 CSV 读取数据
+- 生成论文级图表
 
-Key Changes:
-1. All ax.set_title() calls removed or made optional
-2. compute_pull_in_range() function added
-3. fig_basin_map() for 2D success rate visualization
-4. fig_gap_to_oracle() with proper oracle_sync naming
+不负责：
+- 模型加载
+- 数据采集
+- 算法实现
 """
 
 import os
@@ -20,151 +16,103 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-
-# ============================================================================
-# IEEE Journal Style Configuration
-# ============================================================================
-
+# 设置 Matplotlib
 plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif'],
-    'font.size': 11,
-    'axes.labelsize': 12,
-    'axes.titlesize': 12,
-    'legend.fontsize': 9,
-    'xtick.labelsize': 10,
-    'ytick.labelsize': 10,
-    'figure.figsize': (8, 5),
+    'font.size': 12,
+    'axes.labelsize': 14,
+    'axes.titlesize': 14,
+    'legend.fontsize': 10,
+    'figure.figsize': (10, 6),
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
     'lines.linewidth': 2,
-    'lines.markersize': 7,
-    'axes.grid': True,
-    'grid.alpha': 0.3,
-    'axes.linewidth': 1.2,
-    'mathtext.fontset': 'stix',
+    'lines.markersize': 8,
 })
 
 
 # ============================================================================
-# Method Style Configuration (Narrative-Aligned)
+# 方法配置
 # ============================================================================
 
-METHOD_CONFIG = {
-    "naive_slice": {
-        "label": "Naive Slice",
-        "color": "#7f7f7f",
-        "marker": "v",
-        "ls": ":",
-        "lw": 1.5,
-        "alpha": 0.6
-    },
-    "matched_filter": {
-        "label": "Matched Filter (41×)",
-        "color": "#d62728",
-        "marker": "X",
-        "ls": "--",
-        "lw": 1.8,
-        "alpha": 0.5
-    },
-    "adjoint_lmmse": {
-        "label": "Adjoint+LMMSE",
-        "color": "#ff7f0e",
-        "marker": "P",
-        "ls": "-.",
-        "lw": 2.0,
-        "alpha": 0.8
-    },
-    "adjoint_slice": {
-        "label": "Adjoint+Slice",
-        "color": "#9467bd",
-        "marker": "d",
-        "ls": ":",
-        "lw": 2.0,
-        "alpha": 0.8
-    },
-    "proposed_no_update": {
-        "label": r"w/o $\tau$ update",
-        "color": "#8c564b",
-        "marker": "s",
-        "ls": "-",
-        "lw": 2.0,
-        "alpha": 0.9
-    },
-    "proposed_tau_slice": {
-        "label": r"Proposed ($\tau$)+Slice",
-        "color": "#17becf",
-        "marker": "p",
-        "ls": "-.",
-        "lw": 2.0,
-        "alpha": 0.9
-    },
-    "proposed": {
-        "label": "Proposed (GA-BV-Net)",
-        "color": "#1f77b4",
-        "marker": "o",
-        "ls": "-",
-        "lw": 2.8,
-        "alpha": 1.0
-    },
-    "oracle_sync": {
-        "label": r"Oracle (true $\theta$)",
-        "color": "#2ca02c",
-        "marker": "^",
-        "ls": "-",
-        "lw": 2.5,
-        "alpha": 1.0
-    },
-    "oracle": {
-        "label": r"Oracle (true $\theta$)",
-        "color": "#2ca02c",
-        "marker": "^",
-        "ls": "-",
-        "lw": 2.5,
-        "alpha": 1.0
-    },
-    "random_init": {
-        "label": "Random Init",
-        "color": "black",
-        "marker": "*",
-        "ls": ":",
-        "lw": 1.5,
-        "alpha": 0.5
-    },
+METHOD_NAMES = {
+    "naive_slice": "Naive Slice",
+    "matched_filter": "Matched Filter",
+    "adjoint_lmmse": "Adjoint+LMMSE",  # 补强(B)
+    "adjoint_slice": "Adjoint+Slice",
+    "proposed_no_update": "w/o τ update",
+    "proposed_tau_slice": "Proposed (τ)+Slice",  # 消融：验证VAMP价值
+    "proposed": "Proposed (GA-BV-Net)",
+    "oracle": "Oracle θ",
+    "random_init": "Random Init",
+}
+
+METHOD_COLORS = {
+    "naive_slice": "C7",       # 灰
+    "matched_filter": "C3",    # 红
+    "adjoint_lmmse": "C6",     # 粉（补强B）
+    "adjoint_slice": "C4",     # 紫
+    "proposed_no_update": "C5",# 棕
+    "proposed_tau_slice": "C8",# 浅绿
+    "proposed": "C0",          # 蓝
+    "oracle": "C2",            # 绿
+    "random_init": "C9",       # 青
+}
+
+METHOD_MARKERS = {
+    "naive_slice": "v",
+    "matched_filter": "x",
+    "adjoint_lmmse": "+",
+    "adjoint_slice": "d",
+    "proposed_no_update": "s",
+    "proposed_tau_slice": "p",
+    "proposed": "o",
+    "oracle": "^",
+    "random_init": "*",
+}
+
+METHOD_LINESTYLES = {
+    "naive_slice": ":",
+    "matched_filter": "--",
+    "adjoint_lmmse": "-.",
+    "adjoint_slice": ":",
+    "proposed_no_update": "-",
+    "proposed_tau_slice": "-.",
+    "proposed": "-",
+    "oracle": "-",
+    "random_init": ":",
 }
 
 
-def get_style(method: str) -> dict:
-    """Get plotting style for method."""
-    return METHOD_CONFIG.get(method, {
-        "label": method, "color": "black", "marker": "o",
-        "ls": "-", "lw": 2.0, "alpha": 1.0
-    })
-
-
 # ============================================================================
-# Helper Functions
+# 辅助函数
 # ============================================================================
 
-def aggregate(df: pd.DataFrame, group_cols: List[str],
-              value_cols: List[str]) -> pd.DataFrame:
-    """Aggregate data with mean, std, and 95% CI."""
-    agg_funcs = {col: ['mean', 'std', 'count'] for col in value_cols}
+def aggregate(df: pd.DataFrame, group_cols: List[str], value_cols: List[str]) -> pd.DataFrame:
+    """聚合数据，计算均值、标准差和 95% 置信区间"""
+    agg_funcs = {}
+    for col in value_cols:
+        agg_funcs[col] = ['mean', 'std', 'count']
+
     agg = df.groupby(group_cols).agg(agg_funcs).reset_index()
     agg.columns = ['_'.join(col).strip('_') for col in agg.columns]
 
+    # 计算 95% CI
     for col in value_cols:
-        mean, std, count = f'{col}_mean', f'{col}_std', f'{col}_count'
-        if all(c in agg.columns for c in [mean, std, count]):
-            agg[f'{col}_ci95'] = 1.96 * agg[std] / np.sqrt(agg[count].clip(lower=1))
+        mean_col = f'{col}_mean'
+        std_col = f'{col}_std'
+        count_col = f'{col}_count'
+        ci_col = f'{col}_ci95'
+
+        if mean_col in agg.columns and std_col in agg.columns:
+            agg[ci_col] = 1.96 * agg[std_col] / np.sqrt(agg[count_col].clip(lower=1))
 
     return agg
 
 
 def load_data(data_dir: str) -> Dict[str, pd.DataFrame]:
-    """Load all CSV data files."""
+    """加载所有 CSV 数据"""
     data = {}
     csv_files = [
         'data_snr_sweep.csv',
@@ -176,7 +124,6 @@ def load_data(data_dir: str) -> Dict[str, pd.DataFrame]:
         'data_pilot_sweep.csv',
         'data_jacobian.csv',
         'data_latency.csv',
-        'data_crlb_sweep.csv',
     ]
 
     for f in csv_files:
@@ -184,689 +131,767 @@ def load_data(data_dir: str) -> Dict[str, pd.DataFrame]:
         if os.path.exists(path):
             key = f.replace('data_', '').replace('.csv', '')
             data[key] = pd.read_csv(path)
-            n_methods = len(data[key]['method'].unique()) if 'method' in data[key].columns else 0
-            print(f"  ✓ {f}: {len(data[key])} rows, {n_methods} methods")
-        else:
-            print(f"  ⚠️ Not found: {f}")
+            print(f"  Loaded: {f}")
 
     return data
 
 
-def check_methods(df: pd.DataFrame, expected: List[str], fig_name: str) -> List[str]:
-    """Check and warn about missing methods."""
-    if 'method' not in df.columns:
-        print(f"  ⚠️ {fig_name}: Missing 'method' column")
-        return []
-
-    actual = set(df['method'].unique())
-    missing = set(expected) - actual
-
-    if missing:
-        print(f"  ⚠️ {fig_name}: Missing methods {missing}")
-
-    return [m for m in expected if m in actual]
-
-
 # ============================================================================
-# P1-2: Pull-in Range Computation
-# ============================================================================
-
-def compute_pull_in_range(df: pd.DataFrame, method: str,
-                          threshold: float = 0.95) -> float:
-    """
-    Compute pull-in range: max init_error where success_rate >= threshold.
-
-    Args:
-        df: DataFrame with 'init_error', 'method', 'success_rate' columns
-        method: Method name
-        threshold: Success rate threshold (default 95%)
-
-    Returns:
-        pull_in: Pull-in range in samples, or NaN if not computable
-    """
-    if 'init_error' not in df.columns or 'success_rate' not in df.columns:
-        return float('nan')
-
-    method_data = df[df['method'] == method]
-    if len(method_data) == 0:
-        return float('nan')
-
-    agg = method_data.groupby('init_error')['success_rate'].mean().reset_index()
-
-    # Find max init_error where success_rate >= threshold
-    passing = agg[agg['success_rate'] >= threshold]
-
-    if len(passing) == 0:
-        return 0.0
-
-    return passing['init_error'].max()
-
-
-def compute_summary_metrics(df: pd.DataFrame, methods: List[str]) -> pd.DataFrame:
-    """Compute summary metrics including pull-in range."""
-    records = []
-
-    for method in methods:
-        method_data = df[df['method'] == method]
-        if len(method_data) == 0:
-            continue
-
-        pull_in = compute_pull_in_range(df, method)
-
-        records.append({
-            'method': method,
-            'pull_in_range': pull_in,
-            'mean_ber': method_data['ber'].mean(),
-            'mean_rmse_tau': method_data['rmse_tau_final'].mean() if 'rmse_tau_final' in method_data.columns else float('nan'),
-            'mean_success_rate': method_data['success_rate'].mean() if 'success_rate' in method_data.columns else float('nan'),
-        })
-
-    return pd.DataFrame(records)
-
-
-# ============================================================================
-# Figure Functions (NO TITLES - Journal Style)
+# 绘图函数
 # ============================================================================
 
 def fig01_ber_vs_snr(df: pd.DataFrame, out_dir: str):
-    """Fig 1: BER vs SNR (no title, axes-only information)."""
+    """
+    Fig 1: BER vs SNR with SNR Gain annotation
+
+    专家1建议：添加 Hardware Wall 阴影（高 SNR 区域性能不再线性下降）
+    """
+
     fig, ax = plt.subplots(figsize=(10, 7))
+
     agg = aggregate(df, ['snr_db', 'method'], ['ber'])
 
-    expected = ["matched_filter", "adjoint_slice", "proposed_no_update", "proposed", "oracle_sync", "oracle"]
-    methods = check_methods(df, expected, "Fig 01")
+    # 按顺序绘制
+    plot_order = ["matched_filter", "adjoint_slice", "proposed_no_update", "proposed", "oracle"]
 
-    for method in methods:
+    for method in plot_order:
         data = agg[agg['method'] == method]
         if len(data) == 0:
             continue
 
-        s = get_style(method)
         snr = data['snr_db'].values
         mean = data['ber_mean'].values
         ci = data.get('ber_ci95', pd.Series([0]*len(data))).values
 
-        ax.semilogy(snr, mean, marker=s['marker'], color=s['color'],
-                    linestyle=s['ls'], label=s['label'],
-                    linewidth=s['lw'], alpha=s['alpha'], markersize=7)
-
+        ax.semilogy(snr, mean,
+                    marker=METHOD_MARKERS.get(method, 'o'),
+                    color=METHOD_COLORS.get(method, 'C0'),
+                    linestyle=METHOD_LINESTYLES.get(method, '-'),
+                    label=METHOD_NAMES.get(method, method),
+                    markersize=8, linewidth=2)
         if np.any(ci > 0):
-            ax.fill_between(snr, np.maximum(mean - ci, 1e-4), mean + ci,
-                           alpha=0.12, color=s['color'])
+            ax.fill_between(snr, mean - ci, mean + ci, alpha=0.15,
+                            color=METHOD_COLORS.get(method, 'C0'))
 
-    # Hardware Wall region
-    ax.axvspan(18, 28, color='gray', alpha=0.1)
-    ax.text(22, 0.35, r"$\Gamma_{\mathrm{eff}}$ Limited",
-            fontsize=10, color='gray', ha='center', style='italic')
+    # Hardware Wall 阴影（专家1建议）
+    ax.axvspan(20, 30, color='gray', alpha=0.1)
+    ax.text(23, 0.4, "Hardware Wall\n(Limited by $\\Gamma_{eff}$)",
+            fontsize=10, color='gray', alpha=0.8, ha='center')
 
-    ax.set_xlabel('SNR (dB)')
-    ax.set_ylabel('Bit Error Rate (BER)')
-    ax.legend(loc='upper right', framealpha=0.9)
-    ax.set_ylim([5e-2, 0.55])
+    # SNR Gain 标注
+    target_ber = 0.15
+    ax.axhline(y=target_ber, color='gray', linestyle=':', alpha=0.5, linewidth=1.5)
+    ax.text(22, target_ber * 1.15, f'BER = {target_ber}', fontsize=10, color='gray')
+
+    ax.set_xlabel('SNR (dB)', fontsize=14)
+    ax.set_ylabel('BER', fontsize=14)
+    ax.set_title('Communication Performance: BER vs SNR', fontsize=14)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([5e-2, 0.6])
     ax.set_xlim([-7, 27])
-    ax.grid(True, which='both', alpha=0.3)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig01_ber_vs_snr.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig01_ber_vs_snr.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig01_ber_vs_snr.pdf")
     plt.close(fig)
-    print("  ✓ Fig 01: BER vs SNR")
 
 
 def fig02_rmse_tau_vs_snr(df: pd.DataFrame, out_dir: str):
-    """Fig 2: τ RMSE vs SNR."""
+    """Fig 2: RMSE_τ vs SNR"""
+
     fig, ax = plt.subplots(figsize=(10, 6))
+
     agg = aggregate(df, ['snr_db', 'method'], ['rmse_tau_final'])
 
-    expected = ["matched_filter", "adjoint_slice", "proposed_no_update", "proposed"]
-    methods = check_methods(df, expected, "Fig 02")
+    plot_order = ["matched_filter", "adjoint_slice", "proposed_no_update", "proposed"]
 
-    for method in methods:
+    for method in plot_order:
         data = agg[agg['method'] == method]
         if len(data) == 0:
             continue
 
-        s = get_style(method)
-        ax.semilogy(data['snr_db'], data['rmse_tau_final_mean'],
-                   marker=s['marker'], color=s['color'], linestyle=s['ls'],
-                   label=s['label'], linewidth=s['lw'], alpha=s['alpha'])
+        snr = data['snr_db'].values
+        mean = data['rmse_tau_final_mean'].values
 
-    ax.axhline(y=0.1, color='green', linestyle=':', linewidth=2,
-               label=r'Target ($\epsilon_\tau=0.1$)')
-    ax.axhspan(0, 0.1, alpha=0.1, color='green')
+        ax.semilogy(snr, mean,
+                    marker=METHOD_MARKERS.get(method, 'o'),
+                    color=METHOD_COLORS.get(method, 'C0'),
+                    linestyle=METHOD_LINESTYLES.get(method, '-'),
+                    label=METHOD_NAMES.get(method, method),
+                    markersize=8, linewidth=2)
 
-    ax.set_xlabel('SNR (dB)')
-    ax.set_ylabel(r'$\tau$ RMSE (samples)')
-    ax.legend(loc='upper right')
+    ax.axhline(y=0.1, color='green', linestyle=':', linewidth=2, label='Target (0.1 samples)')
+
+    ax.set_xlabel('SNR (dB)', fontsize=14)
+    ax.set_ylabel('RMSE τ (samples)', fontsize=14)
+    ax.set_title('Sensing Performance: Delay Estimation Error', fontsize=14)
+    ax.legend(loc='upper right', fontsize=10)
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig02_rmse_tau_vs_snr.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig02_rmse_tau_vs_snr.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig02_rmse_tau_vs_snr.pdf")
     plt.close(fig)
-    print("  ✓ Fig 02: RMSE τ vs SNR")
+
+
+def fig03_success_rate(df: pd.DataFrame, out_dir: str):
+    """Fig 3: Success Rate vs SNR"""
+
+    if 'success_rate' not in df.columns:
+        print("Warning: success_rate not in data, skipping fig03")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    agg = aggregate(df, ['snr_db', 'method'], ['success_rate'])
+
+    plot_order = ["matched_filter", "adjoint_slice", "proposed_no_update", "proposed"]
+
+    for method in plot_order:
+        data = agg[agg['method'] == method]
+        if len(data) == 0:
+            continue
+
+        snr = data['snr_db'].values
+        mean = data['success_rate_mean'].values * 100
+
+        ax.plot(snr, mean,
+                marker=METHOD_MARKERS.get(method, 'o'),
+                color=METHOD_COLORS.get(method, 'C0'),
+                linestyle=METHOD_LINESTYLES.get(method, '-'),
+                label=METHOD_NAMES.get(method, method),
+                linewidth=2, markersize=8)
+
+    ax.axhline(y=90, color='green', linestyle=':', linewidth=2, label='90% target')
+
+    ax.set_xlabel('SNR (dB)', fontsize=14)
+    ax.set_ylabel('Success Rate (%)', fontsize=14)
+    ax.set_title('τ Estimation Reliability: P(|τ_err| < 0.1 samples)', fontsize=14)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 105])
+
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/fig03_success_rate.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig03_success_rate.pdf")
+    plt.close(fig)
 
 
 def fig04_cliff_all_methods(df: pd.DataFrame, out_dir: str):
     """
-    Fig 4: Cliff Plot (core contribution figure).
+    Fig 4: Cliff plot with ALL methods（核心图）
 
-    P1-2: Include pull-in range visualization.
+    专家方案1 + 补强(A)：
+    - 盆地边界从 success_rate 数据推导，不是硬编码
+    - 加入 adjoint_lmmse（更强的线性基线）
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
     agg = aggregate(df, ['init_error', 'method'], ['ber', 'rmse_tau_final', 'success_rate'])
 
-    expected = ["naive_slice", "adjoint_lmmse", "adjoint_slice", "matched_filter",
-                "proposed_no_update", "proposed", "oracle_sync", "oracle"]
-    methods = check_methods(df, expected, "Fig 04")
+    # 补强(A)：从数据计算盆地边界
+    # 定义：proposed 的 success_rate >= 0.5 的最大 init_error
+    proposed_data = agg[agg['method'] == 'proposed']
+    if len(proposed_data) > 0 and 'success_rate_mean' in proposed_data.columns:
+        success_mask = proposed_data['success_rate_mean'] >= 0.5
+        if success_mask.any():
+            basin_boundary = proposed_data[success_mask]['init_error'].max()
+        else:
+            basin_boundary = 0.3  # fallback
+    else:
+        basin_boundary = 0.3  # fallback
 
-    # Compute pull-in range from data
-    pull_in_proposed = compute_pull_in_range(df, 'proposed', threshold=0.95)
-    pull_in_baseline = compute_pull_in_range(df, 'adjoint_slice', threshold=0.95)
+    methods_to_plot = ["naive_slice", "adjoint_lmmse", "adjoint_slice", "matched_filter",
+                       "proposed_no_update", "proposed", "oracle"]
 
-    if np.isnan(pull_in_proposed):
-        pull_in_proposed = 0.3  # Default
+    # ===== Panel A: BER vs init_error =====
 
-    max_x = max(agg['init_error'].max(), 1.5)
+    # 数据驱动的 Zone Shading
+    ax1.axvspan(0, basin_boundary, color='green', alpha=0.08, label='Basin of Attraction')
+    ax1.axvspan(basin_boundary, basin_boundary + 0.2, color='orange', alpha=0.08, label='Transition Zone')
+    ax1.axvspan(basin_boundary + 0.2, 2.0, color='red', alpha=0.08, label='Ambiguity Zone')
 
-    # Zone shading
-    for ax in [ax1, ax2]:
-        ax.axvspan(0, pull_in_proposed, color='green', alpha=0.08, label='_nolegend_')
-        ax.axvline(pull_in_proposed, color='green', linestyle='--', linewidth=2, alpha=0.8)
-
-    # Panel A: BER vs init_error
-    for method in methods:
+    # 画方法曲线
+    for method in methods_to_plot:
         data = agg[agg['method'] == method]
         if len(data) == 0:
             continue
 
-        s = get_style(method)
-        ax1.plot(data['init_error'], data['ber_mean'],
-                marker=s['marker'], color=s['color'], linestyle=s['ls'],
-                linewidth=s['lw'], alpha=s['alpha'], label=s['label'], markersize=6)
+        init_errors = data['init_error'].values
+        ber_mean = data['ber_mean'].values
 
-    ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.4, linewidth=1)
-    ax1.text(max_x - 0.1, 0.48, 'Random', fontsize=9, color='gray', alpha=0.7, ha='right')
+        ax1.plot(init_errors, ber_mean,
+                 marker=METHOD_MARKERS.get(method, 'o'),
+                 color=METHOD_COLORS.get(method, 'C0'),
+                 linestyle=METHOD_LINESTYLES.get(method, '-'),
+                 label=METHOD_NAMES.get(method, method),
+                 linewidth=2, markersize=8)
 
-    # Pull-in annotation
-    ax1.annotate(f'Pull-in={pull_in_proposed:.2f}',
-                xy=(pull_in_proposed, 0.15), xytext=(pull_in_proposed + 0.3, 0.25),
-                arrowprops=dict(arrowstyle='->', color='green', lw=1.5),
-                fontsize=10, color='green', fontweight='bold')
+    # 数据驱动的 Basin 边界垂线
+    ax1.axvline(x=basin_boundary, color='green', linestyle='--', linewidth=2, alpha=0.7)
+    ax1.text(basin_boundary + 0.02, 0.45, f'Basin={basin_boundary:.2f}',
+             fontsize=10, color='green', alpha=0.8)
 
-    ax1.set_xlabel(r'Initial $\tau$ Error (samples)')
-    ax1.set_ylabel('BER')
+    ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+    ax1.text(1.3, 0.48, 'Random Guess', fontsize=9, color='gray', alpha=0.7)
+
+    ax1.set_xlabel('Initial $\\tau$ Error (samples)', fontsize=14)
+    ax1.set_ylabel('BER', fontsize=14)
+    ax1.set_title('(a) Communication Performance vs Sync Error', fontsize=14)
     ax1.legend(loc='upper left', fontsize=8, ncol=2)
-    ax1.set_ylim([0, 0.55])
-    ax1.set_xlim([0, max_x])
     ax1.grid(True, alpha=0.3)
+    ax1.set_ylim([0, 0.55])
+    ax1.set_xlim([0, max(agg['init_error'].max(), 1.5)])
 
-    # Panel B: RMSE vs init_error
-    for method in methods:
-        if method in ["oracle", "oracle_sync"]:
+    # ===== Panel B: RMSE vs init_error =====
+
+    # 数据驱动的 Zone Shading
+    ax2.axvspan(0, basin_boundary, color='green', alpha=0.08)
+    ax2.axvspan(basin_boundary, basin_boundary + 0.2, color='orange', alpha=0.08)
+    ax2.axvspan(basin_boundary + 0.2, 2.0, color='red', alpha=0.08)
+
+    for method in methods_to_plot:
+        if method == "oracle":
             continue
         data = agg[agg['method'] == method]
         if len(data) == 0:
             continue
 
-        s = get_style(method)
-        ax2.plot(data['init_error'], data['rmse_tau_final_mean'],
-                marker=s['marker'], color=s['color'], linestyle=s['ls'],
-                linewidth=s['lw'], alpha=s['alpha'], label=s['label'], markersize=6)
+        init_errors = data['init_error'].values
+        rmse_mean = data['rmse_tau_final_mean'].values
 
-    # y=x reference line
-    ax2.plot([0, max_x], [0, max_x], 'k--', alpha=0.4, linewidth=1, label='No Improvement')
-    ax2.axhspan(0, 0.1, alpha=0.1, color='green')
-    ax2.text(0.05, 0.08, r'$\epsilon_\tau$', fontsize=9, color='green', alpha=0.8)
+        ax2.plot(init_errors, rmse_mean,
+                 marker=METHOD_MARKERS.get(method, 'o'),
+                 color=METHOD_COLORS.get(method, 'C0'),
+                 linestyle=METHOD_LINESTYLES.get(method, '-'),
+                 label=METHOD_NAMES.get(method, method),
+                 linewidth=2, markersize=8)
 
-    ax2.set_xlabel(r'Initial $\tau$ Error (samples)')
-    ax2.set_ylabel(r'Final $\tau$ RMSE (samples)')
+    # y=x 参考线和目标区域
+    max_x = max(agg['init_error'].max(), 1.5)
+    ax2.plot([0, max_x], [0, max_x], 'k--', alpha=0.5, label='No Improvement (y=x)')
+    ax2.axhspan(0, 0.1, alpha=0.15, color='green')
+    ax2.axvline(x=basin_boundary, color='green', linestyle='--', linewidth=2, alpha=0.7)
+
+    ax2.set_xlabel('Initial $\\tau$ Error (samples)', fontsize=14)
+    ax2.set_ylabel('Final $\\tau$ RMSE (samples)', fontsize=14)
+    ax2.set_title('(b) Delay Estimation Performance', fontsize=14)
     ax2.legend(loc='upper left', fontsize=8)
+    ax2.grid(True, alpha=0.3)
     ax2.set_ylim([0, max_x])
     ax2.set_xlim([0, max_x])
-    ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig04_cliff_all_methods.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig04_cliff_all_methods.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig04_cliff_all_methods.pdf")
     plt.close(fig)
-    print(f"  ✓ Fig 04: Cliff Plot (pull-in={pull_in_proposed:.2f})")
 
 
 def fig05_snr_multi_init_error(df: pd.DataFrame, out_dir: str):
-    """Fig 5: Multi init_error SNR sweep."""
+    """
+    Fig 5: SNR sweep @ multiple init_errors（专家方案3）
+
+    证明：
+    (a) init_error=0: baseline 没 bug
+    (b) init_error=0.2: proposed 领先
+    (c) init_error=0.3: baseline 失效
+    """
+
     if 'init_error' not in df.columns:
-        print("  ⚠️ Fig 05: Missing init_error column, skipping")
+        print("Warning: init_error not in data, skipping fig05")
         return
 
     init_errors = sorted(df['init_error'].unique())
-    n_panels = min(len(init_errors), 3)
+    n_panels = len(init_errors)
 
-    fig, axes = plt.subplots(1, n_panels, figsize=(5*n_panels, 4.5))
+    fig, axes = plt.subplots(1, n_panels, figsize=(6*n_panels, 5))
     if n_panels == 1:
         axes = [axes]
 
-    expected = ["adjoint_slice", "proposed_no_update", "proposed", "oracle_sync", "oracle"]
-    methods = check_methods(df, expected, "Fig 05")
+    methods_to_plot = ["adjoint_slice", "proposed_no_update", "proposed", "oracle"]
 
-    for idx, init_error in enumerate(init_errors[:n_panels]):
+    for idx, init_error in enumerate(init_errors):
         ax = axes[idx]
         df_sub = df[df['init_error'] == init_error]
         agg = aggregate(df_sub, ['snr_db', 'method'], ['ber'])
 
-        for method in methods:
+        for method in methods_to_plot:
             data = agg[agg['method'] == method]
             if len(data) == 0:
                 continue
 
-            s = get_style(method)
-            ax.semilogy(data['snr_db'], data['ber_mean'],
-                       marker=s['marker'], color=s['color'], linestyle=s['ls'],
-                       label=s['label'], linewidth=s['lw'], alpha=s['alpha'])
+            snr = data['snr_db'].values
+            ber_mean = data['ber_mean'].values
 
-        ax.set_xlabel('SNR (dB)')
-        ax.set_ylabel('BER')
+            ax.semilogy(snr, ber_mean,
+                        marker=METHOD_MARKERS.get(method, 'o'),
+                        color=METHOD_COLORS.get(method, 'C0'),
+                        linestyle=METHOD_LINESTYLES.get(method, '-'),
+                        label=METHOD_NAMES.get(method, method),
+                        linewidth=2, markersize=8)
 
-        # Color-coded init_error label
+        ax.set_xlabel('SNR (dB)', fontsize=12)
+        ax.set_ylabel('BER', fontsize=12)
+
+        # 根据 init_error 设置标题
         if init_error == 0.0:
-            color = 'green'
-            label = r'$\Delta\tau_0=0$'
-        elif init_error <= 0.2:
-            color = 'orange'
-            label = f'$\\Delta\\tau_0={init_error}$'
+            title = f'({"abc"[idx]}) init_error=0: Baseline Validation'
+            ax.set_title(title, fontsize=12, color='green')
+        elif init_error == 0.2:
+            title = f'({"abc"[idx]}) init_error=0.2: Proposed Leading'
+            ax.set_title(title, fontsize=12, color='orange')
         else:
-            color = 'red'
-            label = f'$\\Delta\\tau_0={init_error}$'
+            title = f'({"abc"[idx]}) init_error={init_error}: Baseline Fails'
+            ax.set_title(title, fontsize=12, color='red')
 
-        ax.text(0.05, 0.95, label, transform=ax.transAxes, fontsize=12,
-                color=color, fontweight='bold', verticalalignment='top')
-
-        ax.legend(loc='upper right', fontsize=8)
+        ax.legend(loc='upper right', fontsize=9)
         ax.grid(True, alpha=0.3)
-        ax.set_ylim([5e-2, 0.55])
+        ax.set_ylim([5e-2, 0.6])
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig05_snr_multi_init_error.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig05_snr_multi_init_error.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig05_snr_multi_init_error.pdf")
     plt.close(fig)
-    print("  ✓ Fig 05: SNR @ Multi Init Error")
+
+
+def fig06_jacobian_condition(df: pd.DataFrame, out_dir: str):
+    """
+    Fig 6: Jacobian condition number - "The Villain Plot"
+
+    专家1建议：展示为什么端到端方法失败
+    条件数 ~10^15 说明联合估计数值不稳定
+    """
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ===== Panel A: 条件数柱状图（专家1的 "Villain" 图）=====
+
+    # 模拟分层条件数下降（基于物理）
+    layers = ['End-to-End\n(Joint τ,v)', 'Layer 1\n(Pilot τ)', 'Layer 3', 'Layer 7\n(Final)']
+    cond_nums = [1e15, 1e6, 1e3, 1e1]  # 分层后条件数显著下降
+    colors = ['#d62728', '#ff7f0e', '#2ca02c', '#1f77b4']
+
+    bars = ax1.bar(layers, np.log10(cond_nums), color=colors, alpha=0.8, edgecolor='black')
+
+    # 在柱子上标注具体数值
+    for bar, val in zip(bars, cond_nums):
+        height = np.log10(val)
+        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                f'$10^{{{int(height)}}}$',
+                ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+    # 添加阈值线
+    ax1.axhline(y=6, color='orange', linestyle='--', linewidth=2, label='Unstable Threshold ($10^6$)')
+    ax1.axhline(y=3, color='green', linestyle=':', linewidth=2, label='Stable ($10^3$)')
+
+    # 添加标注
+    ax1.annotate('Numerical\nInstability!', xy=(0, 15), xytext=(1.5, 12),
+                fontsize=11, color='red', fontweight='bold',
+                arrowprops=dict(arrowstyle='->', color='red', lw=2))
+
+    ax1.set_ylabel('Condition Number ($\\log_{10}$)', fontsize=14)
+    ax1.set_title('(a) Why End-to-End Fails:\nThe Geometry Gap', fontsize=12)
+    ax1.set_ylim(0, 18)
+    ax1.legend(loc='upper right', fontsize=9)
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    # ===== Panel B: 从数据绘制（如果有）=====
+    if 'init_error' in df.columns and 'gram_cond_log10' in df.columns:
+        init_errors = df['init_error'].values
+        cond_log = df['gram_cond_log10'].values
+
+        ax2.bar(init_errors, cond_log, width=0.08, color='C3', alpha=0.7, edgecolor='black')
+        ax2.axhline(y=6, color='orange', linestyle='--', linewidth=2)
+
+        ax2.set_xlabel('Initial τ Error (samples)', fontsize=14)
+        ax2.set_ylabel('$\\log_{10}$(Condition Number)', fontsize=14)
+        ax2.set_title('(b) Gram Matrix Condition vs Init Error', fontsize=12)
+        ax2.grid(True, alpha=0.3, axis='y')
+    else:
+        # 如果没有数据，画 Jacobian 范数比
+        init_errors = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+        ratio_J = [3e15] * len(init_errors)  # τ sensitivity >> v sensitivity
+
+        ax2.bar(init_errors, np.log10(ratio_J), width=0.08, color='C0', alpha=0.7, edgecolor='black')
+        ax2.set_xlabel('Initial τ Error (samples)', fontsize=14)
+        ax2.set_ylabel('$\\log_{10}(||J_\\tau|| / ||J_v||)$', fontsize=14)
+        ax2.set_title('(b) Jacobian Norm Ratio\n(τ sensitivity >> v sensitivity)', fontsize=12)
+        ax2.grid(True, alpha=0.3, axis='y')
+
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/fig06_jacobian_condition.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig06_jacobian_condition.pdf")
+    plt.close(fig)
+
+
+def fig11_heatmap(df: pd.DataFrame, out_dir: str):
+    """
+    Fig 11: 2D Heatmap - BER vs (SNR × init_error)
+
+    专家建议：展示在不同 SNR 和 init_error 组合下的性能
+    """
+
+    if 'init_error' not in df.columns or 'snr_db' not in df.columns:
+        print("Warning: heatmap data missing required columns, skipping fig11")
+        return
+
+    methods_to_plot = df['method'].unique() if 'method' in df.columns else ['proposed']
+    n_methods = len(methods_to_plot)
+
+    fig, axes = plt.subplots(1, min(n_methods, 3), figsize=(6*min(n_methods, 3), 5))
+    if n_methods == 1:
+        axes = [axes]
+
+    for idx, method in enumerate(methods_to_plot[:3]):  # 最多画3个
+        ax = axes[idx]
+
+        df_method = df[df['method'] == method] if 'method' in df.columns else df
+
+        # 聚合数据
+        agg = df_method.groupby(['snr_db', 'init_error'])['ber'].mean().reset_index()
+
+        # 创建 pivot table
+        pivot = agg.pivot(index='init_error', columns='snr_db', values='ber')
+
+        # 绘制热力图
+        sns.heatmap(pivot, ax=ax, cmap='RdYlGn_r', annot=True, fmt='.2f',
+                    cbar_kws={'label': 'BER'}, vmin=0, vmax=0.5)
+
+        ax.set_xlabel('SNR (dB)', fontsize=12)
+        ax.set_ylabel('Initial τ Error (samples)', fontsize=12)
+        ax.set_title(f'{METHOD_NAMES.get(method, method)}', fontsize=12)
+
+        # 标注 Basin 边界
+        if 0.3 in pivot.index.values:
+            y_pos = list(pivot.index.values).index(0.3) + 0.5
+            ax.axhline(y=y_pos, color='white', linestyle='--', linewidth=2)
+
+    fig.suptitle('BER Performance Heatmap: SNR × Init Error', fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/fig11_heatmap.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig11_heatmap.pdf")
+    plt.close(fig)
 
 
 def fig07_gap_to_oracle(df: pd.DataFrame, out_dir: str):
-    """
-    Fig 7: Gap-to-Oracle (P1-3).
+    """Fig 7: Gap-to-Oracle - 当 proposed ≈ oracle 时让差异可见"""
 
-    Shows gap = method - oracle_sync for both BER and τ RMSE.
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
     agg = aggregate(df, ['snr_db', 'method'], ['ber', 'rmse_tau_final'])
 
-    # Get oracle data (try oracle_sync first, then oracle)
-    oracle_data = agg[agg['method'].isin(['oracle_sync', 'oracle'])]
-    if len(oracle_data) == 0:
-        print("  ⚠️ Fig 07: No oracle data, skipping")
-        return
+    # 获取 oracle 基准
+    oracle_data = agg[agg['method'] == 'oracle'][['snr_db', 'ber_mean', 'rmse_tau_final_mean']]
+    oracle_data = oracle_data.rename(columns={'ber_mean': 'oracle_ber', 'rmse_tau_final_mean': 'oracle_rmse'})
 
-    oracle_data = oracle_data.groupby('snr_db').agg({
-        'ber_mean': 'first',
-        'rmse_tau_final_mean': 'first'
-    }).reset_index()
-    oracle_data = oracle_data.rename(columns={
-        'ber_mean': 'oracle_ber',
-        'rmse_tau_final_mean': 'oracle_rmse'
-    })
-
-    expected = ["adjoint_slice", "proposed_no_update", "proposed"]
-    methods = check_methods(df, expected, "Fig 07")
+    methods_to_plot = ["adjoint_slice", "proposed_no_update", "proposed"]
 
     # Panel A: BER Gap
-    for method in methods:
+    for method in methods_to_plot:
         data = agg[agg['method'] == method][['snr_db', 'ber_mean']]
         merged = pd.merge(data, oracle_data, on='snr_db')
+
         if len(merged) == 0:
             continue
 
-        s = get_style(method)
+        snr = merged['snr_db'].values
         gap = merged['ber_mean'].values - merged['oracle_ber'].values
-        ax1.plot(merged['snr_db'], gap, marker=s['marker'], color=s['color'],
-                linestyle=s['ls'], label=s['label'], linewidth=s['lw'])
 
-    ax1.axhline(y=0, color='green', linestyle='--', linewidth=2, label='Oracle')
-    ax1.set_xlabel('SNR (dB)')
-    ax1.set_ylabel(r'$\Delta$BER (method $-$ oracle)')
-    ax1.legend(loc='upper right')
+        ax1.plot(snr, gap,
+                 marker=METHOD_MARKERS.get(method, 'o'),
+                 color=METHOD_COLORS.get(method, 'C0'),
+                 linestyle=METHOD_LINESTYLES.get(method, '-'),
+                 label=METHOD_NAMES.get(method, method),
+                 linewidth=2, markersize=8)
+
+    ax1.axhline(y=0, color='green', linestyle='--', linewidth=2, label='Oracle (zero gap)')
+    ax1.axhline(y=0.01, color='orange', linestyle=':', linewidth=1.5, alpha=0.7, label='1% gap')
+
+    ax1.set_xlabel('SNR (dB)', fontsize=14)
+    ax1.set_ylabel('ΔBER (method - oracle)', fontsize=14)
+    ax1.set_title('(a) BER Gap to Oracle', fontsize=14)
+    ax1.legend(loc='upper right', fontsize=10)
     ax1.grid(True, alpha=0.3)
 
-    # Panel B: RMSE Gap (ratio)
-    for method in methods:
+    # Panel B: RMSE
+    for method in methods_to_plot:
         data = agg[agg['method'] == method][['snr_db', 'rmse_tau_final_mean']]
-        merged = pd.merge(data, oracle_data, on='snr_db')
-        if len(merged) == 0:
+
+        if len(data) == 0:
             continue
 
-        s = get_style(method)
-        ratio = merged['rmse_tau_final_mean'].values / (merged['oracle_rmse'].values + 1e-10)
-        ax2.semilogy(merged['snr_db'], ratio, marker=s['marker'], color=s['color'],
-                    linestyle=s['ls'], label=s['label'], linewidth=s['lw'])
+        snr = data['snr_db'].values
+        rmse = data['rmse_tau_final_mean'].values
 
-    ax2.axhline(y=1, color='green', linestyle='--', linewidth=2, label='Oracle')
-    ax2.set_xlabel('SNR (dB)')
-    ax2.set_ylabel(r'$\tau$ RMSE Ratio (method / oracle)')
-    ax2.legend(loc='upper right')
+        ax2.semilogy(snr, rmse,
+                     marker=METHOD_MARKERS.get(method, 'o'),
+                     color=METHOD_COLORS.get(method, 'C0'),
+                     linestyle=METHOD_LINESTYLES.get(method, '-'),
+                     label=METHOD_NAMES.get(method, method),
+                     linewidth=2, markersize=8)
+
+    ax2.axhline(y=0.1, color='green', linestyle=':', linewidth=2, label='Target (0.1 samples)')
+
+    ax2.set_xlabel('SNR (dB)', fontsize=14)
+    ax2.set_ylabel('Final τ RMSE (samples)', fontsize=14)
+    ax2.set_title('(b) τ RMSE Comparison', fontsize=14)
+    ax2.legend(loc='upper right', fontsize=10)
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig07_gap_to_oracle.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig07_gap_to_oracle.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig07_gap_to_oracle.pdf")
     plt.close(fig)
-    print("  ✓ Fig 07: Gap-to-Oracle")
 
 
 def fig08_robustness(df_pn: pd.DataFrame, df_pilot: pd.DataFrame, out_dir: str):
-    """Fig 8: PN and Pilot robustness."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    """Fig 8: Robustness to PN and Pilot length"""
 
-    expected = ["adjoint_slice", "proposed_no_update", "proposed", "oracle_sync", "oracle"]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    methods_to_plot = ["adjoint_slice", "proposed", "oracle"]
 
     # Panel A: PN sweep
     if df_pn is not None and len(df_pn) > 0:
-        methods = check_methods(df_pn, expected, "Fig 08 (PN)")
         agg_pn = aggregate(df_pn, ['pn_linewidth', 'method'], ['ber'])
 
-        for method in methods:
+        for method in methods_to_plot:
             data = agg_pn[agg_pn['method'] == method]
             if len(data) == 0:
                 continue
 
-            s = get_style(method)
             pn = data['pn_linewidth'].values / 1e3  # kHz
-            ax1.plot(pn, data['ber_mean'], marker=s['marker'], color=s['color'],
-                    label=s['label'], linewidth=s['lw'])
+            ber = data['ber_mean'].values
+
+            ax1.plot(pn, ber,
+                     marker=METHOD_MARKERS.get(method, 'o'),
+                     color=METHOD_COLORS.get(method, 'C0'),
+                     label=METHOD_NAMES.get(method, method))
 
         ax1.set_xlabel('PN Linewidth (kHz)')
         ax1.set_ylabel('BER')
-        ax1.legend(fontsize=8)
+        ax1.set_title('(a) Robustness to Phase Noise')
+        ax1.legend()
         ax1.grid(True, alpha=0.3)
 
     # Panel B: Pilot sweep
     if df_pilot is not None and len(df_pilot) > 0:
-        methods = check_methods(df_pilot, expected, "Fig 08 (Pilot)")
         agg_pilot = aggregate(df_pilot, ['pilot_len', 'method'], ['rmse_tau_final'])
 
-        for method in methods:
+        for method in methods_to_plot:
             data = agg_pilot[agg_pilot['method'] == method]
             if len(data) == 0:
                 continue
 
-            s = get_style(method)
-            ax2.plot(data['pilot_len'], data['rmse_tau_final_mean'],
-                    marker=s['marker'], color=s['color'],
-                    label=s['label'], linewidth=s['lw'])
+            pilot = data['pilot_len'].values
+            rmse = data['rmse_tau_final_mean'].values
+
+            ax2.plot(pilot, rmse,
+                     marker=METHOD_MARKERS.get(method, 'o'),
+                     color=METHOD_COLORS.get(method, 'C0'),
+                     label=METHOD_NAMES.get(method, method))
 
         ax2.set_xlabel('Pilot Length')
-        ax2.set_ylabel(r'$\tau$ RMSE (samples)')
-        ax2.legend(fontsize=8)
+        ax2.set_ylabel('RMSE τ (samples)')
+        ax2.set_title('(b) Impact of Pilot Length')
+        ax2.legend()
         ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig08_robustness.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig08_robustness.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig08_robustness.pdf")
     plt.close(fig)
-    print("  ✓ Fig 08: Robustness")
 
 
 def fig09_latency(df: pd.DataFrame, out_dir: str):
-    """Fig 9: Latency comparison."""
-    if len(df) == 0:
-        print("  ⚠️ Fig 09: No latency data, skipping")
-        return
+    """Fig 9: Latency comparison"""
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 6))
 
     methods = df['method'].values
     latencies = df['latency_mean_ms'].values
     stds = df['latency_std_ms'].values
 
-    colors = [get_style(m)['color'] for m in methods]
-    labels = [get_style(m)['label'] for m in methods]
+    colors = [METHOD_COLORS.get(m, 'C0') for m in methods]
+    labels = [METHOD_NAMES.get(m, m) for m in methods]
 
     bars = ax.bar(range(len(methods)), latencies, yerr=stds,
                   color=colors, alpha=0.7, edgecolor='black', capsize=5)
 
     ax.set_xticks(range(len(methods)))
     ax.set_xticklabels(labels, rotation=15, ha='right')
-    ax.set_ylabel('Latency (ms)')
+    ax.set_ylabel('Latency (ms)', fontsize=14)
+    ax.set_title('Computational Complexity', fontsize=14)
     ax.grid(True, alpha=0.3, axis='y')
 
-    # Value labels
+    # 标注数值
     for i, (lat, std) in enumerate(zip(latencies, stds)):
-        ax.text(i, lat + std + 0.5, f'{lat:.1f}', ha='center', fontsize=10)
+        ax.text(i, lat + std + 0.5, f'{lat:.1f}ms', ha='center', fontsize=10)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig09_latency.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig09_latency.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig09_latency.pdf")
     plt.close(fig)
-    print("  ✓ Fig 09: Latency")
 
 
-def fig10_ablation_dual_axis(df: pd.DataFrame, out_dir: str):
-    """Fig 10: Ablation study - dual axis (BER bar + τ RMSE line)."""
-    fig, ax1 = plt.subplots(figsize=(10, 5.5))
-
-    target_snr = df['snr_db'].max()
-    data = df[df['snr_db'] == target_snr].copy()
-
-    methods = ["random_init", "proposed_no_update", "proposed_tau_slice", "proposed", "oracle_sync"]
-    # Filter to available methods
-    methods = [m for m in methods if m in data['method'].unique() or
-               (m == 'oracle_sync' and 'oracle' in data['method'].unique())]
-
-    agg = aggregate(data, ['method'], ['ber', 'rmse_tau_final'])
-
-    # Reorder
-    method_order = {m: i for i, m in enumerate(methods)}
-    agg['order'] = agg['method'].map(method_order)
-    agg = agg.dropna(subset=['order']).sort_values('order')
-
-    x = np.arange(len(agg))
-    width = 0.4
-
-    # Left axis: BER bars
-    colors = [get_style(m)['color'] for m in agg['method']]
-    bars = ax1.bar(x, agg['ber_mean'], width, color=colors, alpha=0.7,
-                   edgecolor='black', linewidth=1.2, label='BER')
-
-    ax1.set_ylabel('BER (Lower is Better)', fontsize=11)
-    ax1.set_ylim(0, 0.5)
-
-    # Right axis: τ RMSE line
-    ax2 = ax1.twinx()
-    rmse = agg['rmse_tau_final_mean'].fillna(0).values
-
-    ax2.plot(x, rmse, color='#d62728', marker='D', markersize=10,
-            linewidth=2.5, linestyle='--', label=r'$\tau$ RMSE')
-
-    ax2.set_ylabel(r'$\tau$ RMSE (samples)', color='#d62728', fontsize=11)
-    ax2.set_yscale('log')
-    ax2.tick_params(axis='y', labelcolor='#d62728')
-    ax2.set_ylim(1e-2, 5)
-
-    # X axis labels
-    labels = [get_style(m)['label'] for m in agg['method']]
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, rotation=20, ha='right', fontsize=10)
-
-    # Combined legend
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center', ncol=2, fontsize=9)
-
-    fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig10_ablation_dual.{ext}", dpi=300)
-    plt.close(fig)
-    print("  ✓ Fig 10: Ablation (dual axis)")
-
-
-def fig11_basin_map(df: pd.DataFrame, out_dir: str):
+def fig10_ablation(df: pd.DataFrame, out_dir: str):
     """
-    Fig 11: Basin Map (P1-4).
+    Fig 10: 消融实验（专家方案2，修正版）
 
-    2D heatmap of success rate: SNR × init_error.
+    验证各组件的贡献：
+    - oracle > proposed > proposed_tau_slice > proposed_no_update > random_init
+
+    P0-1 修复：删除了有 bug 的 proposed_no_learned_alpha
     """
-    if 'init_error' not in df.columns or 'snr_db' not in df.columns:
-        print("  ⚠️ Fig 11: Missing columns, skipping")
-        return
 
-    # Get proposed and baseline
-    methods_to_plot = ['proposed', 'adjoint_slice']
-    available = [m for m in methods_to_plot if m in df['method'].unique()]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    if len(available) == 0:
-        print("  ⚠️ Fig 11: No methods available, skipping")
-        return
+    agg = aggregate(df, ['snr_db', 'method'], ['ber', 'rmse_tau_final'])
 
-    n_methods = len(available)
-    fig, axes = plt.subplots(1, n_methods, figsize=(6*n_methods, 5))
-    if n_methods == 1:
-        axes = [axes]
+    # 消融实验方法顺序（从弱到强）- P0-1 修复后
+    methods_order = ["random_init", "proposed_no_update", "proposed_tau_slice", "proposed", "oracle"]
 
-    for idx, method in enumerate(available):
-        ax = axes[idx]
-        df_method = df[df['method'] == method]
-
-        # Aggregate success rate
-        agg = df_method.groupby(['snr_db', 'init_error'])['success_rate'].mean().reset_index()
-        pivot = agg.pivot(index='init_error', columns='snr_db', values='success_rate')
-
-        sns.heatmap(pivot, ax=ax, cmap='RdYlGn', annot=True, fmt='.2f',
-                   cbar_kws={'label': 'Success Rate'}, vmin=0, vmax=1,
-                   linewidths=0.5, linecolor='white')
-
-        ax.set_xlabel('SNR (dB)')
-        ax.set_ylabel(r'Initial $\tau$ Error (samples)')
-        ax.text(0.5, 1.02, get_style(method)['label'], transform=ax.transAxes,
-                fontsize=11, ha='center', fontweight='bold')
-
-    fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig11_basin_map.{ext}", dpi=300)
-    plt.close(fig)
-    print("  ✓ Fig 11: Basin Map")
-
-
-def fig12_efficiency(df_snr: pd.DataFrame, df_crlb: pd.DataFrame, out_dir: str):
-    """
-    Fig 12: Efficiency plot (RMSE / sqrt(CRLB)).
-
-    P2-1: Shows how close each method is to the theoretical bound.
-    """
-    if df_crlb is None or len(df_crlb) == 0:
-        print("  ⚠️ Fig 12: No CRLB data, skipping")
-        return
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-
-    agg_snr = aggregate(df_snr, ['snr_db', 'method'], ['rmse_tau_final'])
-
-    expected = ["adjoint_slice", "proposed", "oracle_sync", "oracle"]
-    methods = check_methods(df_snr, expected, "Fig 12")
-
-    for method in methods:
-        data = agg_snr[agg_snr['method'] == method]
+    # Panel A: BER vs SNR
+    for method in methods_order:
+        data = agg[agg['method'] == method]
         if len(data) == 0:
             continue
 
-        merged = pd.merge(data, df_crlb, on='snr_db')
-        if len(merged) == 0:
+        snr = data['snr_db'].values
+        ber_mean = data['ber_mean'].values
+
+        ax1.semilogy(snr, ber_mean,
+                     marker=METHOD_MARKERS.get(method, 'o'),
+                     color=METHOD_COLORS.get(method, 'C0'),
+                     linestyle=METHOD_LINESTYLES.get(method, '-'),
+                     label=METHOD_NAMES.get(method, method),
+                     linewidth=2, markersize=8)
+
+    ax1.set_xlabel('SNR (dB)', fontsize=14)
+    ax1.set_ylabel('BER', fontsize=14)
+    ax1.set_title('(a) Ablation Study: BER Performance', fontsize=14)
+    ax1.legend(loc='upper right', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim([5e-2, 0.6])
+
+    # Panel B: RMSE vs SNR
+    for method in methods_order:
+        if method == "oracle":
+            continue  # Oracle RMSE = 0
+        data = agg[agg['method'] == method]
+        if len(data) == 0:
             continue
 
-        s = get_style(method)
-        efficiency = merged['rmse_tau_final_mean'] / merged['sqrt_crlb_tau']
+        snr = data['snr_db'].values
+        rmse_mean = data['rmse_tau_final_mean'].values
 
-        ax.semilogy(merged['snr_db'], efficiency, marker=s['marker'], color=s['color'],
-                   linestyle=s['ls'], label=s['label'], linewidth=s['lw'])
+        ax2.semilogy(snr, rmse_mean,
+                     marker=METHOD_MARKERS.get(method, 'o'),
+                     color=METHOD_COLORS.get(method, 'C0'),
+                     linestyle=METHOD_LINESTYLES.get(method, '-'),
+                     label=METHOD_NAMES.get(method, method),
+                     linewidth=2, markersize=8)
 
-    ax.axhline(y=1, color='green', linestyle='--', linewidth=2, label='CRLB')
-    ax.set_xlabel('SNR (dB)')
-    ax.set_ylabel(r'Efficiency: RMSE / $\sqrt{\mathrm{CRLB}}$')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
+    ax2.axhline(y=0.1, color='green', linestyle=':', linewidth=2, label='Target (0.1)')
+
+    ax2.set_xlabel('SNR (dB)', fontsize=14)
+    ax2.set_ylabel('Final τ RMSE (samples)', fontsize=14)
+    ax2.set_title('(b) Ablation Study: Sensing Performance', fontsize=14)
+    ax2.legend(loc='upper right', fontsize=9)
+    ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(f"{out_dir}/fig12_efficiency.{ext}", dpi=300)
+    fig.savefig(f"{out_dir}/fig10_ablation.png", dpi=300)
+    fig.savefig(f"{out_dir}/fig10_ablation.pdf")
     plt.close(fig)
-    print("  ✓ Fig 12: Efficiency")
+
+    # 打印消融实验结果表格
+    print("\n📊 消融实验结果 @ SNR=15dB:")
+    snr15 = agg[agg['snr_db'] == 15]
+    for method in methods_order:
+        data = snr15[snr15['method'] == method]
+        if len(data) > 0:
+            ber = data['ber_mean'].values[0]
+            rmse = data['rmse_tau_final_mean'].values[0] if 'rmse_tau_final_mean' in data.columns else 0
+            print(f"  {METHOD_NAMES.get(method, method):25s}: BER={ber:.4f}, RMSE={rmse:.4f}")
 
 
 # ============================================================================
-# Main Function
+# 主函数
 # ============================================================================
 
 def generate_all_figures(data_dir: str, out_dir: str = None):
-    """Generate all figures from CSV data."""
+    """从 CSV 数据生成所有图表"""
+
     if out_dir is None:
         out_dir = data_dir
 
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
-    print("📊 Journal Figure Generation (Expert v2.0)")
+    print("Loading data...")
     print("=" * 60)
-    print("\nLoading data...")
     data = load_data(data_dir)
 
-    print("\n" + "-" * 40)
-    print("Generating figures (NO TITLES - journal style)...")
-    print("-" * 40)
+    print("\n" + "=" * 60)
+    print("Generating figures...")
+    print("=" * 60)
 
-    # Core figures
     if 'snr_sweep' in data:
         fig01_ber_vs_snr(data['snr_sweep'], out_dir)
+        print("  ✓ Fig 1: BER vs SNR")
+
         fig02_rmse_tau_vs_snr(data['snr_sweep'], out_dir)
+        print("  ✓ Fig 2: RMSE_τ vs SNR")
+
+        fig03_success_rate(data['snr_sweep'], out_dir)
+        print("  ✓ Fig 3: Success Rate")
+
         fig07_gap_to_oracle(data['snr_sweep'], out_dir)
+        print("  ✓ Fig 7: Gap-to-Oracle")
 
     if 'cliff_sweep' in data:
         fig04_cliff_all_methods(data['cliff_sweep'], out_dir)
-
-        # Compute and save summary metrics
-        methods = data['cliff_sweep']['method'].unique().tolist()
-        summary = compute_summary_metrics(data['cliff_sweep'], methods)
-        summary.to_csv(f"{out_dir}/summary_metrics.csv", index=False)
-        print(f"  ✓ Summary metrics saved")
+        print("  ✓ Fig 4: Cliff (ALL methods) - 核心图【方案1】")
 
     if 'snr_multi_init_error' in data:
         fig05_snr_multi_init_error(data['snr_multi_init_error'], out_dir)
+        print("  ✓ Fig 5: SNR @ multi init_error【方案3】")
 
-    if 'ablation_sweep' in data:
-        fig10_ablation_dual_axis(data['ablation_sweep'], out_dir)
+    # P0-3: Jacobian 图暂时移除（当前实现是手写数值，不是真实计算）
+    # 如需恢复，需实现数值差分 Jacobian
+    # if 'jacobian' in data:
+    #     fig06_jacobian_condition(data['jacobian'], out_dir)
+    #     print("  ✓ Fig 6: Jacobian Condition")
 
-    # Basin map
-    if 'heatmap_sweep' in data:
-        fig11_basin_map(data['heatmap_sweep'], out_dir)
-
-    # Robustness
     if 'pn_sweep' in data or 'pilot_sweep' in data:
         fig08_robustness(data.get('pn_sweep'), data.get('pilot_sweep'), out_dir)
+        print("  ✓ Fig 8: Robustness")
 
     if 'latency' in data:
         fig09_latency(data['latency'], out_dir)
+        print("  ✓ Fig 9: Latency")
 
-    # Efficiency (if CRLB data available)
-    if 'crlb_sweep' in data and 'snr_sweep' in data:
-        fig12_efficiency(data['snr_sweep'], data['crlb_sweep'], out_dir)
+    if 'ablation_sweep' in data:
+        fig10_ablation(data['ablation_sweep'], out_dir)
+        print("  ✓ Fig 10: Ablation Study【方案2】")
+
+    if 'heatmap_sweep' in data:
+        fig11_heatmap(data['heatmap_sweep'], out_dir)
+        print("  ✓ Fig 11: Heatmap (SNR × init_error)")
 
     print("\n" + "=" * 60)
-    print(f"✅ All figures saved to: {out_dir}")
+    print(f"All figures saved to: {out_dir}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Journal Figure Generation (v2.0)")
-    parser.add_argument('--data_dir', type=str, required=True, help="CSV data directory")
-    parser.add_argument('--out_dir', type=str, default=None, help="Output directory")
+    parser = argparse.ArgumentParser(description="Generate paper figures from CSV data")
+    parser.add_argument('--data_dir', type=str, required=True, help="Directory containing CSV data")
+    parser.add_argument('--out_dir', type=str, default=None, help="Output directory for figures")
     args = parser.parse_args()
 
     generate_all_figures(args.data_dir, args.out_dir)
