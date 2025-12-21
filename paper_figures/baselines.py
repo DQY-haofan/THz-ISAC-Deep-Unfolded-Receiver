@@ -326,6 +326,92 @@ class BaselineOracle:
         return x_hat, theta_hat
 
 
+class BaselineRandomInit:
+    """
+    Random Init: 使用大随机误差的 θ
+
+    理论性能下界（消融实验用）
+    """
+    name = "random_init"
+
+    @staticmethod
+    @torch.no_grad()
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+        theta_true = batch['theta_true']
+        batch_size = theta_true.shape[0]
+        Ts = 1.0 / sim_cfg.fs
+
+        # 大随机误差：τ ± 2 samples, v ± 50 m/s
+        noise_tau = torch.randn(batch_size, 1, device=device) * 2.0 * Ts
+        noise_v = torch.randn(batch_size, 1, device=device) * 50.0
+        noise_a = torch.randn(batch_size, 1, device=device) * 10.0
+
+        theta_init = theta_true.clone()
+        theta_init[:, 0:1] += noise_tau
+        theta_init[:, 1:2] += noise_v
+        theta_init[:, 2:3] += noise_a
+
+        batch_random = batch.copy()
+        batch_random['theta_init'] = theta_init
+
+        # 不更新 θ
+        original_setting = model.cfg.enable_theta_update
+        model.cfg.enable_theta_update = False
+
+        outputs = model(batch_random)
+
+        model.cfg.enable_theta_update = original_setting
+
+        x_hat = outputs['x_hat']
+        theta_hat = theta_init  # 保持随机初始化
+
+        return x_hat, theta_hat
+
+
+class BaselineProposedNoLearnedAlpha:
+    """
+    Proposed w/o learned α: 使用固定 α 而非可学习权重
+
+    消融实验：验证可学习权重的价值
+    """
+    name = "proposed_no_learned_alpha"
+
+    @staticmethod
+    @torch.no_grad()
+    def run(model, batch: Dict, sim_cfg, device: str, pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 保存原始 α 值
+        original_alphas = {}
+
+        # 尝试冻结可学习的 α 参数
+        try:
+            for name, param in model.named_parameters():
+                if 'alpha' in name.lower() or 'weight' in name.lower():
+                    original_alphas[name] = param.data.clone()
+                    # 设为固定值 0.5
+                    param.data.fill_(0.5)
+        except Exception as e:
+            pass  # 如果没有 alpha 参数，跳过
+
+        # 运行完整方法
+        original_setting = model.cfg.enable_theta_update
+        model.cfg.enable_theta_update = True
+
+        outputs = model(batch)
+
+        model.cfg.enable_theta_update = original_setting
+
+        # 恢复原始 α 值
+        for name, val in original_alphas.items():
+            for n, p in model.named_parameters():
+                if n == name:
+                    p.data = val
+
+        x_hat = outputs['x_hat']
+        theta_hat = outputs.get('theta_hat', batch['theta_init'])
+
+        return x_hat, theta_hat
+
+
 # ============================================================================
 # 方法注册表
 # ============================================================================
@@ -336,8 +422,10 @@ BASELINE_REGISTRY = {
     "adjoint_lmmse": BaselineAdjointLMMSE,
     "adjoint_slice": BaselineAdjointSlice,
     "proposed_no_update": BaselineProposedNoUpdate,
+    "proposed_no_learned_alpha": BaselineProposedNoLearnedAlpha,  # 消融实验
     "proposed": BaselineProposed,
     "oracle": BaselineOracle,
+    "random_init": BaselineRandomInit,  # 消融实验
 }
 
 # 方法层级（从弱到强）
@@ -347,6 +435,7 @@ METHOD_ORDER = [
     "adjoint_lmmse",
     "adjoint_slice",
     "proposed_no_update",
+    "proposed_no_learned_alpha",
     "proposed",
     "oracle",
 ]
@@ -364,6 +453,15 @@ METHOD_CLIFF = [
     "oracle",
 ]
 
+# 消融实验用的方法集（方案2）
+METHOD_ABLATION = [
+    "random_init",           # 理论下界
+    "proposed_no_update",    # w/o τ update
+    "proposed_no_learned_alpha",  # w/o learned α
+    "proposed",              # 完整方法
+    "oracle",                # 理论上界
+]
+
 
 def get_baseline(method_name: str):
     """获取基线算法类"""
@@ -372,7 +470,7 @@ def get_baseline(method_name: str):
     return BASELINE_REGISTRY[method_name]
 
 
-def run_baseline(method_name: str, model, batch: Dict, sim_cfg, device: str, 
+def run_baseline(method_name: str, model, batch: Dict, sim_cfg, device: str,
                  pilot_len: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
     """运行指定的基线算法"""
     baseline_cls = get_baseline(method_name)
