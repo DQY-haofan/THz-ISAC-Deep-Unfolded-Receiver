@@ -45,7 +45,7 @@ print("🔍 Module Import Path Check")
 print("=" * 60)
 
 try:
-    from evaluator_v3 import (
+    from evaluator import (
         EvalConfig,
         load_model,
         run_snr_sweep,
@@ -68,7 +68,7 @@ except ImportError as e:
     print(f"  ⚠️ evaluator_v3 import error: {e}")
     print("  Falling back to evaluator_v2...")
     try:
-        from evaluator_v2 import (
+        from evaluator import (
             EvalConfig, load_model, run_snr_sweep, run_cliff_sweep,
             run_snr_sweep_multi_init_error, run_ablation_sweep,
             run_heatmap_sweep, run_pn_sweep, run_pilot_sweep,
