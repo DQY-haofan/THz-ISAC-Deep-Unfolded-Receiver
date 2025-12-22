@@ -1163,7 +1163,7 @@ class GABVNet(nn.Module):
         )
         # Initialize to zero so refiner starts as identity (via residual)
         with torch.no_grad():
-            self.refiner[-1].weight.zero_()
+            nn.init.xavier_uniform_(self.refiner[-1].weight, gain=0.1)
             self.refiner[-1].bias.zero_()
 
         # Flag to bypass refiner for debugging
