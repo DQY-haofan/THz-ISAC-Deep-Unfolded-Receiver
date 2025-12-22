@@ -83,8 +83,8 @@ class BaselineNaiveSlice:
 
 class BaselineMatchedFilter:
     name = "matched_filter"
-    GRID_POINTS = 41
-    DEFAULT_SEARCH_HALF_RANGE = 1.7
+    GRID_POINTS = 11
+    DEFAULT_SEARCH_HALF_RANGE = 0.5
 
     @staticmethod
     @torch.no_grad()
