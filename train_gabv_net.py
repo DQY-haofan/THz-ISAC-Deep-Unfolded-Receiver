@@ -359,27 +359,30 @@ def freeze_module(module: nn.Module, freeze: bool = True):
 def apply_freeze_schedule(model: GABVNet, stage_cfg: StageConfig):
     """Apply freeze schedule based on stage config."""
     if stage_cfg.freeze_comm:
-        freeze_module(model.phys_enc, True)
+        # 冻结 VAMP 和 refiner
         freeze_module(model.solver_layers, True)
         freeze_module(model.refiner, True)
-        print("  [Freeze] phys_enc, solver, refiner FROZEN")
+        print("  [Freeze] phys_enc FROZEN")
+        print("  [Freeze] solver_layers, refiner FROZEN")
     else:
-        freeze_module(model.phys_enc, False)
+        # 解冻 VAMP 和 refiner（关键！）
         freeze_module(model.solver_layers, False)
         freeze_module(model.refiner, False)
-        print("  [Freeze] phys_enc, solver, refiner ACTIVE")
+        print("  [Freeze] phys_enc FROZEN")
+        print("  [Train] solver_layers, refiner ACTIVE ← 正在训练")
 
     if stage_cfg.freeze_pn:
         freeze_module(model.pn_tracker, True)
         print("  [Freeze] pn_tracker FROZEN")
     else:
         freeze_module(model.pn_tracker, False)
-        print("  [Freeze] pn_tracker ACTIVE")
+        print("  [Train] pn_tracker ACTIVE")
 
-    # Theta updater and pilot are always trainable
+    # tau_estimator, theta_updater, pilot 始终可训练
+    freeze_module(model.tau_estimator, False)
     freeze_module(model.theta_updater, False)
     freeze_module(model.pilot, False)
-
+    print("  [Train] tau_estimator, theta_updater, pilot ACTIVE")
 
 # =============================================================================
 # Single Stage Training
@@ -630,7 +633,7 @@ def train_one_stage(
 
     ckpt_path = ckpt_dir / "final.pth"
     torch.save({
-        'model_state': model.state_dict(),
+        'model_state_dict': model.state_dict(),  # 改成标准名称
         'config': {
             'stage': stage_cfg.stage,
             'n_steps': stage_cfg.n_steps,
