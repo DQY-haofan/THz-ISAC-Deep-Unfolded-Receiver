@@ -172,14 +172,14 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
         StageConfig(
             stage=1,
             name="Stage1_CommOnly",
-            description="Communication only, exact theta, HIGH SNR",
+            description="Communication only, small theta noise for learning",
             n_steps=base_steps,
-            theta_noise_samples=(0.0, 0.0, 0.0),  # Exact theta
+            theta_noise_samples=(0.1, 10.0, 1.0),  # 改：从 (0,0,0) 改成小噪声
             enable_theta_update=False,
             loss_weight_comm=1.0,
             loss_weight_sens=0.0,
             loss_weight_prior=0.0,
-            snr_range=(10, 30),  # HIGH SNR - start easy!
+            snr_range=(5, 25),  # 改：从 (10,30) 扩展到包含低SNR
             enable_pn=True,
             freeze_comm=False,
             freeze_pn=False,
