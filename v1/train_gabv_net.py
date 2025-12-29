@@ -172,14 +172,14 @@ def get_curriculum_stages(base_steps: int) -> List[StageConfig]:
         StageConfig(
             stage=1,
             name="Stage1_CommOnly",
-            description="Communication only, exact theta, HIGH SNR",
+            description="Communication only, small theta noise for learning",
             n_steps=base_steps,
-            theta_noise_samples=(0.0, 0.0, 0.0),  # Exact theta
+            theta_noise_samples=(0.1, 10.0, 1.0),  # 改：从 (0,0,0) 改成小噪声
             enable_theta_update=False,
             loss_weight_comm=1.0,
             loss_weight_sens=0.0,
             loss_weight_prior=0.0,
-            snr_range=(10, 30),  # HIGH SNR - start easy!
+            snr_range=(5, 25),  # 改：从 (10,30) 扩展到包含低SNR
             enable_pn=True,
             freeze_comm=False,
             freeze_pn=False,
@@ -359,27 +359,30 @@ def freeze_module(module: nn.Module, freeze: bool = True):
 def apply_freeze_schedule(model: GABVNet, stage_cfg: StageConfig):
     """Apply freeze schedule based on stage config."""
     if stage_cfg.freeze_comm:
-        freeze_module(model.phys_enc, True)
+        # 冻结 VAMP 和 refiner
         freeze_module(model.solver_layers, True)
         freeze_module(model.refiner, True)
-        print("  [Freeze] phys_enc, solver, refiner FROZEN")
+        print("  [Freeze] phys_enc FROZEN")
+        print("  [Freeze] solver_layers, refiner FROZEN")
     else:
-        freeze_module(model.phys_enc, False)
+        # 解冻 VAMP 和 refiner（关键！）
         freeze_module(model.solver_layers, False)
         freeze_module(model.refiner, False)
-        print("  [Freeze] phys_enc, solver, refiner ACTIVE")
+        print("  [Freeze] phys_enc FROZEN")
+        print("  [Train] solver_layers, refiner ACTIVE ← 正在训练")
 
     if stage_cfg.freeze_pn:
         freeze_module(model.pn_tracker, True)
         print("  [Freeze] pn_tracker FROZEN")
     else:
         freeze_module(model.pn_tracker, False)
-        print("  [Freeze] pn_tracker ACTIVE")
+        print("  [Train] pn_tracker ACTIVE")
 
-    # Theta updater and pilot are always trainable
+    # tau_estimator, theta_updater, pilot 始终可训练
+    freeze_module(model.tau_estimator, False)
     freeze_module(model.theta_updater, False)
     freeze_module(model.pilot, False)
-
+    print("  [Train] tau_estimator, theta_updater, pilot ACTIVE")
 
 # =============================================================================
 # Single Stage Training
@@ -630,7 +633,7 @@ def train_one_stage(
 
     ckpt_path = ckpt_dir / "final.pth"
     torch.save({
-        'model_state': model.state_dict(),
+        'model_state_dict': model.state_dict(),  # 改成标准名称
         'config': {
             'stage': stage_cfg.stage,
             'n_steps': stage_cfg.n_steps,

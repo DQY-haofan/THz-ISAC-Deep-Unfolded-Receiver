@@ -10,13 +10,13 @@ Description:
     - Alias: approx_chi(rho_eff) -> chi_from_rho(rho_eff) for backward compat
 
     Formula (Frozen):
-        ρ_eff = SINR_eff = 1 / (SNR^-1 + Γ_eff^-1)
-        χ(ρ) = (2/π) / (1 + κρ),  κ = 1 - 2/π ≈ 0.3634
+        Ï_eff = SINR_eff = 1 / (SNR^-1 + Î“_eff^-1)
+        Ï‡(Ï) = (2/Ï€) / (1 + ÎºÏ),  Îº = 1 - 2/Ï€ â‰ˆ 0.3634
 
     Endpoint Constraints (MUST PASS Protocol 0):
-        χ(ρ→0) = 2/π ≈ 0.6366 (low SNR limit)
-        χ(ρ→∞) → 0 (high SNR limit)
-        χ monotonically decreasing
+        Ï‡(Ïâ†’0) = 2/Ï€ â‰ˆ 0.6366 (low SNR limit)
+        Ï‡(Ïâ†’âˆž) â†’ 0 (high SNR limit)
+        Ï‡ monotonically decreasing
 
 Author: Definition Freeze v3
 Date: 2025-12-17
@@ -30,12 +30,12 @@ import warnings
 # FROZEN CONSTANTS (DO NOT MODIFY)
 # =============================================================================
 
-CHI_LOW_SNR_LIMIT = 2.0 / np.pi  # ≈ 0.6366197723675814
-KAPPA = 1.0 - CHI_LOW_SNR_LIMIT  # ≈ 0.36338022763241865
+CHI_LOW_SNR_LIMIT = 2.0 / np.pi  # â‰ˆ 0.6366197723675814
+KAPPA = 1.0 - CHI_LOW_SNR_LIMIT  # â‰ˆ 0.36338022763241865
 
 # Sanity check thresholds
-CHI_ZERO_TOLERANCE = 0.03  # χ(0) must be within this of 2/π
-CHI_INF_THRESHOLD = 1e-6   # χ(∞) must be below this
+CHI_ZERO_TOLERANCE = 0.03  # Ï‡(0) must be within this of 2/Ï€
+CHI_INF_THRESHOLD = 1e-6   # Ï‡(âˆž) must be below this
 
 
 # =============================================================================
@@ -44,25 +44,25 @@ CHI_INF_THRESHOLD = 1e-6   # χ(∞) must be below this
 
 def chi_from_rho(rho: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
-    CANONICAL χ(ρ) function - THE source of truth.
+    CANONICAL Ï‡(Ï) function - THE source of truth.
 
     Formula:
-        χ(ρ) = (2/π) / (1 + κρ)
-        where κ = 1 - 2/π ≈ 0.3634
+        Ï‡(Ï) = (2/Ï€) / (1 + ÎºÏ)
+        where Îº = 1 - 2/Ï€ â‰ˆ 0.3634
 
     Endpoint Behavior:
-        χ(0) = 2/π ≈ 0.6366 (information MOST retained at low SNR)
-        χ(∞) → 0 (quantization noise dominates at high SNR)
+        Ï‡(0) = 2/Ï€ â‰ˆ 0.6366 (information MOST retained at low SNR)
+        Ï‡(âˆž) â†’ 0 (quantization noise dominates at high SNR)
 
     This captures the "arcsine law" behavior of 1-bit quantization:
-    - At low SNR, thermal noise dominates → 1-bit loses little info
-    - At high SNR, signal is clipped → 1-bit loses significant info
+    - At low SNR, thermal noise dominates â†’ 1-bit loses little info
+    - At high SNR, signal is clipped â†’ 1-bit loses significant info
 
     Args:
         rho: Effective SINR (linear scale), scalar or array
 
     Returns:
-        chi: Information retention factor in [0, 2/π]
+        chi: Information retention factor in [0, 2/Ï€]
     """
     rho = np.asarray(rho)
     rho_safe = np.maximum(rho, 0.0)  # Ensure non-negative
@@ -90,11 +90,11 @@ def approx_chi_from_components(gamma_eff: float, snr_linear: float) -> float:
     """
     TWO-PARAMETER convenience wrapper.
 
-    Computes ρ_eff from components, then calls chi_from_rho.
+    Computes Ï_eff from components, then calls chi_from_rho.
 
     Formula:
-        ρ_eff = 1 / (1/SNR + 1/Γ_eff) = (SNR * Γ_eff) / (SNR + Γ_eff)
-        χ = chi_from_rho(ρ_eff)
+        Ï_eff = 1 / (1/SNR + 1/Î“_eff) = (SNR * Î“_eff) / (SNR + Î“_eff)
+        Ï‡ = chi_from_rho(Ï_eff)
 
     Args:
         gamma_eff: Hardware distortion ratio (linear)
@@ -116,10 +116,10 @@ def compute_sinr_eff(snr_linear: float, gamma_eff: float) -> float:
     Computes effective SINR via harmonic mean.
 
     Formula:
-        ρ_eff = 1 / (1/SNR + 1/Γ_eff)
+        Ï_eff = 1 / (1/SNR + 1/Î“_eff)
 
     Physical Interpretation:
-        - Combines thermal noise (1/SNR) and hardware distortion (1/Γ_eff)
+        - Combines thermal noise (1/SNR) and hardware distortion (1/Î“_eff)
         - Limited by the weaker of the two
 
     Args:
@@ -141,14 +141,14 @@ def compute_sinr_eff(snr_linear: float, gamma_eff: float) -> float:
 
 def estimate_gamma_eff(sim_stats: Dict[str, float]) -> float:
     """
-    First-principles Γ_eff estimation from power decomposition.
+    First-principles Î“_eff estimation from power decomposition.
 
     Formula (per DR-P2-2.5):
-        Γ_eff = P_signal / (P_pa + P_pn)
+        Î“_eff = P_signal / (P_pa + P_pn)
 
     IMPORTANT: P_quantization_loss is NOT included!
-    - Γ_eff captures TX-side distortions (PA nonlinearity + phase noise)
-    - χ captures RX-side quantization loss separately
+    - Î“_eff captures TX-side distortions (PA nonlinearity + phase noise)
+    - Ï‡ captures RX-side quantization loss separately
     - Including P_quant would double-count the quantization effect
 
     Args:
@@ -156,7 +156,7 @@ def estimate_gamma_eff(sim_stats: Dict[str, float]) -> float:
             - P_signal: Main signal power
             - P_pa_distortion: PA Bussgang residual power
             - P_phase_noise: Phase noise equivalent power
-            - P_quantization_loss: (NOT USED for Γ_eff - captured by χ)
+            - P_quantization_loss: (NOT USED for Î“_eff - captured by Ï‡)
 
     Returns:
         gamma_eff: Hardware distortion ratio (linear scale)
@@ -171,7 +171,7 @@ def estimate_gamma_eff(sim_stats: Dict[str, float]) -> float:
 
     # Compute Gamma_eff
     if P_dist < 1e-12:
-        # No distortion → infinite Γ_eff (ideal hardware)
+        # No distortion â†’ infinite Î“_eff (ideal hardware)
         gamma_eff = 1e9
     else:
         gamma_eff = P_sig / P_dist
@@ -186,7 +186,7 @@ def estimate_gamma_eff(sim_stats: Dict[str, float]) -> float:
 def compute_fim_block_diag(H: np.ndarray, snr: float, chi: float,
                            block_size: int = 32) -> np.ndarray:
     """
-    Block-diagonal FIM approximation for O(NK²) complexity.
+    Block-diagonal FIM approximation for O(NKÂ²) complexity.
 
     Args:
         H: Channel matrix [N, K] or diag [N]
@@ -203,7 +203,7 @@ def compute_fim_block_diag(H: np.ndarray, snr: float, chi: float,
 
     N, K = H.shape
 
-    # χ-scaled SNR
+    # Ï‡-scaled SNR
     eff_snr = chi * snr
 
     # Simple FIM: J = eff_snr * H^H @ H
@@ -221,7 +221,7 @@ def compute_crlb_from_fim(FIM: np.ndarray, regularization: float = 1e-6) -> np.n
         regularization: Tikhonov regularization for stability
 
     Returns:
-        CRLB: [K, K] Cramér-Rao Lower Bound matrix
+        CRLB: [K, K] CramÃ©r-Rao Lower Bound matrix
     """
     K = FIM.shape[0]
     FIM_reg = FIM + regularization * np.eye(K)
@@ -296,19 +296,19 @@ def check_forbidden_region(gamma_eff: float, pn_var: float,
     Checks if operating point is in "forbidden region".
 
     Forbidden conditions (per DR-P2-3.5):
-        1. Γ_eff < -20 dB (hardware too noisy)
-        2. Phase noise variance > π (phase wrapping)
+        1. Î“_eff < -20 dB (hardware too noisy)
+        2. Phase noise variance > Ï€ (phase wrapping)
 
     Args:
         gamma_eff: Hardware distortion ratio (linear)
-        pn_var: Phase noise variance (radians²)
-        gamma_threshold_db: Minimum acceptable Γ_eff
+        pn_var: Phase noise variance (radiansÂ²)
+        gamma_threshold_db: Minimum acceptable Î“_eff
         pn_threshold: Maximum acceptable PN variance
 
     Returns:
         Dict with:
             - in_forbidden: True if in forbidden region
-            - gamma_ok: True if Γ_eff acceptable
+            - gamma_ok: True if Î“_eff acceptable
             - pn_ok: True if PN variance acceptable
     """
     gamma_db = 10 * np.log10(max(gamma_eff, 1e-12))
@@ -330,7 +330,7 @@ def check_forbidden_region(gamma_eff: float, pn_var: float,
 
 def verify_chi_endpoints() -> Dict[str, bool]:
     """
-    Verifies χ formula satisfies endpoint constraints.
+    Verifies Ï‡ formula satisfies endpoint constraints.
 
     This is Protocol 0 from sanity checks - MUST PASS before training.
 
@@ -339,14 +339,14 @@ def verify_chi_endpoints() -> Dict[str, bool]:
     """
     results = {}
 
-    # Test 1: χ(0) ≈ 2/π
+    # Test 1: Ï‡(0) â‰ˆ 2/Ï€
     chi_zero = chi_from_rho(0.0)
     error_zero = abs(chi_zero - CHI_LOW_SNR_LIMIT)
     results['chi_at_zero'] = chi_zero
     results['chi_zero_error'] = error_zero
     results['chi_zero_pass'] = error_zero < CHI_ZERO_TOLERANCE
 
-    # Test 2: χ(∞) → 0
+    # Test 2: Ï‡(âˆž) â†’ 0
     chi_inf = chi_from_rho(1e9)
     results['chi_at_inf'] = chi_inf
     results['chi_inf_pass'] = chi_inf < CHI_INF_THRESHOLD
@@ -367,7 +367,7 @@ def verify_chi_endpoints() -> Dict[str, bool]:
 
 def verify_chi_api_consistency(snr_db: float = 20.0, gamma_db: float = 10.0) -> Dict:
     """
-    Verifies all χ interfaces return consistent values.
+    Verifies all Ï‡ interfaces return consistent values.
 
     Tests:
         chi_from_rho(rho) == approx_chi(rho) == approx_chi_from_components(gamma, snr)
@@ -418,20 +418,20 @@ if __name__ == "__main__":
     # Test 1: Endpoint verification
     print("\n[Test 1] Chi Endpoint Verification")
     results = verify_chi_endpoints()
-    print(f"  χ(0) = {results['chi_at_zero']:.6f} (expected: {CHI_LOW_SNR_LIMIT:.6f})")
-    print(f"  χ(0) error = {results['chi_zero_error']:.6e} ({'PASS' if results['chi_zero_pass'] else 'FAIL'})")
-    print(f"  χ(1e9) = {results['chi_at_inf']:.2e} ({'PASS' if results['chi_inf_pass'] else 'FAIL'})")
+    print(f"  Ï‡(0) = {results['chi_at_zero']:.6f} (expected: {CHI_LOW_SNR_LIMIT:.6f})")
+    print(f"  Ï‡(0) error = {results['chi_zero_error']:.6e} ({'PASS' if results['chi_zero_pass'] else 'FAIL'})")
+    print(f"  Ï‡(1e9) = {results['chi_at_inf']:.2e} ({'PASS' if results['chi_inf_pass'] else 'FAIL'})")
     print(f"  Monotonic: {'PASS' if results['monotonic_pass'] else 'FAIL'}")
-    print(f"  Overall: {'ALL PASS ✓' if results['all_pass'] else 'FAILED ✗'}")
+    print(f"  Overall: {'ALL PASS âœ“' if results['all_pass'] else 'FAILED âœ—'}")
 
     # Test 2: API consistency
     print("\n[Test 2] API Consistency Check")
     for snr_db in [0, 10, 20, 30]:
         for gamma_db in [0, 10, 20]:
             api_result = verify_chi_api_consistency(snr_db, gamma_db)
-            status = "✓" if api_result['all_consistent'] else "✗"
-            print(f"  SNR={snr_db:3d}dB, Γ={gamma_db:3d}dB: "
-                  f"χ={api_result['chi_from_rho']:.4f} {status}")
+            status = "âœ“" if api_result['all_consistent'] else "âœ—"
+            print(f"  SNR={snr_db:3d}dB, Î“={gamma_db:3d}dB: "
+                  f"Ï‡={api_result['chi_from_rho']:.4f} {status}")
 
     # Test 3: Gamma_eff estimation
     print("\n[Test 3] Gamma_eff Estimation")
@@ -443,16 +443,16 @@ if __name__ == "__main__":
     }
     gamma = estimate_gamma_eff(test_stats)
     print(f"  Test sim_stats: {test_stats}")
-    print(f"  Estimated Γ_eff = {gamma:.4f} ({10*np.log10(gamma):.2f} dB)")
+    print(f"  Estimated Î“_eff = {gamma:.4f} ({10*np.log10(gamma):.2f} dB)")
 
     # Test 4: Forbidden region
     print("\n[Test 4] Forbidden Region Check")
     fr1 = check_forbidden_region(gamma_eff=10.0, pn_var=0.1)
     fr2 = check_forbidden_region(gamma_eff=0.01, pn_var=0.1)
     fr3 = check_forbidden_region(gamma_eff=10.0, pn_var=4.0)
-    print(f"  Γ=10, PN_var=0.1: {'FORBIDDEN' if fr1['in_forbidden'] else 'OK'}")
-    print(f"  Γ=0.01, PN_var=0.1: {'FORBIDDEN' if fr2['in_forbidden'] else 'OK'} (low Γ)")
-    print(f"  Γ=10, PN_var=4.0: {'FORBIDDEN' if fr3['in_forbidden'] else 'OK'} (high PN)")
+    print(f"  Î“=10, PN_var=0.1: {'FORBIDDEN' if fr1['in_forbidden'] else 'OK'}")
+    print(f"  Î“=0.01, PN_var=0.1: {'FORBIDDEN' if fr2['in_forbidden'] else 'OK'} (low Î“)")
+    print(f"  Î“=10, PN_var=4.0: {'FORBIDDEN' if fr3['in_forbidden'] else 'OK'} (high PN)")
 
     print("\n" + "=" * 60)
     print("Self-test complete.")

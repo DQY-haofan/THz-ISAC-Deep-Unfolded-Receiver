@@ -1,5 +1,5 @@
 """
-gabv_net_model.py (Wideband Delay Model - v7.0)
+gabv_net_model.py (Wideband Delay Model - Expert Patched v7.1)
 
 FUNDAMENTAL RESTRUCTURING (Expert Review):
 ===========================================
@@ -25,6 +25,10 @@ Identifiability:
     - Carrier phase exp(-j×2π×fc×τ) is NUISANCE, tracked by PN
 
 Author: Expert Review v7.0 (Wideband Delay)
+
+Expert Patches Applied (v7.1):
+    - Patch-1: LS-fitted Bussgang alpha (scale-robust estimation)
+    - Patch-2: normalize_pilots switch (preserve physical scale)
 Date: 2025-12-19
 """
 
@@ -61,6 +65,11 @@ class GABVConfig:
 
     # Meta features
     meta_dim: int = 6
+
+    # Pilot normalization control (Expert Patch-2)
+    # Default False: preserve true physical scale from simulator
+    # Set True only if specific baselines require unit-power pilots
+    normalize_pilots: bool = False
 
     @property
     def Ts(self):
@@ -112,6 +121,38 @@ def quantize_1bit_torch(y: torch.Tensor) -> torch.Tensor:
     y_i = torch.where(y_i == 0, torch.ones_like(y_i), y_i)
     y_q = (y_r + 1j * y_i) / math.sqrt(2)
     return y_q
+
+
+# =============================================================================
+# Bussgang Alpha Estimation (Expert Patch-1)
+# =============================================================================
+
+def estimate_bussgang_alpha_ls(y_q: torch.Tensor, y_pred: torch.Tensor,
+                                eps: float = 1e-6) -> torch.Tensor:
+    """
+    Least-squares fit alpha (real, positive) such that y_q ≈ alpha * y_pred.
+
+    Works as a robust scale estimator under many mismatches (Expert Patch-1).
+
+    Why this is better than sqrt(2/pi)/sqrt(var):
+    - Automatically adapts to pilot normalization changes
+    - Robust to PA/PN causing statistical mismatch
+    - Scale-invariant: if pilot *= c, alpha adjusts accordingly
+
+    Args:
+        y_q: Quantized observation [B, Np] (complex)
+        y_pred: Predicted signal [B, Np] (complex)
+        eps: Numerical stability constant
+
+    Returns:
+        alpha: Bussgang coefficient [B, 1] (real, positive)
+    """
+    # LS fit: min ||y_q - alpha * y_pred||^2
+    # Solution: alpha = Re(<y_pred, y_q>) / ||y_pred||^2
+    num = torch.real(torch.sum(torch.conj(y_pred) * y_q, dim=1, keepdim=True))
+    den = torch.sum(torch.abs(y_pred)**2, dim=1, keepdim=True).clamp(min=eps)
+    alpha = (num / den).clamp(min=1e-3, max=100.0)
+    return alpha
 
 
 # =============================================================================
@@ -516,14 +557,18 @@ class TauEstimatorInternal(nn.Module):
         # Extract pilots from observation
         y_q_pilot = y_q[:, :Np]
 
-        # Normalize x_pilot (already sliced to Np length)
+        # Pilot normalization control (Expert Patch-2)
+        # normalize_pilots=False preserves true physical scale
         x_pilot_power = torch.mean(torch.abs(x_pilot)**2, dim=1, keepdim=True).clamp(min=1e-10)
-        x_pilot_norm = x_pilot / torch.sqrt(x_pilot_power)
+        if self.cfg.normalize_pilots:
+            x_pilot_use = x_pilot / torch.sqrt(x_pilot_power)
+        else:
+            x_pilot_use = x_pilot
 
         # Pad x_pilot to full length for forward_operator
         # (forward_operator expects [B, N] input)
-        x_full = torch.zeros(B, N, dtype=x_pilot_norm.dtype, device=device)
-        x_full[:, :Np] = x_pilot_norm
+        x_full = torch.zeros(B, N, dtype=x_pilot_use.dtype, device=device)
+        x_full[:, :Np] = x_pilot_use
 
         # Phase alignment
         # y_q contains exp(+j×φ_0_true), so y_pred needs exp(+j×φ_est) to match
@@ -547,9 +592,10 @@ class TauEstimatorInternal(nn.Module):
             J_tau, _, _ = phys_enc.compute_channel_jacobian(theta_current, x_full)
             J_tau = J_tau[:, :Np] * phase
 
-            # Bussgang
-            var = torch.mean(torch.abs(y_pred)**2, dim=1, keepdim=True).clamp(min=1e-6)
-            alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
+            # Bussgang - Use LS-fitted alpha (Expert Patch-1)
+            # OLD: var-based formula is scale-sensitive and can fail under PA/PN mismatch
+            # NEW: LS fit is robust and automatically adapts to pilot normalization
+            alpha = estimate_bussgang_alpha_ls(y_q_pilot, y_pred)
 
             # Residual
             y_tilde = y_q_pilot / (alpha + 1e-6)
@@ -773,10 +819,12 @@ class ScoreBasedThetaUpdater(nn.Module):
         # === CRITICAL: Use known pilots for y_pred and Jacobian ===
         # If x_pilot is provided, use it for prediction (not x_est which adapted to theta error)
         if x_pilot is not None:
-            # IMPORTANT: Normalize x_pilot to unit power!
-            # The simulator may output non-normalized symbols
+            # Pilot normalization control (Expert Patch-2)
             x_pilot_power = torch.mean(torch.abs(x_pilot)**2, dim=1, keepdim=True).clamp(min=1e-10)
-            x_for_pred = x_pilot / torch.sqrt(x_pilot_power)  # Normalize to unit power
+            if self.cfg.normalize_pilots:
+                x_for_pred = x_pilot / torch.sqrt(x_pilot_power)
+            else:
+                x_for_pred = x_pilot
             x_pilot_input_power = x_pilot_power.mean().item()
         else:
             # Fallback: use x_est (less accurate for theta update)
@@ -802,9 +850,9 @@ class ScoreBasedThetaUpdater(nn.Module):
         J_v = J_v[:, :Np] * phase
         J_a = J_a[:, :Np] * phase
 
-        # === Bussgang linearization in matched domain ===
-        var = torch.mean(torch.abs(y_pred_phi)**2, dim=1, keepdim=True).clamp(min=1e-6)
-        alpha = math.sqrt(2/math.pi) / torch.sqrt(var)
+        # === Bussgang linearization in matched domain (Expert Patch-1) ===
+        # Use LS-fitted alpha instead of var-based formula
+        alpha = estimate_bussgang_alpha_ls(y_q_pilot, y_pred_phi)
 
         # y_q remains UNTOUCHED (critical for 1-bit!)
         y_q_pilot = y_obs[:, :Np]
@@ -1163,7 +1211,7 @@ class GABVNet(nn.Module):
         )
         # Initialize to zero so refiner starts as identity (via residual)
         with torch.no_grad():
-            self.refiner[-1].weight.zero_()
+            nn.init.xavier_uniform_(self.refiner[-1].weight, gain=0.1)
             self.refiner[-1].bias.zero_()
 
         # Flag to bypass refiner for debugging
